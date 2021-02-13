@@ -1,7 +1,7 @@
-package raft
+package core
 
 import (
-	"github.com/bitcapybara/go-kv/raft/raftlog"
+	"github.com/bitcapybara/go-raft/util"
 	"log"
 	"net"
 	"net/rpc"
@@ -19,12 +19,12 @@ const (
 )
 
 type AppendEntry struct {
-	term         int             // 当前时刻所属任期
-	leaderAddr   string          // 领导者的地址，方便 follower 重定向
-	prevLogIndex int             // 紧接新记录之前的日志条目索引
-	prevLogTerm  int             // prevLogIndex 条目所处任期
-	entries      []raftlog.Entry // 日志条目（心跳为空；为提高效率可能发送多个）
-	leaderCommit int             // 领导者提交的索引
+	term         int     // 当前时刻所属任期
+	leaderAddr   string  // 领导者的地址，方便 follower 重定向
+	prevLogIndex int     // 紧接新记录之前的日志条目索引
+	prevLogTerm  int     // prevLogIndex 条目所处任期
+	entries      []Entry // 日志条目（心跳为空；为提高效率可能发送多个）
+	leaderCommit int     // 领导者提交的索引
 }
 
 type AppendEntryRes struct {
@@ -194,9 +194,9 @@ func (r *raft) normalLoop() {
 func (r *raft) setTimer(min int, max int) {
 	r.mu.Lock()
 	if r.timer == nil {
-		r.timer = time.NewTimer(time.Millisecond * time.Duration(RandInt(min, max)))
+		r.timer = time.NewTimer(time.Millisecond * time.Duration(util.RandInt(min, max)))
 	} else{
-		r.timer.Reset(time.Millisecond * time.Duration(RandInt(min, max)))
+		r.timer.Reset(time.Millisecond * time.Duration(util.RandInt(min, max)))
 	}
 	r.mu.Unlock()
 }
