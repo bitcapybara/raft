@@ -56,6 +56,8 @@ type raft struct {
 	// 当前节点为 follower/candidate 时，为选举超时计时器
 	// 当前节点为 leader 时，为心跳计时器
 	timer *time.Timer
+	// 选举投票记录
+	voteMap map[int]bool
 
 	mu sync.Mutex
 }
@@ -67,6 +69,7 @@ func New(peers []string, me int) *raft {
 	rf.me = me
 
 	rf.term = -1
+	rf.voteMap = make(map[int]bool)
 	return rf
 }
 
@@ -132,11 +135,11 @@ func (r *raft) leaderLoop() {
 				continue
 			}
 			args := AppendEntry{
-				term: r.term,
-				leaderAddr: r.peers[r.me],
+				term:         r.term,
+				leaderAddr:   r.peers[r.me],
 				prevLogIndex: 0,
-				prevLogTerm: 0,
-				entries: nil,
+				prevLogTerm:  0,
+				entries:      nil,
 				leaderCommit: 0,
 			}
 			res := &AppendEntryRes{}
@@ -181,10 +184,16 @@ func (r *raft) normalLoop() {
 				log.Printf("调用rpc服务失败：%s%s\n", peer, err)
 			}
 			if res.term <= term && res.voteGranted {
+				// 成功获得选票
 				vote += 1
+			} else if res.term > term {
+				// 当前节点任期落后，则退出竞选
+				r.roleType = Follower
+				r.term = res.term
+				break
 			}
 		}
-		if vote >= len(r.peers) / 2 {
+		if vote >= len(r.peers)/2 {
 			r.roleType = Leader
 		}
 		r.mu.Unlock()
@@ -195,7 +204,7 @@ func (r *raft) setTimer(min int, max int) {
 	r.mu.Lock()
 	if r.timer == nil {
 		r.timer = time.NewTimer(time.Millisecond * time.Duration(util.RandInt(min, max)))
-	} else{
+	} else {
 		r.timer.Reset(time.Millisecond * time.Duration(util.RandInt(min, max)))
 	}
 	r.mu.Unlock()
@@ -220,14 +229,45 @@ func (r *raft) appendEntries(args AppendEntry, res *AppendEntryRes) error {
 	return nil
 }
 
-// follower 开放的 rpc 接口，由 candidate 调用
+// follower 和 candidate 开放的 rpc接口，由 candidate 调用
 func (r *raft) requestVote(args RequestVote, res *RequestVoteRes) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if args.term >= r.term {
+	argsTerm := args.term
+
+	// 拉票的候选者任期落后
+	if argsTerm < r.term {
 		res.term = r.term
-		res.voteGranted = true
+		res.voteGranted = false
+		return nil
+	}
+
+	// 当前节点所处任期数落后
+	if argsTerm > r.term {
+		if r.roleType == Candidate {
+			// 当前节点是候选者，自动降级，投出第一票
+			r.roleType = Follower
+			res.term = argsTerm
+			r.voteMap[argsTerm] = true
+			res.voteGranted = true
+		} else if !r.voteMap[argsTerm] {
+			// 当前节点是追随者且没有投过票，则投出第一票
+			res.voteGranted = true
+		} else {
+			// 当前节点是追随者且已投过票，则不投票
+			res.voteGranted = false
+		}
+		res.term = argsTerm
+		r.term = argsTerm
+		return nil
+	}
+
+	// 拉票者和当前节点任期数相同
+	// 无论当前节点是候选者还是追随者，都不投票
+	if argsTerm == r.term {
+		res.term = argsTerm
+		res.voteGranted = false
 	}
 	return nil
 }
