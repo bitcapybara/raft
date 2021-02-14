@@ -27,7 +27,7 @@ type AppendEntry struct {
 	leaderCommit int     // 领导者提交的索引
 }
 
-type AppendEntryRes struct {
+type AppendEntryApply struct {
 	term    int  // 当前时刻所属任期，用于领导者更新自身
 	success bool // 如果关注者包含与prevLogIndex和prevLogTerm匹配的条目，则为true
 }
@@ -39,7 +39,7 @@ type RequestVote struct {
 	lastLogTerm   int    // lastLogIndex 所处的任期
 }
 
-type RequestVoteRes struct {
+type RequestVoteApply struct {
 	term        int  // 当前时刻所属任期，用于领导者更新自身
 	voteGranted bool // 为 true 表示候选人收到一个选票
 }
@@ -56,7 +56,7 @@ type raft struct {
 	// 当前节点为 follower/candidate 时，为选举超时计时器
 	// 当前节点为 leader 时，为心跳计时器
 	timer *time.Timer
-	// 选举投票记录
+	// 选举投票记录，仅在当前角色为 Follower 时可用
 	voteMap map[int]bool
 
 	mu sync.Mutex
@@ -142,10 +142,17 @@ func (r *raft) leaderLoop() {
 				entries:      nil,
 				leaderCommit: 0,
 			}
-			res := &AppendEntryRes{}
+			res := &AppendEntryApply{}
 			err = client.Call("raft.requestVote", args, res)
 			if err != nil {
 				log.Printf("调用rpc服务失败：%s%s\n", peer, err)
+			}
+			if res.term > r.term {
+				// 当前任期数落后，降级为 Follower
+				r.roleType = Follower
+				r.term = res.term
+				r.voteMap = make(map[int]bool)
+				break
 			}
 		}
 
@@ -163,9 +170,10 @@ func (r *raft) normalLoop() {
 		r.roleType = Candidate
 		// 发送投票请求
 		vote := 0
-		term := r.term + 1
+		r.term += 1
 		for index, peer := range r.peers {
 			if index == r.me {
+				// 投票给自己
 				vote += 1
 				continue
 			}
@@ -175,18 +183,18 @@ func (r *raft) normalLoop() {
 				continue
 			}
 			args := RequestVote{
-				term:          term,
+				term:          r.term,
 				candidateAddr: r.peers[r.me],
 			}
-			res := &RequestVoteRes{}
+			res := &RequestVoteApply{}
 			err = client.Call("raft.requestVote", args, res)
 			if err != nil {
 				log.Printf("调用rpc服务失败：%s%s\n", peer, err)
 			}
-			if res.term <= term && res.voteGranted {
+			if res.term <= r.term && res.voteGranted {
 				// 成功获得选票
 				vote += 1
-			} else if res.term > term {
+			} else if res.term > r.term {
 				// 当前节点任期落后，则退出竞选
 				r.roleType = Follower
 				r.term = res.term
@@ -194,6 +202,7 @@ func (r *raft) normalLoop() {
 			}
 		}
 		if vote >= len(r.peers)/2 {
+			// 获得了大多数选票，转换为 Leader
 			r.roleType = Leader
 		}
 		r.mu.Unlock()
@@ -211,26 +220,39 @@ func (r *raft) setTimer(min int, max int) {
 }
 
 // follower 和 candidate 开放的 rpc接口，由 leader 调用
-func (r *raft) appendEntries(args AppendEntry, res *AppendEntryRes) error {
+func (r *raft) appendEntries(args AppendEntry, res *AppendEntryApply) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	// ========== 接收日志条目 ==========
-	// todo 日志复制
+	if len(args.entries) != 0 {
+		// todo 日志复制
+		return nil
+	}
 
 	// ========== 接收心跳 ==========
-	if r.roleType != Leader && args.term >= r.term {
-		// follower/candidate 接收到心跳，重置计时器
-		r.roleType = Follower
+	if args.term >= r.term {
+		// 任期数落后或相等
+		if r.roleType == Candidate {
+			// 如果是候选者，需要降级
+			r.roleType = Follower
+			r.voteMap = make(map[int]bool)
+		}
+		r.term = args.term
+		res.term = r.term
+		res.success = true
 		r.setTimer(300, 500)
+		return nil
 	}
+
+	// 发送心跳的 Leader 任期数落后
 	res.term = r.term
-	res.success = false
+	res.success = true
 	return nil
 }
 
 // follower 和 candidate 开放的 rpc接口，由 candidate 调用
-func (r *raft) requestVote(args RequestVote, res *RequestVoteRes) error {
+func (r *raft) requestVote(args RequestVote, res *RequestVoteApply) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -249,6 +271,7 @@ func (r *raft) requestVote(args RequestVote, res *RequestVoteRes) error {
 			// 当前节点是候选者，自动降级，投出第一票
 			r.roleType = Follower
 			res.term = argsTerm
+			r.voteMap = make(map[int]bool)
 			r.voteMap[argsTerm] = true
 			res.voteGranted = true
 		} else if !r.voteMap[argsTerm] {
