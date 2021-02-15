@@ -6,16 +6,16 @@ import (
 
 type Persister interface {
 	// 持久化 raftState
-	saveRaftState(raftState) error
+	SaveRaftState(raftState) error
 
 	// 加载 raftState
-	loadRaftState() (raftState, error)
+	LoadRaftState() (raftState, error)
 
 	// 持久化快照
-	saveSnapshot(ss snapshot) error
+	SaveSnapshot(ss snapshot) error
 
 	// 加载快照
-	loadSnapshot() (snapshot, error)
+	LoadSnapshot() (snapshot, error)
 }
 
 type raftState struct {
@@ -43,22 +43,22 @@ func newPersister(fsm Fsm) *defaultPersister {
 }
 
 // 持久化 raftState
-func (ps *defaultPersister) saveRaftState(state raftState) error {
+func (ps *defaultPersister) SaveRaftState(state raftState) error {
 	return nil
 }
 
 // 加载 raftState
-func (ps *defaultPersister) loadRaftState() (raftState, error) {
+func (ps *defaultPersister) LoadRaftState() (raftState, error) {
 	return raftState{}, nil
 }
 
 // 持久化快照
-func (ps *defaultPersister) saveSnapshot(ss snapshot) error {
+func (ps *defaultPersister) SaveSnapshot(ss snapshot) error {
 	return nil
 }
 
 // 加载快照
-func (ps *defaultPersister) loadSnapshot() (snapshot, error) {
+func (ps *defaultPersister) LoadSnapshot() (snapshot, error) {
 	return snapshot{}, nil
 }
 
