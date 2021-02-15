@@ -29,8 +29,10 @@ type AppendEntry struct {
 }
 
 type AppendEntryReply struct {
-	term    int  // 当前时刻所属任期，用于领导者更新自身
-	success bool // 如果关注者包含与prevLogIndex和prevLogTerm匹配的条目，则为true
+	term    int    // 当前时刻所属任期，用于领导者更新自身
+	success bool   // 如果关注者包含与prevLogIndex和prevLogTerm匹配的条目，则为true
+	data    []byte // 节点应用状态机的返回值
+	err     error  // 节点应用状态机发生的错误
 }
 
 type RequestVote struct {
@@ -175,7 +177,7 @@ func (r *Raft) leaderLoop() {
 	for range r.timer.C {
 		// 每隔一段时间发送心跳
 		r.mu.Lock()
-		if r.commitIndex < len(r.entries) - 1 {
+		if r.commitIndex < len(r.entries)-1 {
 			// 还有未提交的日志，说明正在进行日志复制，不发送心跳
 			continue
 		}
@@ -183,7 +185,7 @@ func (r *Raft) leaderLoop() {
 			if id == r.me {
 				continue
 			}
-			if r.matchIndex[id] < len(r.entries) - 1 {
+			if r.matchIndex[id] < len(r.entries)-1 {
 				// 没有跟上进度的 Follower 正在进行日志复制，不发送心跳
 				continue
 			}
@@ -296,32 +298,63 @@ func (r *Raft) appendEntries(args AppendEntry, res *AppendEntryReply) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if args.term < r.term {
+		// 发送请求的 Leader 任期数落后
+		res.term = r.term
+		res.success = false
+		return nil
+	}
+
 	// ========== 接收日志条目 ==========
 	if len(args.entries) != 0 {
-		// todo 日志复制
+		prevIndex := args.prevLogIndex
+		if prevIndex >= len(r.entries) || r.entries[prevIndex].term != args.prevLogTerm {
+			res.term = r.term
+			res.success = false
+			return nil
+		}
+		// 将新条目添加到日志中，如果已经存在，则覆盖
+		// todo 仅支持 leader 每次发送一个日志条目
+		r.entries = append(r.entries[:prevIndex+1], args.entries[0])
+		// 提交日志条目，并应用到状态机
+		r.applyFsm(args.leaderCommit, res)
 		return nil
 	}
 
 	// ========== 接收心跳 ==========
-	if args.term >= r.term {
-		// 任期数落后或相等
-		if r.roleType == Candidate {
-			// 如果是候选者，需要降级
-			r.roleType = Follower
-			r.voteMap = make(map[int]bool)
-		}
-		r.term = args.term
-		r.leader = args.leaderId
-		res.term = r.term
-		res.success = true
-		r.setTimer(300, 500)
-		return nil
+	// 任期数落后或相等
+	if r.roleType == Candidate {
+		// 如果是候选者，需要降级
+		r.roleType = Follower
+		r.voteMap = make(map[int]bool)
 	}
-
-	// 发送心跳的 Leader 任期数落后
+	r.term = args.term
+	r.leader = args.leaderId
 	res.term = r.term
 	res.success = true
+	r.setTimer(300, 500)
+
+	// 提交日志条目，并应用到状态机
+	r.applyFsm(args.leaderCommit, res)
+
 	return nil
+}
+
+// 提交日志条目，并应用到状态机
+func (r *Raft) applyFsm(leaderCommit int, res *AppendEntryReply) {
+	prevCommit := r.commitIndex
+	if leaderCommit > r.commitIndex {
+		if leaderCommit >= len(r.entries)-1 {
+			r.commitIndex = len(r.entries) - 1
+		} else {
+			r.commitIndex = leaderCommit
+		}
+	}
+
+	if prevCommit != r.commitIndex {
+		logentry := r.entries[r.commitIndex]
+		res.data, res.err = r.fsm.Apply(logentry.data)
+	}
 }
 
 // follower 和 candidate 开放的 rpc接口，由 candidate 调用
@@ -391,8 +424,8 @@ func (r *Raft) Request(request ClientRequest, response *ClientResponse) error {
 	// 日志复制
 	newEntry := entry{
 		index: r.commitIndex + 1,
-		term: r.term,
-		data: request.data,
+		term:  r.term,
+		data:  request.data,
 	}
 	finalPrevIndex := len(r.entries) - 1
 	r.entries = append(r.entries, newEntry)
@@ -415,12 +448,12 @@ func (r *Raft) Request(request ClientRequest, response *ClientResponse) error {
 			// Follower 节点中必须存在第 prevIndex 条日志，才能接受第 nextIndex 条日志
 			// 如果 Follower 节点缺少很多日志，需要找到缺少的第一条日志的索引
 			args := AppendEntry{
-				term: r.term,
-				leaderId: r.me,
+				term:         r.term,
+				leaderId:     r.me,
 				prevLogIndex: prevIndex,
-				prevLogTerm: r.entries[prevIndex].term,
+				prevLogTerm:  r.entries[prevIndex].term,
 				leaderCommit: r.commitIndex,
-				entries: r.entries[prevIndex:r.nextIndex[id]],
+				entries:      r.entries[prevIndex:r.nextIndex[id]],
 			}
 			res := &AppendEntryReply{}
 			err = client.Call("Raft.AppendEntries", args, res)
@@ -449,12 +482,12 @@ func (r *Raft) Request(request ClientRequest, response *ClientResponse) error {
 			prevIndex = r.nextIndex[id] - 1
 			// 给 Follower 发送缺失的日志，发送的日志的索引一直递增到最新
 			args := AppendEntry{
-				term: r.term,
-				leaderId: r.me,
+				term:         r.term,
+				leaderId:     r.me,
 				prevLogIndex: prevIndex,
-				prevLogTerm: r.entries[prevIndex].term,
+				prevLogTerm:  r.entries[prevIndex].term,
 				leaderCommit: r.commitIndex,
-				entries: r.entries[prevIndex:r.nextIndex[id]],
+				entries:      r.entries[prevIndex:r.nextIndex[id]],
 			}
 			res := &AppendEntryReply{}
 			err = client.Call("Raft.AppendEntries", args, res)
@@ -487,7 +520,7 @@ func (r *Raft) Request(request ClientRequest, response *ClientResponse) error {
 		}
 	}
 
-	if successCnt >= len(r.peers) / 2 {
+	if successCnt >= len(r.peers)/2 {
 		// 新日志成功发送到过半 Follower 节点
 		r.commitIndex += 1
 		applyRes, err := r.fsm.Apply(request.data)
@@ -516,7 +549,7 @@ func (r *Raft) Apply(data []byte) error {
 		return err
 	}
 	defer func() {
-		if err = client.Close();err != nil {
+		if err = client.Close(); err != nil {
 			log.Println(err)
 		}
 	}()
