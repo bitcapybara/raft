@@ -36,10 +36,10 @@ type AppendEntryReply struct {
 }
 
 type RequestVote struct {
-	term          int    // 当前时刻所属任期
-	candidateAddr string // 候选人地址
-	lastLogIndex  int    // 发送此请求的 Candidate 最后一个日志条目的索引
-	lastLogTerm   int    // lastLogIndex 所处的任期
+	term         int    // 当前时刻所属任期
+	candidateId  nodeId // 候选人id
+	lastLogIndex int    // 发送此请求的 Candidate 最后一个日志条目的索引
+	lastLogTerm  int    // lastLogIndex 所处的任期
 }
 
 type RequestVoteReply struct {
@@ -72,6 +72,10 @@ type Raft struct {
 	// 当前时刻所处的 term
 	term int
 
+	// 当前任期获得选票的 Candidate
+	// 由 Follower 维护，当前节点 term 值改变时重置为空
+	votedFor nodeId
+
 	// 客户端状态机
 	fsm Fsm
 
@@ -103,9 +107,6 @@ type Raft struct {
 	// 当前节点为 Leader 时，为心跳计时器
 	timer *time.Timer
 
-	// 选举投票记录，仅在当前角色为 Follower 时可用
-	voteMap map[int]bool
-
 	mu sync.Mutex
 }
 
@@ -123,7 +124,7 @@ func NewRaft(peers map[nodeId]nodeAddr, me nodeId, fsm Fsm) *Raft {
 		rf.matchIndex[id] = 0
 		rf.nextIndex[id] = 1
 	}
-	rf.voteMap = make(map[int]bool)
+	rf.votedFor = ""
 	return rf
 }
 
@@ -215,7 +216,7 @@ func (r *Raft) leaderLoop() {
 				// 当前任期数落后，降级为 Follower
 				r.roleType = Follower
 				r.term = res.term
-				r.voteMap = make(map[int]bool)
+				r.votedFor = ""
 				break
 			}
 		}
@@ -235,10 +236,12 @@ func (r *Raft) normalLoop() {
 		// 发送投票请求
 		vote := 0
 		r.term += 1
+		r.votedFor = ""
 		for id, addr := range r.peers {
 			if id == r.me {
 				// 投票给自己
 				vote += 1
+				r.votedFor = r.me
 				continue
 			}
 			client, err := rpc.Dial("tcp", string(addr))
@@ -248,8 +251,8 @@ func (r *Raft) normalLoop() {
 			}
 
 			args := RequestVote{
-				term:          r.term,
-				candidateAddr: string(addr),
+				term:        r.term,
+				candidateId: id,
 			}
 			res := &RequestVoteReply{}
 			err = client.Call("Raft.requestVote", args, res)
@@ -267,6 +270,7 @@ func (r *Raft) normalLoop() {
 				// 当前节点任期落后，则退出竞选
 				r.roleType = Follower
 				r.term = res.term
+				r.votedFor = ""
 				break
 			}
 		}
@@ -326,9 +330,10 @@ func (r *Raft) appendEntries(args AppendEntry, res *AppendEntryReply) error {
 	if r.roleType == Candidate {
 		// 如果是候选者，需要降级
 		r.roleType = Follower
-		r.voteMap = make(map[int]bool)
+
 	}
 	r.term = args.term
+	r.votedFor = ""
 	r.leader = args.leaderId
 	res.term = r.term
 	res.success = true
@@ -364,40 +369,34 @@ func (r *Raft) requestVote(args RequestVote, res *RequestVoteReply) error {
 
 	argsTerm := args.term
 
-	// 拉票的候选者任期落后
 	if argsTerm < r.term {
+		// 拉票的候选者任期落后，不投票
 		res.term = r.term
 		res.voteGranted = false
 		return nil
 	}
 
-	// 当前节点所处任期数落后
 	if argsTerm > r.term {
-		if r.roleType == Candidate {
-			// 当前节点是候选者，自动降级，投出第一票
-			r.roleType = Follower
-			res.term = argsTerm
-			r.voteMap = make(map[int]bool)
-			r.voteMap[argsTerm] = true
-			res.voteGranted = true
-		} else if !r.voteMap[argsTerm] {
-			// 当前节点是追随者且没有投过票，则投出第一票
-			res.voteGranted = true
-		} else {
-			// 当前节点是追随者且已投过票，则不投票
-			res.voteGranted = false
-		}
-		res.term = argsTerm
 		r.term = argsTerm
-		return nil
+		r.votedFor = ""
+		if r.roleType == Candidate {
+			// 当前节点是候选者，自动降级
+			r.roleType = Follower
+		}
 	}
 
-	// 拉票者和当前节点任期数相同
-	// 无论当前节点是候选者还是追随者，都不投票
-	if argsTerm == r.term {
-		res.term = argsTerm
-		res.voteGranted = false
+	res.term = argsTerm
+	res.voteGranted = false
+	if r.votedFor == "" || r.votedFor == args.candidateId {
+		// 当前节点是追随者且没有投过票，则投出第一票
+		lastIndex := len(r.entries) - 1
+		lastTerm := r.entries[lastIndex].term
+		if args.lastLogTerm > lastTerm || (args.lastLogTerm == lastTerm && args.lastLogIndex >= lastIndex) {
+			r.votedFor = args.candidateId
+			res.voteGranted = true
+		}
 	}
+
 	return nil
 }
 
@@ -463,7 +462,7 @@ func (r *Raft) Request(request ClientRequest, response *ClientResponse) error {
 			if res.term > r.term {
 				// 如果任期数小，降级为 Follower
 				r.roleType = Follower
-				r.voteMap = make(map[int]bool)
+				r.votedFor = ""
 				err = client.Close()
 				if err != nil {
 					log.Println(err)
@@ -497,7 +496,7 @@ func (r *Raft) Request(request ClientRequest, response *ClientResponse) error {
 			if res.term > r.term {
 				// 如果任期数小，降级为 Follower
 				r.roleType = Follower
-				r.voteMap = make(map[int]bool)
+				r.votedFor = ""
 				err = client.Close()
 				if err != nil {
 					log.Println(err)
