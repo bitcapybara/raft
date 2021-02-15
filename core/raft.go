@@ -49,7 +49,21 @@ type nodeId string
 
 type nodeAddr string
 
-type raft struct {
+// 客户端实现此状态机来应用接收到的日志命令
+type Fsm interface {
+	Apply(data []byte) ([]byte, error)
+}
+
+// 日志条目
+type entry struct {
+	index int    // 此条目的索引
+	term  int    // 日志项所在term
+	data  []byte // 状态机命令
+}
+
+type entries []entry
+
+type Raft struct {
 	// 当前节点的角色
 	roleType roleType
 
@@ -93,8 +107,8 @@ type raft struct {
 	mu sync.Mutex
 }
 
-func NewRaft(peers map[nodeId]nodeAddr, me nodeId, fsm Fsm) *raft {
-	rf := new(raft)
+func NewRaft(peers map[nodeId]nodeAddr, me nodeId, fsm Fsm) *Raft {
+	rf := new(Raft)
 	rf.roleType = Follower
 	rf.term = 0
 	rf.fsm = fsm
@@ -111,7 +125,7 @@ func NewRaft(peers map[nodeId]nodeAddr, me nodeId, fsm Fsm) *raft {
 	return rf
 }
 
-func (r *raft) Start() {
+func (r *Raft) Start() {
 	// 设定计时器，开始后台线程
 	go r.loop()
 
@@ -145,7 +159,7 @@ func (r *raft) Start() {
 }
 
 // 后台循环执行的定时器
-func (r *raft) loop() {
+func (r *Raft) loop() {
 	for {
 		if r.roleType == Leader {
 			r.leaderLoop()
@@ -156,13 +170,21 @@ func (r *raft) loop() {
 }
 
 // leader 循环
-func (r *raft) leaderLoop() {
+func (r *Raft) leaderLoop() {
 	r.setTimer(30, 50)
 	for range r.timer.C {
 		// 每隔一段时间发送心跳
 		r.mu.Lock()
+		if r.commitIndex < len(r.entries) - 1 {
+			// 还有未提交的日志，说明正在进行日志复制，不发送心跳
+			continue
+		}
 		for id, addr := range r.peers {
 			if id == r.me {
+				continue
+			}
+			if r.matchIndex[id] < len(r.entries) - 1 {
+				// 没有跟上进度的 Follower 正在进行日志复制，不发送心跳
 				continue
 			}
 			client, err := rpc.Dial("tcp", string(addr))
@@ -179,7 +201,7 @@ func (r *raft) leaderLoop() {
 				leaderCommit: r.commitIndex,
 			}
 			res := &AppendEntryReply{}
-			err = client.Call("raft.requestVote", args, res)
+			err = client.Call("Raft.requestVote", args, res)
 			if err != nil {
 				log.Printf("调用rpc服务失败：%s%s\n", addr, err)
 			}
@@ -201,7 +223,7 @@ func (r *raft) leaderLoop() {
 }
 
 // follower 和 candidate 循环
-func (r *raft) normalLoop() {
+func (r *Raft) normalLoop() {
 	r.setTimer(300, 500)
 	for range r.timer.C {
 		// 等待超时，开始新一轮竞选
@@ -228,7 +250,7 @@ func (r *raft) normalLoop() {
 				candidateAddr: string(addr),
 			}
 			res := &RequestVoteReply{}
-			err = client.Call("raft.requestVote", args, res)
+			err = client.Call("Raft.requestVote", args, res)
 			if err != nil {
 				log.Printf("调用rpc服务失败：%s%s\n", addr, err)
 			}
@@ -259,7 +281,7 @@ func (r *raft) normalLoop() {
 	}
 }
 
-func (r *raft) setTimer(min int, max int) {
+func (r *Raft) setTimer(min int, max int) {
 	r.mu.Lock()
 	if r.timer == nil {
 		r.timer = time.NewTimer(time.Millisecond * time.Duration(util.RandInt(min, max)))
@@ -270,7 +292,7 @@ func (r *raft) setTimer(min int, max int) {
 }
 
 // follower 和 candidate 开放的 rpc接口，由 leader 调用
-func (r *raft) appendEntries(args AppendEntry, res *AppendEntryReply) error {
+func (r *Raft) appendEntries(args AppendEntry, res *AppendEntryReply) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -303,7 +325,7 @@ func (r *raft) appendEntries(args AppendEntry, res *AppendEntryReply) error {
 }
 
 // follower 和 candidate 开放的 rpc接口，由 candidate 调用
-func (r *raft) requestVote(args RequestVote, res *RequestVoteReply) error {
+func (r *Raft) requestVote(args RequestVote, res *RequestVoteReply) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -355,7 +377,7 @@ type ClientResponse struct {
 }
 
 // 当前节点是 Leader 时开放的 rpc 接口，接受客户端请求
-func (r *raft) Request(request ClientRequest, response *ClientResponse) error {
+func (r *Raft) Request(request ClientRequest, response *ClientResponse) error {
 
 	// 当前节点是 Leader 才接受此调用
 	isLeader := r.me == r.leader
@@ -364,12 +386,7 @@ func (r *raft) Request(request ClientRequest, response *ClientResponse) error {
 	}
 
 	r.mu.Lock()
-	// 日志复制和心跳互斥
-	r.timer.Stop()
-	defer func() {
-		r.mu.Unlock()
-		r.setTimer(30, 50)
-	}()
+	defer r.mu.Unlock()
 
 	// 日志复制
 	newEntry := entry{
@@ -406,7 +423,7 @@ func (r *raft) Request(request ClientRequest, response *ClientResponse) error {
 				entries: r.entries[prevIndex:r.nextIndex[id]],
 			}
 			res := &AppendEntryReply{}
-			err = client.Call("raft.AppendEntries", args, res)
+			err = client.Call("Raft.AppendEntries", args, res)
 			if err != nil {
 				log.Println(err)
 			}
@@ -440,7 +457,7 @@ func (r *raft) Request(request ClientRequest, response *ClientResponse) error {
 				entries: r.entries[prevIndex:r.nextIndex[id]],
 			}
 			res := &AppendEntryReply{}
-			err = client.Call("raft.AppendEntries", args, res)
+			err = client.Call("Raft.AppendEntries", args, res)
 			if err != nil {
 				log.Println(err)
 			}
@@ -485,7 +502,7 @@ func (r *raft) Request(request ClientRequest, response *ClientResponse) error {
 }
 
 // 客户端调用此方法来应用日志条目
-func (r *raft) Apply(data []byte) error {
+func (r *Raft) Apply(data []byte) error {
 	// 将请求重定向到 Leader
 	if r.leader == "" {
 		return errors.New("找不到 Leader 节点")
@@ -507,7 +524,7 @@ func (r *raft) Apply(data []byte) error {
 	args := ClientRequest{data: data}
 	res := &ClientResponse{}
 	// 调用 Leader 节点 rpc 接口
-	err = client.Call("raft.Request", args, res)
+	err = client.Call("Raft.Request", args, res)
 	if err != nil {
 		return err
 	}
