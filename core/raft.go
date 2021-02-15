@@ -67,6 +67,7 @@ type entries []entry
 
 type Raft struct {
 	// 当前节点的角色
+	// todo 使用有限状态机实现角色的转换
 	roleType roleType
 
 	// 当前时刻所处的 term
@@ -357,8 +358,9 @@ func (r *Raft) applyFsm(leaderCommit int, res *AppendEntryReply) {
 	}
 
 	if prevCommit != r.commitIndex {
-		logentry := r.entries[r.commitIndex]
-		res.data, res.err = r.fsm.Apply(logentry.data)
+		logEntry := r.entries[r.commitIndex]
+		res.data, res.err = r.fsm.Apply(logEntry.data)
+		r.lastApplied += 1
 	}
 }
 
