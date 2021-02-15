@@ -1,6 +1,22 @@
 package core
 
-import "encoding/gob"
+import (
+	"encoding/gob"
+)
+
+type Persister interface {
+	// 持久化 raftState
+	saveRaftState(raftState) error
+
+	// 加载 raftState
+	loadRaftState() (raftState, error)
+
+	// 持久化快照
+	saveSnapshot(ss snapshot) error
+
+	// 加载快照
+	loadSnapshot() (snapshot, error)
+}
 
 type raftState struct {
 	Term     int
@@ -14,33 +30,35 @@ type snapshot struct {
 	state     Fsm
 }
 
-type persister struct {
-	raftStatePath string
-	snapshotPath string
+// 持久化器的默认实现，保存在文件中
+type defaultPersister struct {
+	filePath string
 }
 
-func NewPersister(fsm Fsm) *persister {
+func newPersister(fsm Fsm) *defaultPersister {
 	gob.Register(fsm)
-	return &persister{}
+	dp := new(defaultPersister)
+	dp.filePath = "./persist.store"
+	return dp
 }
 
 // 持久化 raftState
-func (ps *persister) saveRaftState(state raftState) error {
+func (ps *defaultPersister) saveRaftState(state raftState) error {
 	return nil
 }
 
 // 加载 raftState
-func (ps *persister) loadRaftState() (raftState, error) {
+func (ps *defaultPersister) loadRaftState() (raftState, error) {
 	return raftState{}, nil
 }
 
-// 保存快照
-func (ps *persister) saveSnapshot(ss snapshot) error {
+// 持久化快照
+func (ps *defaultPersister) saveSnapshot(ss snapshot) error {
 	return nil
 }
 
 // 加载快照
-func (ps *persister) loadSnapshot() (snapshot, error) {
+func (ps *defaultPersister) loadSnapshot() (snapshot, error) {
 	return snapshot{}, nil
 }
 
