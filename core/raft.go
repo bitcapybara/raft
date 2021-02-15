@@ -63,8 +63,6 @@ type entry struct {
 	data  []byte // 状态机命令
 }
 
-type entries []entry
-
 type Raft struct {
 	// 当前节点的角色
 	// todo 使用有限状态机实现角色的转换
@@ -90,7 +88,7 @@ type Raft struct {
 	leader nodeId
 
 	// 当前节点保存的日志
-	entries entries
+	entries []entry
 
 	// 已经提交的最大的日志索引，由当前节点维护。
 	commitIndex int
@@ -119,7 +117,7 @@ func NewRaft(peers map[nodeId]nodeAddr, me nodeId, fsm Fsm) *Raft {
 	rf.peers = peers
 	rf.me = me
 	rf.leader = ""
-	rf.entries = make(entries, 0)
+	rf.entries = make([]entry, 0)
 	rf.commitIndex = 0
 	for id := range peers {
 		rf.matchIndex[id] = 0
