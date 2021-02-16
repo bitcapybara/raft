@@ -1,65 +1,64 @@
 package core
 
-import (
-	"encoding/gob"
-)
+import "encoding/gob"
+
+type RaftStatePersister interface {
+
+	SaveRaftState(RaftState) error
+
+	LoadRaftState() (RaftState, error)
+}
+
+type SnapshotPersister interface {
+
+	SaveSnapshot(Snapshot) error
+
+	LoadSnapshot() (Snapshot, error)
+}
 
 type Persister interface {
-	// 持久化 raftState
-	SaveRaftState(raftState) error
 
-	// 加载 raftState
-	LoadRaftState() (raftState, error)
+	RaftStatePersister
 
-	// 持久化快照
-	SaveSnapshot(ss snapshot) error
-
-	// 加载快照
-	LoadSnapshot() (snapshot, error)
+	SnapshotPersister
 }
 
-type raftState struct {
+type RaftState struct {
 	Term     int
-	VotedFor int
-	Entries  []entry
+	VotedFor NodeId
+	Entries  []Entry
 }
 
-type snapshot struct {
+type Snapshot struct {
 	lastIndex int
 	lastTerm  int
 	state     Fsm
 }
 
 // 持久化器的默认实现，保存在文件中
-type defaultPersister struct {
+type DefaultPersister struct {
 	filePath string
 }
 
-func newPersister(fsm Fsm) *defaultPersister {
+func NewPersister(fsm Fsm) *DefaultPersister {
 	gob.Register(fsm)
-	dp := new(defaultPersister)
+	dp := new(DefaultPersister)
 	dp.filePath = "./persist.store"
 	return dp
 }
 
-// 持久化 raftState
-func (ps *defaultPersister) SaveRaftState(state raftState) error {
-	return nil
+func (d *DefaultPersister) SaveRaftState(state RaftState) error {
+	panic("implement me")
 }
 
-// 加载 raftState
-func (ps *defaultPersister) LoadRaftState() (raftState, error) {
-	return raftState{}, nil
+func (d *DefaultPersister) LoadRaftState() (RaftState, error) {
+	panic("implement me")
 }
 
-// 持久化快照
-func (ps *defaultPersister) SaveSnapshot(ss snapshot) error {
-	return nil
+func (d *DefaultPersister) SaveSnapshot(snapshot Snapshot) error {
+	panic("implement me")
 }
 
-// 加载快照
-func (ps *defaultPersister) LoadSnapshot() (snapshot, error) {
-	return snapshot{}, nil
+func (d *DefaultPersister) LoadSnapshot() (Snapshot, error) {
+	panic("implement me")
 }
-
-

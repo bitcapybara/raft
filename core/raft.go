@@ -21,11 +21,11 @@ const (
 
 type AppendEntry struct {
 	term         int     // 当前时刻所属任期
-	leaderId     nodeId  // 领导者的地址，方便 follower 重定向
+	leaderId     NodeId  // 领导者的地址，方便 follower 重定向
 	prevLogIndex int     // 要发送的日志条目的前一个条目的索引
 	prevLogTerm  int     // prevLogIndex 条目所处任期
 	leaderCommit int     // Leader 提交的索引
-	entries      []entry // 日志条目（心跳为空；为提高效率可能发送多个）
+	entries      []Entry // 日志条目（心跳为空；为提高效率可能发送多个）
 }
 
 type AppendEntryReply struct {
@@ -37,7 +37,7 @@ type AppendEntryReply struct {
 
 type RequestVote struct {
 	term         int    // 当前时刻所属任期
-	candidateId  nodeId // 候选人id
+	candidateId  NodeId // 候选人id
 	lastLogIndex int    // 发送此请求的 Candidate 最后一个日志条目的索引
 	lastLogTerm  int    // lastLogIndex 所处的任期
 }
@@ -47,48 +47,57 @@ type RequestVoteReply struct {
 	voteGranted bool // 为 true 表示候选人收到一个选票
 }
 
-type nodeId string
+type NodeId string
 
-type nodeAddr string
+type NodeAddr string
 
-// 客户端实现此状态机来应用接收到的日志命令
+// 客户端实现此状态机
 type Fsm interface {
-	Apply(data []byte) ([]byte, error)
+	// 参数实际上是 Entry 的 Data 字段
+	// 返回值是应用状态机后的结果
+	Apply([]byte) ([]byte, error)
 }
 
 // 日志条目
-type entry struct {
-	index int    // 此条目的索引
-	term  int    // 日志项所在term
-	data  []byte // 状态机命令
+type Entry struct {
+	Index int    // 此条目的索引
+	Term  int    // 日志项所在term
+	Data  []byte // 状态机命令
 }
 
-type Raft struct {
+type raft struct {
 	// 当前节点的角色
-	// todo 使用有限状态机实现角色的转换
+	// todo 使用 select + chan 实现实现角色状态机的转换
 	roleType roleType
+
+	// 持久化器
+	persister Persister
+
+	// 需要持久化的属性
+	// todo 使用 chan 实现属性的变更和持久化
+	raftState RaftState
 
 	// 当前时刻所处的 term
 	term int
 
 	// 当前任期获得选票的 Candidate
 	// 由 Follower 维护，当前节点 term 值改变时重置为空
-	votedFor nodeId
+	votedFor NodeId
 
 	// 客户端状态机
 	fsm Fsm
 
 	// 所有节点
-	peers map[nodeId]nodeAddr
+	peers map[NodeId]NodeAddr
 
 	// 当前节点在 peers 中的索引
-	me nodeId
+	me NodeId
 
 	// 当前 leader 在 peers 中的索引
-	leader nodeId
+	leader NodeId
 
 	// 当前节点保存的日志
-	entries []entry
+	entries []Entry
 
 	// 已经提交的最大的日志索引，由当前节点维护。
 	commitIndex int
@@ -97,37 +106,41 @@ type Raft struct {
 	lastApplied int
 
 	// 下一次要发送给各节点的日志索引。由 Leader 维护，初始值为 Leader 最后一个日志的索引 + 1
-	nextIndex map[nodeId]int
+	nextIndex map[NodeId]int
 
 	// 已经复制到各节点的最大的日志索引。由 Leader 维护，初始值为0
-	matchIndex map[nodeId]int
+	matchIndex map[NodeId]int
 
 	// 当前节点为 Follower / Candidate 时，为选举超时计时器
 	// 当前节点为 Leader 时，为心跳计时器
+	// todo 使用 select + chan 优化
 	timer *time.Timer
 
 	mu sync.Mutex
 }
 
-func NewRaft(peers map[nodeId]nodeAddr, me nodeId, fsm Fsm) *Raft {
-	rf := new(Raft)
+func NewRaft(peers map[NodeId]NodeAddr, me NodeId, fsm Fsm, persister Persister) *raft {
+	rf := new(raft)
 	rf.roleType = Follower
-	rf.term = 0
+	rf.persister = persister
+	raftState, err := rf.persister.LoadRaftState()
+	if err != nil {
+		log.Fatalln(err)
+	}
+	rf.term, rf.votedFor, rf.entries = raftState.Term, raftState.VotedFor, raftState.Entries
 	rf.fsm = fsm
 	rf.peers = peers
 	rf.me = me
 	rf.leader = ""
-	rf.entries = make([]entry, 0)
 	rf.commitIndex = 0
 	for id := range peers {
 		rf.matchIndex[id] = 0
 		rf.nextIndex[id] = 1
 	}
-	rf.votedFor = ""
 	return rf
 }
 
-func (r *Raft) Start() {
+func (r *raft) Start() {
 	// 设定计时器，开始后台线程
 	go r.loop()
 
@@ -161,7 +174,7 @@ func (r *Raft) Start() {
 }
 
 // 后台循环执行的定时器
-func (r *Raft) loop() {
+func (r *raft) loop() {
 	for {
 		if r.roleType == Leader {
 			r.leaderLoop()
@@ -172,7 +185,7 @@ func (r *Raft) loop() {
 }
 
 // leader 循环
-func (r *Raft) leaderLoop() {
+func (r *raft) leaderLoop() {
 	r.setTimer(30, 50)
 	for range r.timer.C {
 		// 每隔一段时间发送心跳
@@ -198,12 +211,12 @@ func (r *Raft) leaderLoop() {
 				term:         r.term,
 				leaderId:     r.me,
 				prevLogIndex: r.commitIndex,
-				prevLogTerm:  r.entries[r.commitIndex].term,
+				prevLogTerm:  r.entries[r.commitIndex].Term,
 				entries:      nil,
 				leaderCommit: r.commitIndex,
 			}
 			res := &AppendEntryReply{}
-			err = client.Call("Raft.requestVote", args, res)
+			err = client.Call("raft.requestVote", args, res)
 			if err != nil {
 				log.Printf("调用rpc服务失败：%s%s\n", addr, err)
 			}
@@ -214,8 +227,10 @@ func (r *Raft) leaderLoop() {
 			if res.term > r.term {
 				// 当前任期数落后，降级为 Follower
 				r.roleType = Follower
-				r.term = res.term
-				r.votedFor = ""
+				err := r.updateTerm(res.term)
+				if err != nil {
+					log.Println(err)
+				}
 				break
 			}
 		}
@@ -225,7 +240,7 @@ func (r *Raft) leaderLoop() {
 }
 
 // follower 和 candidate 循环
-func (r *Raft) normalLoop() {
+func (r *raft) normalLoop() {
 	r.setTimer(300, 500)
 	for range r.timer.C {
 		// 等待超时，开始新一轮竞选
@@ -234,13 +249,19 @@ func (r *Raft) normalLoop() {
 		r.roleType = Candidate
 		// 发送投票请求
 		vote := 0
-		r.term += 1
-		r.votedFor = ""
+		err := r.updateTerm(r.term + 1)
+		if err != nil {
+			log.Println(err)
+		}
 		for id, addr := range r.peers {
 			if id == r.me {
 				// 投票给自己
 				vote += 1
 				r.votedFor = r.me
+				err := r.persistRaftState()
+				if err != nil {
+					log.Println(err)
+				}
 				continue
 			}
 			client, err := rpc.Dial("tcp", string(addr))
@@ -254,7 +275,7 @@ func (r *Raft) normalLoop() {
 				candidateId: id,
 			}
 			res := &RequestVoteReply{}
-			err = client.Call("Raft.requestVote", args, res)
+			err = client.Call("raft.requestVote", args, res)
 			if err != nil {
 				log.Printf("调用rpc服务失败：%s%s\n", addr, err)
 			}
@@ -268,8 +289,10 @@ func (r *Raft) normalLoop() {
 			} else if res.term > r.term {
 				// 当前节点任期落后，则退出竞选
 				r.roleType = Follower
-				r.term = res.term
-				r.votedFor = ""
+				err := r.updateTerm(res.term)
+				if err != nil {
+					log.Println(err)
+				}
 				break
 			}
 		}
@@ -286,7 +309,20 @@ func (r *Raft) normalLoop() {
 	}
 }
 
-func (r *Raft) setTimer(min int, max int) {
+func (r *raft) persistRaftState() error {
+	err := r.persister.SaveRaftState(RaftState{r.term, r.votedFor, r.entries})
+	return err
+}
+
+func (r * raft) updateTerm(term int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.term = term
+	r.votedFor = ""
+	return r.persistRaftState()
+}
+
+func (r *raft) setTimer(min int, max int) {
 	r.mu.Lock()
 	if r.timer == nil {
 		r.timer = time.NewTimer(time.Millisecond * time.Duration(util.RandInt(min, max)))
@@ -297,7 +333,7 @@ func (r *Raft) setTimer(min int, max int) {
 }
 
 // follower 和 candidate 开放的 rpc接口，由 leader 调用
-func (r *Raft) appendEntries(args AppendEntry, res *AppendEntryReply) error {
+func (r *raft) appendEntries(args AppendEntry, res *AppendEntryReply) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -311,7 +347,7 @@ func (r *Raft) appendEntries(args AppendEntry, res *AppendEntryReply) error {
 	// ========== 接收日志条目 ==========
 	if len(args.entries) != 0 {
 		prevIndex := args.prevLogIndex
-		if prevIndex >= len(r.entries) || r.entries[prevIndex].term != args.prevLogTerm {
+		if prevIndex >= len(r.entries) || r.entries[prevIndex].Term != args.prevLogTerm {
 			res.term = r.term
 			res.success = false
 			return nil
@@ -319,6 +355,10 @@ func (r *Raft) appendEntries(args AppendEntry, res *AppendEntryReply) error {
 		// 将新条目添加到日志中，如果已经存在，则覆盖
 		// todo 仅支持 leader 每次发送一个日志条目
 		r.entries = append(r.entries[:prevIndex+1], args.entries[0])
+		err := r.persistRaftState()
+		if err != nil {
+			log.Println(err)
+		}
 		// 提交日志条目，并应用到状态机
 		r.applyFsm(args.leaderCommit, res)
 		return nil
@@ -331,8 +371,10 @@ func (r *Raft) appendEntries(args AppendEntry, res *AppendEntryReply) error {
 		r.roleType = Follower
 
 	}
-	r.term = args.term
-	r.votedFor = ""
+	err := r.updateTerm(args.term)
+	if err != nil {
+		log.Println(err)
+	}
 	r.leader = args.leaderId
 	res.term = r.term
 	res.success = true
@@ -345,7 +387,7 @@ func (r *Raft) appendEntries(args AppendEntry, res *AppendEntryReply) error {
 }
 
 // 提交日志条目，并应用到状态机
-func (r *Raft) applyFsm(leaderCommit int, res *AppendEntryReply) {
+func (r *raft) applyFsm(leaderCommit int, res *AppendEntryReply) {
 	prevCommit := r.commitIndex
 	if leaderCommit > r.commitIndex {
 		if leaderCommit >= len(r.entries)-1 {
@@ -357,13 +399,13 @@ func (r *Raft) applyFsm(leaderCommit int, res *AppendEntryReply) {
 
 	if prevCommit != r.commitIndex {
 		logEntry := r.entries[r.commitIndex]
-		res.data, res.err = r.fsm.Apply(logEntry.data)
+		res.data, res.err = r.fsm.Apply(logEntry.Data)
 		r.lastApplied += 1
 	}
 }
 
 // follower 和 candidate 开放的 rpc接口，由 candidate 调用
-func (r *Raft) requestVote(args RequestVote, res *RequestVoteReply) error {
+func (r *raft) requestVote(args RequestVote, res *RequestVoteReply) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -377,8 +419,10 @@ func (r *Raft) requestVote(args RequestVote, res *RequestVoteReply) error {
 	}
 
 	if argsTerm > r.term {
-		r.term = argsTerm
-		r.votedFor = ""
+		err := r.updateTerm(argsTerm)
+		if err != nil {
+			log.Println(err)
+		}
 		if r.roleType == Candidate {
 			// 当前节点是候选者，自动降级
 			r.roleType = Follower
@@ -390,9 +434,13 @@ func (r *Raft) requestVote(args RequestVote, res *RequestVoteReply) error {
 	if r.votedFor == "" || r.votedFor == args.candidateId {
 		// 当前节点是追随者且没有投过票，则投出第一票
 		lastIndex := len(r.entries) - 1
-		lastTerm := r.entries[lastIndex].term
+		lastTerm := r.entries[lastIndex].Term
 		if args.lastLogTerm > lastTerm || (args.lastLogTerm == lastTerm && args.lastLogIndex >= lastIndex) {
 			r.votedFor = args.candidateId
+			err := r.persistRaftState()
+			if err != nil {
+				log.Println(err)
+			}
 			res.voteGranted = true
 		}
 	}
@@ -409,7 +457,7 @@ type ClientResponse struct {
 }
 
 // 当前节点是 Leader 时开放的 rpc 接口，接受客户端请求
-func (r *Raft) Request(request ClientRequest, response *ClientResponse) error {
+func (r *raft) Request(request ClientRequest, response *ClientResponse) error {
 
 	// 当前节点是 Leader 才接受此调用
 	isLeader := r.me == r.leader
@@ -421,13 +469,17 @@ func (r *Raft) Request(request ClientRequest, response *ClientResponse) error {
 	defer r.mu.Unlock()
 
 	// 日志复制
-	newEntry := entry{
-		index: r.commitIndex + 1,
-		term:  r.term,
-		data:  request.data,
+	newEntry := Entry{
+		Index: r.commitIndex + 1,
+		Term:  r.term,
+		Data:  request.data,
 	}
 	finalPrevIndex := len(r.entries) - 1
 	r.entries = append(r.entries, newEntry)
+	err := r.persistRaftState()
+	if err != nil {
+		log.Println(err)
+	}
 
 	successCnt := 0
 	for id, addr := range r.peers {
@@ -450,19 +502,22 @@ func (r *Raft) Request(request ClientRequest, response *ClientResponse) error {
 				term:         r.term,
 				leaderId:     r.me,
 				prevLogIndex: prevIndex,
-				prevLogTerm:  r.entries[prevIndex].term,
+				prevLogTerm:  r.entries[prevIndex].Term,
 				leaderCommit: r.commitIndex,
 				entries:      r.entries[prevIndex:r.nextIndex[id]],
 			}
 			res := &AppendEntryReply{}
-			err = client.Call("Raft.AppendEntries", args, res)
+			err = client.Call("raft.AppendEntries", args, res)
 			if err != nil {
 				log.Println(err)
 			}
 			if res.term > r.term {
 				// 如果任期数小，降级为 Follower
 				r.roleType = Follower
-				r.votedFor = ""
+				err := r.updateTerm(res.term)
+				if err != nil {
+					log.Println(err)
+				}
 				err = client.Close()
 				if err != nil {
 					log.Println(err)
@@ -484,19 +539,22 @@ func (r *Raft) Request(request ClientRequest, response *ClientResponse) error {
 				term:         r.term,
 				leaderId:     r.me,
 				prevLogIndex: prevIndex,
-				prevLogTerm:  r.entries[prevIndex].term,
+				prevLogTerm:  r.entries[prevIndex].Term,
 				leaderCommit: r.commitIndex,
 				entries:      r.entries[prevIndex:r.nextIndex[id]],
 			}
 			res := &AppendEntryReply{}
-			err = client.Call("Raft.AppendEntries", args, res)
+			err = client.Call("raft.AppendEntries", args, res)
 			if err != nil {
 				log.Println(err)
 			}
 			if res.term > r.term {
 				// 如果任期数小，降级为 Follower
 				r.roleType = Follower
-				r.votedFor = ""
+				err := r.updateTerm(res.term)
+				if err != nil {
+					log.Println(err)
+				}
 				err = client.Close()
 				if err != nil {
 					log.Println(err)
@@ -534,7 +592,7 @@ func (r *Raft) Request(request ClientRequest, response *ClientResponse) error {
 }
 
 // 客户端调用此方法来应用日志条目
-func (r *Raft) Apply(data []byte) error {
+func (r *raft) Apply(data []byte) error {
 	// 将请求重定向到 Leader
 	if r.leader == "" {
 		return errors.New("找不到 Leader 节点")
@@ -556,7 +614,7 @@ func (r *Raft) Apply(data []byte) error {
 	args := ClientRequest{data: data}
 	res := &ClientResponse{}
 	// 调用 Leader 节点 rpc 接口
-	err = client.Call("Raft.Request", args, res)
+	err = client.Call("raft.Request", args, res)
 	if err != nil {
 		return err
 	}
