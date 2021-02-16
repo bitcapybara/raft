@@ -30,20 +30,20 @@ type RaftState struct {
 }
 
 type Snapshot struct {
-	lastIndex int
-	lastTerm  int
-	state     Fsm
+	LastIndex int
+	LastTerm  int
+	Data     []byte
 }
 
 // 持久化器的默认实现，保存在文件中
 type DefaultPersister struct {
-	filePath string
+	FilePath string
 }
 
 func NewPersister(fsm Fsm) *DefaultPersister {
 	gob.Register(fsm)
 	dp := new(DefaultPersister)
-	dp.filePath = "./persist.store"
+	dp.FilePath = "./persist.store"
 	return dp
 }
 

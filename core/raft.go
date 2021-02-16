@@ -29,10 +29,8 @@ type AppendEntry struct {
 }
 
 type AppendEntryReply struct {
-	term    int    // 当前时刻所属任期，用于领导者更新自身
-	success bool   // 如果关注者包含与prevLogIndex和prevLogTerm匹配的条目，则为true
-	data    []byte // 节点应用状态机的返回值
-	err     error  // 节点应用状态机发生的错误
+	term    int  // 当前时刻所属任期，用于领导者更新自身
+	success bool // 如果关注者包含与prevLogIndex和prevLogTerm匹配的条目，则为true
 }
 
 type RequestVote struct {
@@ -47,6 +45,20 @@ type RequestVoteReply struct {
 	voteGranted bool // 为 true 表示候选人收到一个选票
 }
 
+type InstallSnapshot struct {
+	term              int    // Leader 的当前 term
+	leaderId          NodeId // Leader 的 nodeId
+	lastIncludedIndex int    // 快照要替换的日志条目截止索引
+	lastIncludedTerm  int    // lastIncludedIndex 所在位置的条目的 term
+	offset            int64  // 分批发送数据时，当前块的字节偏移量
+	data              []byte // 快照的序列化数据
+	done              bool   // 分批发送是否完成
+}
+
+type InstallSnapshotReply struct {
+	term int // 接收的 Follower 的当前 term
+}
+
 type NodeId string
 
 type NodeAddr string
@@ -55,7 +67,10 @@ type NodeAddr string
 type Fsm interface {
 	// 参数实际上是 Entry 的 Data 字段
 	// 返回值是应用状态机后的结果
-	Apply([]byte) ([]byte, error)
+	Apply([]byte) error
+
+	// 生成快照二进制数据
+	Serialize() ([]byte, error)
 }
 
 // 日志条目
@@ -76,6 +91,9 @@ type raft struct {
 	// 需要持久化的属性
 	// todo 使用 chan 实现属性的变更和持久化
 	raftState RaftState
+
+	// 快照
+	snapshot Snapshot
 
 	// 当前时刻所处的 term
 	term int
@@ -123,12 +141,26 @@ func NewRaft(peers map[NodeId]NodeAddr, me NodeId, fsm Fsm, persister Persister)
 	rf := new(raft)
 	rf.roleType = Follower
 	rf.persister = persister
+	rf.fsm = fsm
+	// 加载 raftState
 	raftState, err := rf.persister.LoadRaftState()
 	if err != nil {
-		log.Fatalln(err)
+		log.Println(err)
+		rf.term, rf.votedFor, rf.entries = 0, "", make([]Entry, 0)
+	} else {
+		rf.term, rf.votedFor, rf.entries = raftState.Term, raftState.VotedFor, raftState.Entries
 	}
-	rf.term, rf.votedFor, rf.entries = raftState.Term, raftState.VotedFor, raftState.Entries
-	rf.fsm = fsm
+	// 加载 snapshot
+	snapshot, err := rf.persister.LoadSnapshot()
+	if err != nil {
+		log.Println(err)
+		rf.snapshot = Snapshot{0, 0, nil}
+	} else {
+		rf.snapshot = snapshot
+		// 使用快照初始化状态机
+		err = rf.fsm.Apply(rf.snapshot.Data)
+	}
+
 	rf.peers = peers
 	rf.me = me
 	rf.leader = ""
@@ -314,7 +346,7 @@ func (r *raft) persistRaftState() error {
 	return err
 }
 
-func (r * raft) updateTerm(term int) error {
+func (r *raft) updateTerm(term int) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.term = term
@@ -360,8 +392,7 @@ func (r *raft) appendEntries(args AppendEntry, res *AppendEntryReply) error {
 			log.Println(err)
 		}
 		// 提交日志条目，并应用到状态机
-		r.applyFsm(args.leaderCommit, res)
-		return nil
+		return r.applyFsm(args.leaderCommit, res)
 	}
 
 	// ========== 接收心跳 ==========
@@ -381,13 +412,11 @@ func (r *raft) appendEntries(args AppendEntry, res *AppendEntryReply) error {
 	r.setTimer(300, 500)
 
 	// 提交日志条目，并应用到状态机
-	r.applyFsm(args.leaderCommit, res)
-
-	return nil
+	return r.applyFsm(args.leaderCommit, res)
 }
 
 // 提交日志条目，并应用到状态机
-func (r *raft) applyFsm(leaderCommit int, res *AppendEntryReply) {
+func (r *raft) applyFsm(leaderCommit int, res *AppendEntryReply) error {
 	prevCommit := r.commitIndex
 	if leaderCommit > r.commitIndex {
 		if leaderCommit >= len(r.entries)-1 {
@@ -399,12 +428,17 @@ func (r *raft) applyFsm(leaderCommit int, res *AppendEntryReply) {
 
 	if prevCommit != r.commitIndex {
 		logEntry := r.entries[r.commitIndex]
-		res.data, res.err = r.fsm.Apply(logEntry.Data)
+		err := r.fsm.Apply(logEntry.Data)
+		if err != nil {
+			return err
+		}
 		r.lastApplied += 1
 	}
+
+	return nil
 }
 
-// follower 和 candidate 开放的 rpc接口，由 candidate 调用
+// Follower 和 Candidate 开放的 rpc 接口，由 Candidate 调用
 func (r *raft) requestVote(args RequestVote, res *RequestVoteReply) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -448,16 +482,46 @@ func (r *raft) requestVote(args RequestVote, res *RequestVoteReply) error {
 	return nil
 }
 
+// Follower 开放的 rpc 接口，由 Leader 调用
+func (r *raft) installSnapshot(args InstallSnapshot, res InstallSnapshotReply) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if args.term < r.term {
+		// Leader 的 term 过期，直接返回
+		res.term = r.term
+		return nil
+	}
+
+	// 持久化
+	res.term = r.term
+	snapshot := Snapshot{args.lastIncludedIndex, args.lastIncludedTerm, args.data}
+	err := r.persister.SaveSnapshot(snapshot)
+	if err != nil {
+		return err
+	}
+
+	if !args.done {
+		// 若传送没有完成，则继续接收数据
+		return nil
+	}
+
+	// 保存快照成功，删除多余日志
+	if args.lastIncludedIndex <= len(r.entries) && r.entries[args.lastIncludedIndex].Term == args.lastIncludedTerm {
+		r.entries = r.entries[:args.lastIncludedIndex]
+		return nil
+	}
+
+	r.entries = make([]Entry, 0)
+	return nil
+}
+
 type ClientRequest struct {
 	data []byte // 客户端请求应用到状态机的数据
 }
 
-type ClientResponse struct {
-	data []byte // 状态机应用数据后返回的结果
-}
-
 // 当前节点是 Leader 时开放的 rpc 接口，接受客户端请求
-func (r *raft) Request(request ClientRequest, response *ClientResponse) error {
+func (r *raft) Request(request ClientRequest, response *string) error {
 
 	// 当前节点是 Leader 才接受此调用
 	isLeader := r.me == r.leader
@@ -580,14 +644,62 @@ func (r *raft) Request(request ClientRequest, response *ClientResponse) error {
 	if successCnt >= len(r.peers)/2 {
 		// 新日志成功发送到过半 Follower 节点
 		r.commitIndex += 1
-		applyRes, err := r.fsm.Apply(request.data)
+		err := r.fsm.Apply(request.data)
 		if err != nil {
-			return err
+			log.Println(err)
 		}
-		response.data = applyRes
-		return nil
-	}
+		// 当日志量超过阈值时，生成快照
+		if r.commitIndex - r.snapshot.LastIndex > 1000 {
+			bytes, err := r.fsm.Serialize()
+			if err != nil {
+				return nil
+			}
 
+			// 快照数据发送给所有 Follower 节点
+			for id, addr := range r.peers {
+				if id == r.me {
+					// 自己保存快照
+					r.snapshot =  Snapshot{r.commitIndex, r.term, bytes}
+					err := r.persister.SaveSnapshot(r.snapshot)
+					if err != nil {
+						log.Println(err)
+					}
+					continue
+				}
+				client, err := rpc.Dial("tcp", string(addr))
+				if err != nil {
+					log.Println(err)
+					break
+				}
+				args := InstallSnapshot{
+					term: r.term,
+					leaderId: r.me,
+					lastIncludedIndex: r.commitIndex,
+					lastIncludedTerm: r.entries[r.commitIndex].Term,
+					offset: 0,
+					done: true,
+				}
+				res := &InstallSnapshotReply{}
+				err = client.Call("rpc.InstallSnapshot", args, res)
+				if err != nil {
+					log.Println(err)
+				}
+				err = client.Close()
+				if err != nil {
+					log.Println(err)
+				}
+				if res.term > r.term {
+					// 如果任期数小，降级为 Follower
+					r.roleType = Follower
+					err := r.updateTerm(res.term)
+					if err != nil {
+						log.Println(err)
+					}
+					break
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -612,7 +724,7 @@ func (r *raft) Apply(data []byte) error {
 	}()
 
 	args := ClientRequest{data: data}
-	res := &ClientResponse{}
+	var res *string
 	// 调用 Leader 节点 rpc 接口
 	err = client.Call("raft.Request", args, res)
 	if err != nil {
