@@ -2,31 +2,19 @@ package core
 
 import "encoding/gob"
 
-type RaftStatePersister interface {
-
-	SaveRaftState(RaftState) error
-
-	LoadRaftState() (RaftState, error)
+type HardStatePersister interface {
+	SaveHardState(*HardState) error
+	LoadHardState() (*HardState, error)
 }
 
 type SnapshotPersister interface {
-
 	SaveSnapshot(Snapshot) error
-
 	LoadSnapshot() (Snapshot, error)
 }
 
 type Persister interface {
-
-	RaftStatePersister
-
+	HardStatePersister
 	SnapshotPersister
-}
-
-type RaftState struct {
-	Term     int
-	VotedFor NodeId
-	Entries  []Entry
 }
 
 type Snapshot struct {
@@ -40,18 +28,18 @@ type DefaultPersister struct {
 	FilePath string
 }
 
-func NewPersister(fsm Fsm) *DefaultPersister {
+func NewDefaultPersister(fsm Fsm) *DefaultPersister {
 	gob.Register(fsm)
 	dp := new(DefaultPersister)
 	dp.FilePath = "./persist.store"
 	return dp
 }
 
-func (d *DefaultPersister) SaveRaftState(state RaftState) error {
+func (d *DefaultPersister) SaveHardState(state *HardState) error {
 	panic("implement me")
 }
 
-func (d *DefaultPersister) LoadRaftState() (RaftState, error) {
+func (d *DefaultPersister) LoadHardState() (*HardState, error) {
 	panic("implement me")
 }
 
