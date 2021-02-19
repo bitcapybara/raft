@@ -7,10 +7,11 @@ import (
 
 // 构造 Node 对象时的配置参数
 type Config struct {
-	Fsm                *Fsm
-	Persister          *Persister
-	peers              map[NodeId]NodeAddr
-	me                 NodeId
+	Fsm                Fsm
+	RaftStatePersister RaftStatePersister
+	SnapshotPersister  SnapshotPersister
+	Peers              map[NodeId]NodeAddr
+	Me                 NodeId
 	ElectionMinTimeout int
 	ElectionMaxTimeout int
 	HeartbeatTimeout   int
@@ -27,7 +28,7 @@ func NewNode(config Config) *Node {
 	return &Node{
 		raft:   NewRaft(config),
 		config: config,
-		timer: NewTimer(config),
+		timer:  NewTimer(config),
 	}
 }
 
@@ -64,10 +65,9 @@ func (nd *Node) rpcServer() {
 	if err != nil {
 		log.Fatalf("rpc 服务器注册服务失败：%s\n", err)
 	}
-	err = s.Serve("tcp", string(nd.config.peers[nd.config.me]))
+	err = s.Serve("tcp", string(nd.config.Peers[nd.config.Me]))
 	log.Fatalf("rpc 服务器开启监听失败：%s\n", err)
 }
-
 
 // Follower 和 Candidate 开放的 rpc接口，由 Leader 调用
 func (nd *Node) AppendEntries(args AppendEntry, res *AppendEntryReply) error {

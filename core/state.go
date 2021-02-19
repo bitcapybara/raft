@@ -10,18 +10,8 @@ const (
 	Follower                   // 追随者
 )
 
-const (
-	ElectTimeout   RoleEvent = iota // 选举计时器超时
-	MajorityVotes                   // 获得大多数节点选票
-	DiscoverLeader                  // 接收到 Leader 心跳
-	GetHigherTerm                   // 获取到更高的 term 数
-)
-
 // 角色类型
 type RoleStage uint8
-
-// 角色转换事件类型
-type RoleEvent uint8
 
 type RoleState struct {
 	roleStage   RoleStage      // 节点当前角色
@@ -34,40 +24,16 @@ func NewRoleState() *RoleState {
 	}
 }
 
-func (rs *RoleState) setRoleStage(event RoleEvent) bool {
-	rs.mu.Lock()
-	defer rs.mu.Unlock()
-
-	switch event {
-	case ElectTimeout:
-		if rs.roleStage == Follower {
-			rs.roleStage = Candidate
-			return true
-		}
-	case MajorityVotes:
-		if rs.roleStage == Candidate {
-			rs.roleStage = Leader
-			return true
-		}
-	case DiscoverLeader:
-		if rs.roleStage == Candidate {
-			rs.roleStage = Follower
-			return true
-		}
-	case GetHigherTerm:
-		if rs.roleStage != Follower {
-			rs.roleStage = Follower
-			return true
-		}
-	}
-
-	return false
+func (st *RoleState) setRoleStage(stage RoleStage) {
+	st.mu.Lock()
+	st.roleStage = stage
+	st.mu.Unlock()
 }
 
-func (rs *RoleState) getRoleStage() RoleStage {
-	rs.mu.RLock()
-	stage := rs.roleStage
-	rs.mu.RUnlock()
+func (st *RoleState) getRoleStage() RoleStage {
+	st.mu.RLock()
+	stage := st.roleStage
+	st.mu.RUnlock()
 	return stage
 }
 
@@ -97,15 +63,48 @@ type HardState struct {
 	// 当前节点保存的日志
 	entries []Entry
 
-	mu sync.RWMutex
+	// 持久化器
+	persister RaftStatePersister
+
+	mu sync.Mutex
 }
 
-func NewHardState() *HardState {
-	return &HardState{
+func NewHardState(persister RaftStatePersister) HardState {
+	return HardState{
 		term: 1,
 		votedFor: "",
 		entries: []Entry{},
+		persister: persister,
 	}
+}
+
+func (st *HardState) lastLogIndex() int {
+	st.mu.Lock()
+	lastIndex := len(st.entries) - 1
+	st.mu.Unlock()
+	return lastIndex
+}
+
+func (st *HardState) currentTerm() int {
+	st.mu.Lock()
+	term := st.term
+	st.mu.Unlock()
+	return term
+}
+
+func (st *HardState) setTerm(term int) error {
+	st.mu.Lock()
+	st.mu.Unlock()
+	// 更新状态
+	st.term = term
+	st.votedFor = ""
+	// 持久化
+	raftState := RaftState{
+		Term: st.term,
+		VotedFor: st.votedFor,
+		Entries: st.entries,
+	}
+	return st.persister.SaveHardState(raftState)
 }
 
 // ==================== SoftState ====================
@@ -119,7 +118,7 @@ type SoftState struct {
 	// 应用到状态机的最后一个日志索引
 	lastApplied int
 
-	mu sync.RWMutex
+	mu sync.Mutex
 }
 
 func NewSoftState() *SoftState {
@@ -127,6 +126,13 @@ func NewSoftState() *SoftState {
 		commitIndex: 0,
 		lastApplied: 0,
 	}
+}
+
+func (st *SoftState) softCommitIndex() int {
+	st.mu.Lock()
+	commitIndex := st.commitIndex
+	st.mu.Unlock()
+	return commitIndex
 }
 
 // ==================== PeerState ====================
@@ -143,7 +149,7 @@ type PeerState struct {
 	// 当前 leader 在 peers 中的索引
 	leader NodeId
 
-	mu sync.RWMutex
+	mu sync.Mutex
 }
 
 func NewPeerState(peers map[NodeId]NodeAddr, me NodeId) *PeerState {
@@ -152,6 +158,20 @@ func NewPeerState(peers map[NodeId]NodeAddr, me NodeId) *PeerState {
 		me: me,
 		leader: "",
 	}
+}
+
+func (st *PeerState) leaderIsMe() bool {
+	st.mu.Lock()
+	isLeader := st.leader == st.me
+	st.mu.Unlock()
+	return isLeader
+}
+
+func (st *PeerState) majority() int {
+	st.mu.Lock()
+	num := len(st.peers) / 2 + 1
+	st.mu.Unlock()
+	return num
 }
 
 // ==================== LeaderState ====================
@@ -165,7 +185,7 @@ type LeaderState struct {
 	// 已经复制到各节点的最大的日志索引。由 Leader 维护，初始值为0
 	matchIndex map[NodeId]int
 
-	mu sync.RWMutex
+	mu sync.Mutex
 }
 
 func NewLeaderState() *LeaderState {
@@ -173,4 +193,18 @@ func NewLeaderState() *LeaderState {
 		nextIndex: make(map[NodeId]int),
 		matchIndex: make(map[NodeId]int),
 	}
+}
+
+func (st *LeaderState) peerMatchIndex(id NodeId) int {
+	st.mu.Lock()
+	index := st.matchIndex[id]
+	st.mu.Unlock()
+	return index
+}
+
+func (st *LeaderState) setMatchAndNextIndex(id NodeId, matchIndex, nextIndex int) {
+	st.mu.Lock()
+	st.matchIndex[id] = matchIndex
+	st.nextIndex[id] = nextIndex
+	st.mu.Unlock()
 }

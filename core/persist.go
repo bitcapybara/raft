@@ -2,9 +2,11 @@ package core
 
 import "encoding/gob"
 
-type HardStatePersister interface {
-	SaveHardState(*HardState) error
-	LoadHardState() (*HardState, error)
+type RaftStatePersister interface {
+	// 每次 raft 的状态改变，都会调用此方法
+	// entries 字段在变化之后进行持久化即可
+	SaveHardState(RaftState) error
+	LoadHardState() (RaftState, error)
 }
 
 type SnapshotPersister interface {
@@ -12,15 +14,25 @@ type SnapshotPersister interface {
 	LoadSnapshot() (Snapshot, error)
 }
 
-type Persister interface {
-	HardStatePersister
-	SnapshotPersister
+type RaftState struct {
+	Term     int
+	VotedFor NodeId
+	Entries  []Entry
+}
+
+func (rs RaftState) toHardState(persister RaftStatePersister) HardState {
+	return HardState{
+		term:     rs.Term,
+		votedFor: rs.VotedFor,
+		entries:  rs.Entries,
+		persister: persister,
+	}
 }
 
 type Snapshot struct {
 	LastIndex int
 	LastTerm  int
-	Data     []byte
+	Data      []byte
 }
 
 // 持久化器的默认实现，保存在文件中
@@ -35,11 +47,11 @@ func NewDefaultPersister(fsm Fsm) *DefaultPersister {
 	return dp
 }
 
-func (d *DefaultPersister) SaveHardState(state *HardState) error {
+func (d *DefaultPersister) SaveHardState(state RaftState) error {
 	panic("implement me")
 }
 
-func (d *DefaultPersister) LoadHardState() (*HardState, error) {
+func (d *DefaultPersister) LoadHardState() (RaftState, error) {
 	panic("implement me")
 }
 
