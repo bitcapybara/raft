@@ -14,13 +14,13 @@ const (
 type RoleStage uint8
 
 type RoleState struct {
-	roleStage   RoleStage      // 节点当前角色
-	mu sync.RWMutex
+	roleStage RoleStage // 节点当前角色
+	mu        sync.RWMutex
 }
 
 func NewRoleState() *RoleState {
 	return &RoleState{
-		roleStage:   Follower,
+		roleStage: Follower,
 	}
 }
 
@@ -52,28 +52,18 @@ type NodeAddr string
 
 // 需要持久化存储的状态
 type HardState struct {
-
-	// 当前时刻所处的 term
-	term int
-
-	// 当前任期获得选票的 Candidate
-	// 由 Follower 维护，当前节点 term 值改变时重置为空
-	votedFor NodeId
-
-	// 当前节点保存的日志
-	entries []Entry
-
-	// 持久化器
-	persister RaftStatePersister
-
-	mu sync.Mutex
+	term      int                // 当前时刻所处的 term
+	votedFor  NodeId             // 当前任期获得选票的 Candidate
+	entries   []Entry            // 当前节点保存的日志
+	persister RaftStatePersister // 持久化器
+	mu        sync.Mutex
 }
 
 func NewHardState(persister RaftStatePersister) HardState {
 	return HardState{
-		term: 1,
-		votedFor: "",
-		entries: []Entry{},
+		term:      1,
+		votedFor:  "",
+		entries:   []Entry{},
 		persister: persister,
 	}
 }
@@ -92,33 +82,44 @@ func (st *HardState) currentTerm() int {
 	return term
 }
 
+func (st *HardState) logEntryTerm(index int) int {
+	st.mu.Lock()
+	term := st.entries[index].Term
+	st.mu.Unlock()
+	return term
+}
+
 func (st *HardState) setTerm(term int) error {
 	st.mu.Lock()
-	st.mu.Unlock()
-	// 更新状态
+	defer st.mu.Unlock()
 	st.term = term
 	st.votedFor = ""
-	// 持久化
+	return st.persist()
+}
+
+func (st *HardState) vote(id NodeId) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.votedFor = id
+	return st.persist()
+}
+
+func (st *HardState) persist() error {
 	raftState := RaftState{
-		Term: st.term,
+		Term:     st.term,
 		VotedFor: st.votedFor,
-		Entries: st.entries,
+		Entries:  st.entries,
 	}
-	return st.persister.SaveHardState(raftState)
+	return st.persister.SaveRaftState(raftState)
 }
 
 // ==================== SoftState ====================
 
 // 保存在内存中的实时状态
 type SoftState struct {
-
-	// 已经提交的最大的日志索引，由当前节点维护。
-	commitIndex int
-
-	// 应用到状态机的最后一个日志索引
-	lastApplied int
-
-	mu sync.Mutex
+	commitIndex int // 已经提交的最大的日志索引，由当前节点维护
+	lastApplied int // 应用到状态机的最后一个日志索引
+	mu          sync.Mutex
 }
 
 func NewSoftState() *SoftState {
@@ -139,23 +140,16 @@ func (st *SoftState) softCommitIndex() int {
 
 // 对等节点状态和路由表
 type PeerState struct {
-
-	// 所有节点
-	peers map[NodeId]NodeAddr
-
-	// 当前节点在 peers 中的索引
-	me NodeId
-
-	// 当前 leader 在 peers 中的索引
-	leader NodeId
-
-	mu sync.Mutex
+	peers  map[NodeId]NodeAddr // 所有节点
+	me     NodeId              // 当前节点在 peers 中的索引
+	leader NodeId              // 当前 leader 在 peers 中的索引
+	mu     sync.Mutex
 }
 
 func NewPeerState(peers map[NodeId]NodeAddr, me NodeId) *PeerState {
 	return &PeerState{
-		peers: peers,
-		me: me,
+		peers:  peers,
+		me:     me,
 		leader: "",
 	}
 }
@@ -169,9 +163,35 @@ func (st *PeerState) leaderIsMe() bool {
 
 func (st *PeerState) majority() int {
 	st.mu.Lock()
-	num := len(st.peers) / 2 + 1
+	num := len(st.peers)/2 + 1
 	st.mu.Unlock()
 	return num
+}
+func (st *PeerState) peersMap() map[NodeId]NodeAddr {
+	st.mu.Lock()
+	peers := st.peers
+	st.mu.Unlock()
+	return peers
+}
+
+func (st *PeerState) isMe(id NodeId) bool {
+	st.mu.Lock()
+	isMe := id == st.me
+	st.mu.Unlock()
+	return isMe
+}
+
+func (st *PeerState) identity() NodeId {
+	st.mu.Lock()
+	me := st.me
+	st.mu.Unlock()
+	return me
+}
+
+func (st *PeerState) setLeader(id NodeId) {
+	st.mu.Lock()
+	st.leader = id
+	st.mu.Unlock()
 }
 
 // ==================== LeaderState ====================
@@ -190,7 +210,7 @@ type LeaderState struct {
 
 func NewLeaderState() *LeaderState {
 	return &LeaderState{
-		nextIndex: make(map[NodeId]int),
+		nextIndex:  make(map[NodeId]int),
 		matchIndex: make(map[NodeId]int),
 	}
 }

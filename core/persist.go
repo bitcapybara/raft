@@ -5,8 +5,8 @@ import "encoding/gob"
 type RaftStatePersister interface {
 	// 每次 raft 的状态改变，都会调用此方法
 	// entries 字段在变化之后进行持久化即可
-	SaveHardState(RaftState) error
-	LoadHardState() (RaftState, error)
+	SaveRaftState(RaftState) error
+	LoadRaftState() (RaftState, error)
 }
 
 type SnapshotPersister interface {
@@ -47,11 +47,11 @@ func NewDefaultPersister(fsm Fsm) *DefaultPersister {
 	return dp
 }
 
-func (d *DefaultPersister) SaveHardState(state RaftState) error {
+func (d *DefaultPersister) SaveRaftState(state RaftState) error {
 	panic("implement me")
 }
 
-func (d *DefaultPersister) LoadHardState() (RaftState, error) {
+func (d *DefaultPersister) LoadRaftState() (RaftState, error) {
 	panic("implement me")
 }
 
