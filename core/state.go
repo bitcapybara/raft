@@ -149,6 +149,13 @@ func (st *HardState) clearEntries() {
 	st.mu.Unlock()
 }
 
+func (st *HardState) logEntries(start, end int) []Entry {
+	st.mu.Lock()
+	entries := st.entries[start:end]
+	st.mu.Unlock()
+	return entries
+}
+
 // ==================== SoftState ====================
 
 // 保存在内存中的实时状态
@@ -288,5 +295,18 @@ func (st *LeaderState) setMatchAndNextIndex(id NodeId, matchIndex, nextIndex int
 	st.mu.Lock()
 	st.matchIndex[id] = matchIndex
 	st.nextIndex[id] = nextIndex
+	st.mu.Unlock()
+}
+
+func (st *LeaderState) peerNextIndex(id NodeId) int {
+	st.mu.Lock()
+	nextIndex := st.nextIndex[id]
+	st.mu.Unlock()
+	return nextIndex
+}
+
+func (st *LeaderState) setNextIndex(id NodeId, index int) {
+	st.mu.Lock()
+	st.nextIndex[id] = index
 	st.mu.Unlock()
 }

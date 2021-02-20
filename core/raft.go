@@ -16,7 +16,6 @@ type raft struct {
 	softState   *SoftState        // 保存在内存中的实时状态
 	peerState   *PeerState        // 对等节点状态和路由表
 	leaderState *LeaderState      // 节点是 Leader 时，保存在内存中的状态
-	mu          sync.Mutex
 }
 
 func NewRaft(config Config) *raft {
@@ -136,6 +135,18 @@ func (rf *raft) clearEntries() {
 	rf.hardState.clearEntries()
 }
 
+func (rf *raft) nextIndex(id NodeId) int {
+	return rf.leaderState.peerNextIndex(id)
+}
+
+func (rf *raft) setNextIndex(id NodeId, index int) {
+	rf.leaderState.setNextIndex(id, index)
+}
+
+func (rf *raft) entries(start, end int) []Entry {
+	return rf.hardState.logEntries(start, end)
+}
+
 // 降级为 Follower
 func (rf *raft) degrade(term int) error {
 	if rf.roleState.getRoleStage() == Follower {
@@ -230,9 +241,6 @@ func (rf *raft) heartbeat(id NodeId) {
 
 // Candidate / Follower 开启新一轮选举
 func (rf *raft) election() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	rf.setRoleStage(Candidate)
 	// 发送投票请求
 	var vote int32 = 0
@@ -301,9 +309,6 @@ func (rf *raft) election() {
 
 // Follower 和 Candidate 接收到来自 Leader 的 AppendEntries 调用
 func (rf *raft) handleCommand(args AppendEntry, res *AppendEntryReply) error {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	rfTerm := rf.term()
 	if args.term < rfTerm {
 		// 发送请求的 Leader 任期数落后
@@ -351,11 +356,7 @@ func (rf *raft) handleCommand(args AppendEntry, res *AppendEntryReply) error {
 
 // Follower 和 Candidate 接收到来自 Candidate 的 RequestVote 调用
 func (rf *raft) handleVoteReq(args RequestVote, res *RequestVoteReply) error {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	argsTerm := args.term
-
 	rfTerm := rf.term()
 	if argsTerm < rfTerm {
 		// 拉票的候选者任期落后，不投票
@@ -396,9 +397,6 @@ func (rf *raft) handleVoteReq(args RequestVote, res *RequestVoteReply) error {
 
 // Follower 接收来自 Leader 的 InstallSnapshot 调用
 func (rf *raft) handleSnapshot(args InstallSnapshot, res *InstallSnapshotReply) error {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	rfTerm := rf.term()
 	if args.term < rfTerm {
 		// Leader 的 term 过期，直接返回
@@ -430,12 +428,100 @@ func (rf *raft) handleSnapshot(args InstallSnapshot, res *InstallSnapshotReply) 
 }
 
 // 接收来自客户端的 rpc 请求
+func (rf *raft) handleClientReq(id NodeId, addr NodeAddr) error {
+	finalPrevIndex := rf.lastLogIndex()
 
-func (rf *raft) handleClientReq(args ClientRequest, res *ClientResponse) error {
-	if !rf.isLeader() {
-		res.ok = false
-		res.leaderId = rf.leaderId()
+	// 遍历所有 Follower，发送日志
+	if rf.isMe(id) {
 		return nil
 	}
+	d, err := client.NewPeer2PeerDiscovery("tcp@"+string(addr), "")
+	if err != nil {
+		log.Printf("创建rpc客户端失败：%s%s\n", addr, err)
+		return nil
+	}
+	xClient := client.NewXClient("Node", client.Failtry, client.RandomSelect, d, client.DefaultOption)
+	var prevIndex int
+	for {
+		prevIndex = rf.nextIndex(id) - 1
+		// Follower 节点中必须存在第 prevIndex 条日志，才能接受第 nextIndex 条日志
+		// 如果 Follower 节点缺少很多日志，需要找到缺少的第一条日志的索引
+		args := AppendEntry{
+			term:         rf.term(),
+			leaderId:     rf.me(),
+			prevLogIndex: prevIndex,
+			prevLogTerm:  rf.logEntryTerm(prevIndex),
+			leaderCommit: rf.commitIndex(),
+			entries:      rf.entries(prevIndex, rf.nextIndex(id)),
+		}
+		res := &AppendEntryReply{}
+		err = xClient.Call(context.Background(), "AppendEntries", args, res)
+		if err != nil {
+			log.Printf("调用rpc服务失败：%s%s\n", addr, err)
+			continue
+		}
+		if res.term > rf.term() {
+			// 如果任期数小，降级为 Follower
+			err := rf.degrade(res.term)
+			if err != nil {
+				log.Println(err)
+			}
+			err = xClient.Close()
+			if err != nil {
+				log.Println(err)
+			}
+			break
+		}
+		if res.success {
+			break
+		}
+
+		// 向前继续查找 Follower 缺少的第一条日志的索引
+		rf.setNextIndex(id, rf.nextIndex(id)-1)
+	}
+
+	for prevIndex != finalPrevIndex {
+		prevIndex = rf.nextIndex(id) - 1
+		// 给 Follower 发送缺失的日志，发送的日志的索引一直递增到最新
+		// todo 缺失的日志太多时，直接发送快照
+		args := AppendEntry{
+			term:         rf.term(),
+			leaderId:     rf.me(),
+			prevLogIndex: prevIndex,
+			prevLogTerm:  rf.logEntryTerm(prevIndex),
+			leaderCommit: rf.commitIndex(),
+			entries:      rf.entries(prevIndex, rf.nextIndex(id)),
+		}
+		res := &AppendEntryReply{}
+		err = xClient.Call(context.Background(), "AppendEntries", args, res)
+		if err != nil {
+			log.Printf("调用rpc服务失败：%s%s\n", addr, err)
+			continue
+		}
+		if res.term > rf.term() {
+			// 如果任期数小，降级为 Follower
+			err := rf.degrade(res.term)
+			if err != nil {
+				log.Println(err)
+			}
+			err = xClient.Close()
+			if err != nil {
+				log.Println(err)
+			}
+			break
+		}
+		if res.success {
+			break
+		}
+
+		// 向前继续查找 Follower 缺少的第一条日志的索引
+		rf.setMatchAndNextIndex(id, rf.nextIndex(id)-1, rf.nextIndex(id)+1)
+	}
+
+	err = xClient.Close()
+	if err != nil {
+		log.Println(err)
+	}
+
 	return nil
 }
