@@ -45,3 +45,14 @@ type InstallSnapshot struct {
 type InstallSnapshotReply struct {
 	term int // 接收的 Follower 的当前 term
 }
+
+// ==================== ClientRequest ====================
+
+type ClientRequest struct {
+	data []byte // 客户端请求应用到状态机的数据
+}
+
+type ClientResponse struct {
+	ok       bool   // 客户端请求的是 Leader 节点时，返回 true
+	leaderId NodeId // 客户端请求的不是 Leader 节点时，返回 LeaderId
+}

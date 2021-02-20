@@ -69,10 +69,7 @@ func NewHardState(persister RaftStatePersister) HardState {
 }
 
 func (st *HardState) lastLogIndex() int {
-	st.mu.Lock()
-	lastIndex := len(st.entries) - 1
-	st.mu.Unlock()
-	return lastIndex
+	return st.logLength() - 1
 }
 
 func (st *HardState) currentTerm() int {
@@ -87,6 +84,13 @@ func (st *HardState) logEntryTerm(index int) int {
 	term := st.entries[index].Term
 	st.mu.Unlock()
 	return term
+}
+
+func (st *HardState) logLength() int {
+	st.mu.Lock()
+	length := len(st.entries)
+	st.mu.Unlock()
+	return length
 }
 
 func (st *HardState) setTerm(term int) error {
@@ -113,6 +117,38 @@ func (st *HardState) persist() error {
 	return st.persister.SaveRaftState(raftState)
 }
 
+func (st *HardState) appendEntry(entry Entry) error {
+	st.mu.Lock()
+	st.entries = append(st.entries, entry)
+	return st.persist()
+}
+
+func (st *HardState) logEntry(index int) Entry {
+	st.mu.Lock()
+	entry := st.entries[index]
+	st.mu.Unlock()
+	return entry
+}
+
+func (st *HardState) getVotedFor() NodeId {
+	st.mu.Lock()
+	votedFor := st.votedFor
+	st.mu.Unlock()
+	return votedFor
+}
+
+func (st *HardState) truncateEntries(index int) {
+	st.mu.Lock()
+	st.entries = st.entries[:index]
+	st.mu.Unlock()
+}
+
+func (st *HardState) clearEntries() {
+	st.mu.Lock()
+	st.entries = make([]Entry, 0)
+	st.mu.Unlock()
+}
+
 // ==================== SoftState ====================
 
 // 保存在内存中的实时状态
@@ -134,6 +170,25 @@ func (st *SoftState) softCommitIndex() int {
 	commitIndex := st.commitIndex
 	st.mu.Unlock()
 	return commitIndex
+}
+
+func (st *SoftState) setCommitIndex(index int) {
+	st.mu.Lock()
+	st.commitIndex = index
+	st.mu.Unlock()
+}
+
+func (st *SoftState) setLastApplied(index int) {
+	st.mu.Lock()
+	st.lastApplied = index
+	st.mu.Unlock()
+}
+
+func (st *SoftState) softLastApplied() int {
+	st.mu.Lock()
+	lastApplied := st.lastApplied
+	st.mu.Unlock()
+	return lastApplied
 }
 
 // ==================== PeerState ====================
@@ -192,6 +247,13 @@ func (st *PeerState) setLeader(id NodeId) {
 	st.mu.Lock()
 	st.leader = id
 	st.mu.Unlock()
+}
+
+func (st *PeerState) leaderId() NodeId {
+	st.mu.Lock()
+	leaderId := st.leader
+	st.mu.Unlock()
+	return leaderId
 }
 
 // ==================== LeaderState ====================

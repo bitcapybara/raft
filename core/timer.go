@@ -10,30 +10,12 @@ func init() {
 	rand.Seed(time.Now().UnixNano())
 }
 
+// ==================== timer ====================
+
 type timer struct {
-	enable             bool        // 当前计时器是否有效
-	electionTimer      *time.Timer // 选举超时计时器
-	heartbeatTimer     *time.Timer // 心跳计时器
-
-	electionMinTimeout int         // 最小选举超时时间
-	electionMaxTimeout int         // 最大选举超时时间
-	heartbeatTimeout   int         // 心跳间隔时间
-
-	mu                 sync.Mutex  // 修改 enable 字段时要加锁
-}
-
-func NewTimer(config Config) *timer {
-	return &timer{
-		enable: true,
-		electionMinTimeout: config.ElectionMinTimeout,
-		electionMaxTimeout: config.ElectionMaxTimeout,
-		heartbeatTimeout: config.HeartbeatTimeout,
-	}
-}
-
-func (t *timer) initTimer() {
-	t.electionTimer = time.NewTimer(t.newElectionDuration())
-	t.heartbeatTimer = time.NewTimer(t.heartbeatDuration())
+	enable bool
+	timer  *time.Timer
+	mu     sync.Mutex
 }
 
 func (t *timer) enableTimer() {
@@ -55,24 +37,66 @@ func (t *timer) isEnable() bool {
 	return enable
 }
 
-func (t *timer) setElectionTimer() {
+func (t *timer) setTimer(duration time.Duration) {
+	t.timer.Reset(duration)
+}
+
+// ==================== timerManager ====================
+
+type timerManager struct {
+	electionTimer  *time.Timer       // 选举超时计时器
+	heartbeatTimer map[NodeId]*timer // 各 Follower 维护一个计时器
+
+	electionMinTimeout int // 最小选举超时时间
+	electionMaxTimeout int // 最大选举超时时间
+	heartbeatTimeout   int // 心跳间隔时间
+}
+
+func NewTimerManager(config Config) *timerManager {
+	return &timerManager{
+		electionMinTimeout: config.ElectionMinTimeout,
+		electionMaxTimeout: config.ElectionMaxTimeout,
+		heartbeatTimeout:   config.HeartbeatTimeout,
+	}
+}
+
+func (t *timerManager) initTimerManager(peers map[NodeId]NodeAddr) {
+	t.electionTimer = time.NewTimer(t.newElectionDuration())
+	hbTimerMap := t.heartbeatTimer
+	for id, _ := range peers {
+		hbTimerMap[id] = &timer{
+			enable: true,
+			timer: time.NewTimer(t.heartbeatDuration()),
+		}
+	}
+}
+
+func (t *timerManager) setElectionTimer() {
 	t.electionTimer.Reset(t.newElectionDuration())
 }
 
-func (t *timer) resetElectionTimer() {
+func (t *timerManager) resetElectionTimer() {
 	t.electionTimer.Stop()
 	t.setElectionTimer()
 }
 
-func (t *timer) setHeartbeatTimer() {
-	t.heartbeatTimer.Reset(t.heartbeatDuration())
+func (t *timerManager) setHeartbeatTimer(id NodeId) {
+	t.heartbeatTimer[id].setTimer(t.heartbeatDuration())
 }
 
-func (t *timer) newElectionDuration() time.Duration {
-	randTimeout := rand.Intn(t.electionMaxTimeout - t.electionMinTimeout) + t.electionMinTimeout
+func (t *timerManager) enableHeartbeatTimer(id NodeId) {
+	t.heartbeatTimer[id].enableTimer()
+}
+
+func (t *timerManager) disableHeartbeatTimer(id NodeId) {
+	t.heartbeatTimer[id].disableTimer()
+}
+
+func (t *timerManager) newElectionDuration() time.Duration {
+	randTimeout := rand.Intn(t.electionMaxTimeout-t.electionMinTimeout) + t.electionMinTimeout
 	return time.Millisecond * time.Duration(randTimeout)
 }
 
-func (t *timer) heartbeatDuration() time.Duration {
+func (t *timerManager) heartbeatDuration() time.Duration {
 	return time.Millisecond * time.Duration(t.heartbeatTimeout)
 }
