@@ -48,6 +48,9 @@ func (nd *Node) startTimer() {
 	peerTimerMap := nd.timerManager.heartbeatTimer
 	for id, tmr := range peerTimerMap {
 		// Leader 为每个 Follower 开启一个心跳计时器
+		if nd.raft.isMe(id) {
+			continue
+		}
 		go func(id NodeId, tmr *timer) {
 			for {
 				select {
