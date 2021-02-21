@@ -123,7 +123,6 @@ func (nd *Node) ClientApply(args ClientRequest, res *ClientResponse) error {
 
 	// 构造需要复制的日志
 	newEntry := Entry{
-		Index: nd.raft.commitIndex() + 1,
 		Term:  nd.raft.term(),
 		Data:  args.data,
 	}
@@ -139,7 +138,7 @@ func (nd *Node) ClientApply(args ClientRequest, res *ClientResponse) error {
 		go func(id NodeId, addr NodeAddr) {
 			nd.timerManager.stopHeartbeatTimer(id)
 			// 给节点发送日志条目
-			err := nd.raft.handleClientReq(id, addr)
+			err := nd.raft.sendLogEntry(id, addr)
 			if err != nil {
 				log.Println(err)
 			} else {

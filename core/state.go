@@ -63,13 +63,18 @@ func NewHardState(persister RaftStatePersister) HardState {
 	return HardState{
 		term:      1,
 		votedFor:  "",
-		entries:   []Entry{},
+		entries:   make([]Entry, 0),
 		persister: persister,
 	}
 }
 
 func (st *HardState) lastLogIndex() int {
-	return st.logLength() - 1
+	lastIndex := st.logLength() - 1
+	if lastIndex <= 0 {
+		return 0
+	} else {
+		return lastIndex
+	}
 }
 
 func (st *HardState) currentTerm() int {
@@ -119,6 +124,7 @@ func (st *HardState) persist() error {
 
 func (st *HardState) appendEntry(entry Entry) error {
 	st.mu.Lock()
+	entry.Index = st.lastLogIndex() + 1
 	st.entries = append(st.entries, entry)
 	return st.persist()
 }

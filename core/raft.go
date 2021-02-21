@@ -211,6 +211,11 @@ func (rf *raft) heartbeat(id NodeId) {
 		return
 	}
 	xClient := client.NewXClient("Node", client.Failtry, client.RandomSelect, d, client.DefaultOption)
+	defer func() {
+		if err := xClient.Close(); err != nil {
+			log.Println("关闭客户端失败")
+		}
+	}()
 	term := rf.term()
 	args := AppendEntry{
 		term:         term,
@@ -226,15 +231,18 @@ func (rf *raft) heartbeat(id NodeId) {
 		log.Printf("调用rpc服务失败：%s%s\n", addr, err)
 		return
 	}
-	err = xClient.Close()
-	if err != nil {
-		log.Printf("关闭rpc客户端失败：%s\n", err)
-	}
-	// todo 如果 Follower 缺失日志条目，需要 Leader 继续发送 AppendEntries
+
 	if res.term > term {
 		// 当前任期数落后，降级为 Follower
-		// todo 使用 context 停掉当前还在运行的协程
 		err := rf.degrade(res.term)
+		if err != nil {
+			log.Println(err)
+		}
+	}
+
+	// Follower 和 Leader 的日志不匹配，则进行日志同步
+	if !res.success || rf.nextIndex(id) != rf.lastLogIndex() + 1 {
+		err := rf.sendLogEntry(id, addr)
 		if err != nil {
 			log.Println(err)
 		}
@@ -290,7 +298,6 @@ func (rf *raft) election() {
 				atomic.AddInt32(&vote, 1)
 			} else if res.term > rf.term() {
 				// 当前节点任期落后，则退出竞选
-				// todo 使用 context 停掉当前还在运行的协程
 				err := rf.degrade(res.term)
 				if err != nil {
 					log.Println(err)
@@ -319,22 +326,28 @@ func (rf *raft) handleCommand(args AppendEntry, res *AppendEntryReply) error {
 		return nil
 	}
 
+	// 处理请求
+	prevIndex := args.prevLogIndex
+	if prevIndex >= rf.logLength() || rf.logEntryTerm(prevIndex) != args.prevLogTerm {
+		res.term = rfTerm
+		res.success = false
+		return nil
+	}
+
 	// ========== 接收日志条目 ==========
 	if len(args.entries) != 0 {
-		prevIndex := args.prevLogIndex
 
-		if prevIndex >= rf.logLength() || rf.logEntryTerm(prevIndex) != args.prevLogTerm {
-			res.term = rfTerm
-			res.success = false
-			return nil
+		// 如果当前节点已经有此条目但冲突
+		if rf.lastLogIndex() >= prevIndex + 1 && (rf.logEntryTerm(prevIndex+1) != args.term) {
+			rf.truncateEntries(prevIndex+1)
 		}
+
 		// 将新条目添加到日志中，如果已经存在，则覆盖
 		err := rf.appendEntry(args.entries[0])
 		if err != nil {
 			log.Println(err)
 		}
-		// 提交日志条目，并应用到状态机
-		return rf.applyFsm(args.leaderCommit)
+		return nil
 	}
 
 	// ========== 接收心跳 ==========
@@ -430,23 +443,30 @@ func (rf *raft) handleSnapshot(args InstallSnapshot, res *InstallSnapshotReply) 
 }
 
 // 给指定的节点发送日志条目
-func (rf *raft) handleClientReq(id NodeId, addr NodeAddr) error {
+func (rf *raft) sendLogEntry(id NodeId, addr NodeAddr) error {
 	finalPrevIndex := rf.lastLogIndex()
-
+	// 不用给自己发
 	if rf.isMe(id) {
 		return nil
 	}
+	// 创建 rpc 客户端
 	d, err := client.NewPeer2PeerDiscovery("tcp@"+string(addr), "")
 	if err != nil {
 		log.Printf("创建rpc客户端失败：%s%s\n", addr, err)
 		return nil
 	}
 	xClient := client.NewXClient("Node", client.Failtry, client.RandomSelect, d, client.DefaultOption)
+	defer func() {
+		if err := xClient.Close(); err != nil {
+			log.Println("关闭客户端失败")
+		}
+	}()
+
 	var prevIndex int
+	// Follower 节点中必须存在第 prevIndex 条日志，才能接受第 nextIndex 条日志
+	// 如果 Follower 节点缺少很多日志，需要找到缺少的第一条日志的索引
 	for {
 		prevIndex = rf.nextIndex(id) - 1
-		// Follower 节点中必须存在第 prevIndex 条日志，才能接受第 nextIndex 条日志
-		// 如果 Follower 节点缺少很多日志，需要找到缺少的第一条日志的索引
 		args := AppendEntry{
 			term:         rf.term(),
 			leaderId:     rf.me(),
@@ -464,10 +484,6 @@ func (rf *raft) handleClientReq(id NodeId, addr NodeAddr) error {
 		if res.term > rf.term() {
 			// 如果任期数小，降级为 Follower
 			err := rf.degrade(res.term)
-			if err != nil {
-				log.Println(err)
-			}
-			err = xClient.Close()
 			if err != nil {
 				log.Println(err)
 			}
@@ -481,10 +497,10 @@ func (rf *raft) handleClientReq(id NodeId, addr NodeAddr) error {
 		rf.setNextIndex(id, rf.nextIndex(id)-1)
 	}
 
+	// 给 Follower 发送缺失的日志，发送的日志的索引一直递增到最新
+	// todo 缺失的日志太多时，直接发送快照
 	for prevIndex != finalPrevIndex {
 		prevIndex = rf.nextIndex(id) - 1
-		// 给 Follower 发送缺失的日志，发送的日志的索引一直递增到最新
-		// todo 缺失的日志太多时，直接发送快照
 		args := AppendEntry{
 			term:         rf.term(),
 			leaderId:     rf.me(),
@@ -505,23 +521,14 @@ func (rf *raft) handleClientReq(id NodeId, addr NodeAddr) error {
 			if err != nil {
 				log.Println(err)
 			}
-			err = xClient.Close()
-			if err != nil {
-				log.Println(err)
-			}
 			break
 		}
 		if res.success {
 			break
 		}
 
-		// 向前继续查找 Follower 缺少的第一条日志的索引
-		rf.setMatchAndNextIndex(id, rf.nextIndex(id)-1, rf.nextIndex(id)+1)
-	}
-
-	err = xClient.Close()
-	if err != nil {
-		log.Println(err)
+		// 向后补充
+		rf.setMatchAndNextIndex(id, rf.nextIndex(id), rf.nextIndex(id)+1)
 	}
 
 	return nil
