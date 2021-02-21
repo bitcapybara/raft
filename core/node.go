@@ -30,7 +30,7 @@ type Node struct {
 
 func NewNode(config Config) *Node {
 	return &Node{
-		raft:         NewRaft(config),
+		raft:         newRaft(config),
 		config:       config,
 		timerManager: NewTimerManager(config),
 	}

@@ -19,7 +19,7 @@ type raft struct {
 	leaderState *LeaderState      // 节点是 Leader 时，保存在内存中的状态
 }
 
-func NewRaft(config Config) *raft {
+func newRaft(config Config) *raft {
 	raftPst := config.RaftStatePersister
 	snptPst := config.SnapshotPersister
 	raftState, err := raftPst.LoadRaftState()
@@ -210,7 +210,7 @@ func (rf *raft) heartbeat(id NodeId) {
 		log.Printf("创建rpc客户端失败：%s%s\n", addr, err)
 		return
 	}
-	xClient := client.NewXClient("Node", client.Failtry, client.RandomSelect, d, client.DefaultOption)
+	xClient := client.NewXClient("Node", client.Failfast, client.RandomSelect, d, client.DefaultOption)
 	defer func() {
 		if err := xClient.Close(); err != nil {
 			log.Println("关闭客户端失败")
@@ -444,7 +444,7 @@ func (rf *raft) handleSnapshot(args InstallSnapshot, res *InstallSnapshotReply) 
 
 // 给指定的节点发送日志条目
 func (rf *raft) sendLogEntry(id NodeId, addr NodeAddr) error {
-	finalPrevIndex := rf.lastLogIndex()
+
 	// 不用给自己发
 	if rf.isMe(id) {
 		return nil
@@ -498,8 +498,21 @@ func (rf *raft) sendLogEntry(id NodeId, addr NodeAddr) error {
 	}
 
 	// 给 Follower 发送缺失的日志，发送的日志的索引一直递增到最新
-	// todo 缺失的日志太多时，直接发送快照
-	for prevIndex != finalPrevIndex {
+	snapshot, err := rf.persister.LoadSnapshot()
+	if err != nil {
+		log.Println(err)
+	}
+	for prevIndex != rf.lastLogIndex() {
+		// 缺失的日志太多时，直接发送快照
+		if rf.nextIndex(id) <= snapshot.LastIndex {
+			err := rf.sendSnapshot(id, addr, snapshot.Data)
+			if err != nil {
+				log.Println(err)
+			} else {
+				rf.setMatchAndNextIndex(id, snapshot.LastIndex, snapshot.LastIndex + 1)
+			}
+		}
+
 		prevIndex = rf.nextIndex(id) - 1
 		args := AppendEntry{
 			term:         rf.term(),
@@ -521,9 +534,6 @@ func (rf *raft) sendLogEntry(id NodeId, addr NodeAddr) error {
 			if err != nil {
 				log.Println(err)
 			}
-			break
-		}
-		if res.success {
 			break
 		}
 
@@ -549,6 +559,11 @@ func (rf *raft) sendSnapshot(id NodeId, addr NodeAddr, data []byte) error {
 		return errors.Errorf("创建rpc客户端失败：%s%s\n", addr, err)
 	}
 	xClient := client.NewXClient("Node", client.Failtry, client.RandomSelect, d, client.DefaultOption)
+	defer func() {
+		if err := xClient.Close(); err != nil {
+			log.Println("关闭客户端失败")
+		}
+	}()
 	args := InstallSnapshot{
 		term: rf.term(),
 		leaderId: rf.me(),
@@ -562,10 +577,6 @@ func (rf *raft) sendSnapshot(id NodeId, addr NodeAddr, data []byte) error {
 	err = xClient.Call(context.Background(), "AppendEntries", args, res)
 	if err != nil {
 		return errors.Errorf("调用rpc服务失败：%s%s\n", addr, err)
-	}
-	err = xClient.Close()
-	if err != nil {
-		log.Println(err)
 	}
 	if res.term > rf.term() {
 		// 如果任期数小，降级为 Follower
