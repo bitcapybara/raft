@@ -1,10 +1,10 @@
 package core
 
 import (
-	"context"
-	"github.com/smallnest/rpcx/v6/client"
+	"github.com/go-errors/errors"
 	"github.com/smallnest/rpcx/v6/server"
 	"log"
+	"sync/atomic"
 	"time"
 )
 
@@ -18,6 +18,7 @@ type Config struct {
 	ElectionMinTimeout int
 	ElectionMaxTimeout int
 	HeartbeatTimeout   int
+	MaxLogLength       int
 }
 
 // 代表了一个当前节点
@@ -56,14 +57,15 @@ func (nd *Node) startTimer() {
 		}
 		go func(id NodeId, tmr *time.Timer) {
 			for {
-				select {
-				case <-tmr.C:
-					if nd.raft.isLeader() {
-						// 发送心跳
-						nd.raft.heartbeat(id)
-					}
-					nd.timerManager.setHeartbeatTimer(id)
+				// 等待心跳计时器到期
+				<-tmr.C
+
+				if nd.raft.isLeader() {
+					// 发送心跳
+					nd.raft.heartbeat(id)
 				}
+				// 重置心跳计时器
+				nd.timerManager.setHeartbeatTimer(id)
 			}
 		}(id, tmr)
 	}
@@ -71,16 +73,15 @@ func (nd *Node) startTimer() {
 	// 监听并处理选举计时器事件
 	go func() {
 		for {
-			select {
-			case <-nd.timerManager.electionTimer.C:
-				// 选举计时器到期
-				if !nd.raft.isLeader() {
-					// 开始新选举
-					nd.raft.election()
-				}
-				// 重置选举计时器
-				nd.timerManager.setElectionTimer()
+			// 等待选举计时器到期
+			<-nd.timerManager.electionTimer.C
+
+			if !nd.raft.isLeader() {
+				// 开始新选举
+				nd.raft.election()
 			}
+			// 重置选举计时器
+			nd.timerManager.setElectionTimer()
 		}
 	}()
 }
@@ -120,7 +121,7 @@ func (nd *Node) ClientApply(args ClientRequest, res *ClientResponse) error {
 		return nil
 	}
 
-	// 日志复制
+	// 构造需要复制的日志
 	newEntry := Entry{
 		Index: nd.raft.commitIndex() + 1,
 		Term:  nd.raft.term(),
@@ -132,90 +133,53 @@ func (nd *Node) ClientApply(args ClientRequest, res *ClientResponse) error {
 		log.Println(err)
 	}
 
-	successCnt := 0
+	// 给各节点发送日志条目
+	var successCnt int32 = 0
 	for id, addr := range nd.raft.peers() {
-		nd.timerManager.stopHeartbeatTimer(id)
-		err := nd.raft.handleClientReq(id, addr)
-		if err != nil {
-			log.Println(err)
-		} else {
-			successCnt += 1
-		}
-		nd.timerManager.setHeartbeatTimer(id)
+		go func(id NodeId, addr NodeAddr) {
+			nd.timerManager.stopHeartbeatTimer(id)
+			// 给节点发送日志条目
+			err := nd.raft.handleClientReq(id, addr)
+			if err != nil {
+				log.Println(err)
+			} else {
+				atomic.AddInt32(&successCnt, 1)
+			}
+			nd.timerManager.setHeartbeatTimer(id)
+		}(id, addr)
 	}
 
-	if successCnt > nd.raft.majority() {
-		// 新日志成功发送到过半 Follower 节点
-		nd.raft.setCommitIndex(nd.raft.commitIndex()+1)
-		err := nd.raft.applyFsm(nd.raft.lastLogIndex())
-		if err != nil {
-			log.Println(err)
-		}
-		// 当日志量超过阈值时，生成快照
-		snapshot, err := nd.raft.persister.LoadSnapshot()
-		if err != nil {
-			log.Println(err)
-		}
-		if nd.raft.commitIndex() - snapshot.LastIndex > 1000 {
-			bytes, err := nd.raft.fsm.Serialize()
-			if err != nil {
-				return nil
-			}
+	// 新日志成功发送到过半 Follower 节点，提交本地的日志
+	if int(successCnt) < nd.raft.majority() {
+		return errors.New("日志条目没有复制到多数节点")
+	}
+	nd.raft.setCommitIndex(nd.raft.commitIndex() + 1)
+	err = nd.raft.applyFsm(nd.raft.lastLogIndex())
+	if err != nil {
+		log.Println(err)
+	}
 
-			// 快照数据发送给所有 Follower 节点
-			for id, addr := range nd.raft.peers() {
-				if nd.raft.isMe(id) {
-					// 自己保存快照
-					newSnapshot := Snapshot{
-						LastIndex: nd.raft.commitIndex(),
-						LastTerm: nd.raft.term(),
-						Data: bytes,
-					}
-					err := nd.raft.persister.SaveSnapshot(newSnapshot)
-					if err != nil {
-						log.Println(err)
-					}
-					continue
-				}
-				d, err := client.NewPeer2PeerDiscovery("tcp@"+string(addr), "")
-				if err != nil {
-					log.Printf("创建rpc客户端失败：%s%s\n", addr, err)
-					continue
-				}
-				xClient := client.NewXClient("Node", client.Failtry, client.RandomSelect, d, client.DefaultOption)
-				err = xClient.Call(context.Background(), "AppendEntries", args, res)
-				if err != nil {
-					log.Printf("调用rpc服务失败：%s%s\n", addr, err)
-					continue
-				}
-				args := InstallSnapshot{
-					term: nd.raft.term(),
-					leaderId: nd.raft.me(),
-					lastIncludedIndex: nd.raft.commitIndex(),
-					lastIncludedTerm: nd.raft.logEntryTerm(nd.raft.commitIndex()),
-					offset: 0,
-					done: true,
-				}
-				res := &InstallSnapshotReply{}
-				err = xClient.Call(context.Background(), "AppendEntries", args, res)
-				if err != nil {
-					log.Printf("调用rpc服务失败：%s%s\n", addr, err)
-					continue
-				}
-				err = xClient.Close()
-				if err != nil {
-					log.Println(err)
-				}
-				if res.term > nd.raft.term() {
-					// 如果任期数小，降级为 Follower
-					err := nd.raft.degrade(res.term)
-					if err != nil {
-						log.Println(err)
-					}
-					break
-				}
+	// 当日志量超过阈值时，生成快照
+	snapshot, err := nd.raft.persister.LoadSnapshot()
+	if err != nil {
+		log.Println(err)
+	}
+	// 快照数据发送给所有 Follower 节点
+	if nd.raft.commitIndex()-snapshot.LastIndex <= nd.config.MaxLogLength {
+		return nil
+	}
+	bytes, err := nd.raft.fsm.Serialize()
+	if err != nil {
+		return nil
+	}
+
+	for id, addr := range nd.raft.peers() {
+		go func(id NodeId, addr NodeAddr) {
+			err := nd.raft.sendSnapshot(id, addr, bytes)
+			if err != nil {
+				log.Println(err)
 			}
-		}
+		}(id, addr)
 	}
 	return nil
 }

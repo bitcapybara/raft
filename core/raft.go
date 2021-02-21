@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"github.com/go-errors/errors"
 	"github.com/smallnest/rpcx/v6/client"
 	"log"
 	"sync"
@@ -229,6 +230,7 @@ func (rf *raft) heartbeat(id NodeId) {
 	if err != nil {
 		log.Printf("关闭rpc客户端失败：%s\n", err)
 	}
+	// todo 如果 Follower 缺失日志条目，需要 Leader 继续发送 AppendEntries
 	if res.term > term {
 		// 当前任期数落后，降级为 Follower
 		// todo 使用 context 停掉当前还在运行的协程
@@ -427,11 +429,10 @@ func (rf *raft) handleSnapshot(args InstallSnapshot, res *InstallSnapshotReply) 
 	return nil
 }
 
-// 接收来自客户端的 rpc 请求
+// 给指定的节点发送日志条目
 func (rf *raft) handleClientReq(id NodeId, addr NodeAddr) error {
 	finalPrevIndex := rf.lastLogIndex()
 
-	// 遍历所有 Follower，发送日志
 	if rf.isMe(id) {
 		return nil
 	}
@@ -521,6 +522,47 @@ func (rf *raft) handleClientReq(id NodeId, addr NodeAddr) error {
 	err = xClient.Close()
 	if err != nil {
 		log.Println(err)
+	}
+
+	return nil
+}
+
+func (rf *raft) sendSnapshot(id NodeId, addr NodeAddr, data []byte) error {
+	if rf.isMe(id) {
+		// 自己保存快照
+		newSnapshot := Snapshot{
+			LastIndex: rf.commitIndex(),
+			LastTerm: rf.term(),
+			Data: data,
+		}
+		return rf.persister.SaveSnapshot(newSnapshot)
+	}
+	d, err := client.NewPeer2PeerDiscovery("tcp@"+string(addr), "")
+	if err != nil {
+		return errors.Errorf("创建rpc客户端失败：%s%s\n", addr, err)
+	}
+	xClient := client.NewXClient("Node", client.Failtry, client.RandomSelect, d, client.DefaultOption)
+	args := InstallSnapshot{
+		term: rf.term(),
+		leaderId: rf.me(),
+		lastIncludedIndex: rf.commitIndex(),
+		lastIncludedTerm: rf.logEntryTerm(rf.commitIndex()),
+		offset: 0,
+		data: data,
+		done: true,
+	}
+	res := &InstallSnapshotReply{}
+	err = xClient.Call(context.Background(), "AppendEntries", args, res)
+	if err != nil {
+		return errors.Errorf("调用rpc服务失败：%s%s\n", addr, err)
+	}
+	err = xClient.Close()
+	if err != nil {
+		log.Println(err)
+	}
+	if res.term > rf.term() {
+		// 如果任期数小，降级为 Follower
+		return rf.degrade(res.term)
 	}
 
 	return nil
