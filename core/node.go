@@ -76,12 +76,13 @@ func (nd *Node) startTimer() {
 			// 等待选举计时器到期
 			<-nd.timerManager.electionTimer.C
 
+			// 重置选举计时器
+			nd.timerManager.setElectionTimer()
+
 			if !nd.raft.isLeader() {
 				// 开始新选举
 				nd.raft.election()
 			}
-			// 重置选举计时器
-			nd.timerManager.setElectionTimer()
 		}
 	}()
 }
@@ -105,6 +106,7 @@ func (nd *Node) AppendEntries(args AppendEntry, res *AppendEntryReply) error {
 
 // Follower 和 Candidate 开放的 rpc 接口，由 Candidate 调用
 func (nd *Node) RequestVote(args RequestVote, res *RequestVoteReply) error {
+	// todo 向另一个节点投票后，重置选举计时器
 	return nd.raft.handleVoteReq(args, res)
 }
 
@@ -154,7 +156,7 @@ func (nd *Node) ClientApply(args ClientRequest, res *ClientResponse) error {
 	nd.raft.setCommitIndex(nd.raft.lastLogIndex())
 
 	// 将新提交的条目应用到状态机
-	for index := prevCommitIndex; index < nd.raft.commitIndex(); index++ {
+	for index := prevCommitIndex; index <= nd.raft.commitIndex(); index++ {
 		err = nd.raft.applyFsm(index)
 		if err != nil {
 			log.Println(err)

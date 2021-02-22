@@ -20,6 +20,14 @@ type RaftState struct {
 	Entries  []Entry
 }
 
+func newRaftState() RaftState {
+	return RaftState{
+		Term: 1,
+		VotedFor: "",
+		Entries: make([]Entry, 0),
+	}
+}
+
 func (rs RaftState) toHardState(persister RaftStatePersister) HardState {
 	return HardState{
 		term:     rs.Term,
@@ -35,7 +43,7 @@ type Snapshot struct {
 	Data      []byte
 }
 
-// 持久化器的默认实现，保存在文件中
+// todo 持久化器的默认实现，保存在文件中
 type DefaultPersister struct {
 	FilePath string
 }

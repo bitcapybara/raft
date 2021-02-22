@@ -22,14 +22,19 @@ type raft struct {
 func newRaft(config Config) *raft {
 	raftPst := config.RaftStatePersister
 	snptPst := config.SnapshotPersister
-	raftState, err := raftPst.LoadRaftState()
-	var hardState HardState
-	if err != nil {
-		log.Println(err)
-		hardState = NewHardState(raftPst)
+
+	var raftState RaftState
+	if raftPst != nil {
+		rfState, err := raftPst.LoadRaftState()
+		if err != nil {
+			log.Println(err)
+		} else {
+			raftState = rfState
+		}
 	} else {
-		hardState = raftState.toHardState(raftPst)
+		raftState = newRaftState()
 	}
+	hardState := raftState.toHardState(raftPst)
 
 	return &raft{
 		roleState:   NewRoleState(),
@@ -48,13 +53,27 @@ func (rf *raft) isLeader() bool {
 	return roleStage == Leader && leaderIsMe
 }
 
+// 降级为 Follower
+func (rf *raft) degrade(term int) error {
+	if rf.roleState.getRoleStage() == Follower {
+		return nil
+	}
+	// 更新状态
+	rf.roleState.setRoleStage(Follower)
+	return rf.hardState.setTerm(term)
+}
+
+// ==================== RoleState ====================
+
 func (rf *raft) roleStage() RoleStage {
 	return rf.roleState.getRoleStage()
 }
 
-func (rf *raft) commitIndex() int {
-	return rf.softState.softCommitIndex()
+func (rf *raft) setRoleStage(stage RoleStage) {
+	rf.roleState.setRoleStage(stage)
 }
+
+// ==================== HardState ====================
 
 func (rf *raft) lastLogIndex() int {
 	return rf.hardState.lastLogIndex()
@@ -64,13 +83,73 @@ func (rf *raft) logLength() int {
 	return rf.hardState.logLength()
 }
 
-func (rf *raft) matchIndex(id NodeId) int {
-	return rf.leaderState.peerMatchIndex(id)
-}
-
 func (rf *raft) term() int {
 	return rf.hardState.currentTerm()
 }
+
+func (rf *raft) logEntryTerm(index int) int {
+	return rf.hardState.logEntryTerm(index)
+}
+
+func (rf *raft) logEntry(index int) Entry {
+	return rf.hardState.logEntry(index)
+}
+
+func (rf *raft) votedFor() NodeId {
+	return rf.hardState.getVotedFor()
+}
+
+func (rf *raft) vote(id NodeId) error {
+	if rf.votedFor() == id {
+		return nil
+	}
+	return rf.hardState.vote(id)
+}
+
+func (rf *raft) truncateEntries(index int) {
+	rf.hardState.truncateEntries(index)
+}
+
+func (rf *raft) clearEntries() {
+	rf.hardState.clearEntries()
+}
+
+func (rf *raft) entries(start, end int) []Entry {
+	return rf.hardState.logEntries(start, end)
+}
+
+// 更新自身 term
+func (rf *raft) setTerm(term int) error {
+	if rf.term() == term {
+		return nil
+	}
+	// 更新状态
+	return rf.hardState.setTerm(term)
+}
+
+func (rf *raft) appendEntry(entry Entry) error {
+	return rf.hardState.appendEntry(entry)
+}
+
+// ==================== SoftState ====================
+
+func (rf *raft) commitIndex() int {
+	return rf.softState.softCommitIndex()
+}
+
+func (rf *raft) setLastApplied(index int) {
+	rf.softState.setLastApplied(index)
+}
+
+func (rf *raft) lastApplied() int {
+	return rf.softState.softLastApplied()
+}
+
+func (rf *raft) setCommitIndex(index int) {
+	rf.softState.setCommitIndex(index)
+}
+
+// ==================== PeerState ====================
 
 func (rf *raft) majority() int {
 	return rf.peerState.majority()
@@ -92,48 +171,18 @@ func (rf *raft) leaderId() NodeId {
 	return rf.peerState.leaderId()
 }
 
-func (rf *raft) logEntryTerm(index int) int {
-	return rf.hardState.logEntryTerm(index)
-}
-
-func (rf *raft) logEntry(index int) Entry {
-	return rf.hardState.logEntry(index)
-}
-
-func (rf *raft) votedFor() NodeId {
-	return rf.hardState.getVotedFor()
-}
-
-func (rf *raft) setRoleStage(stage RoleStage) {
-	rf.roleState.setRoleStage(stage)
-}
-
-func (rf *raft) vote(id NodeId) error {
-	return rf.hardState.vote(id)
-}
-
 func (rf *raft) setLeader(id NodeId) {
 	rf.peerState.setLeader(id)
 }
 
+// ==================== LeaderState ====================
+
+func (rf *raft) matchIndex(id NodeId) int {
+	return rf.leaderState.peerMatchIndex(id)
+}
+
 func (rf *raft) setMatchAndNextIndex(id NodeId, matchIndex, nextIndex int) {
 	rf.leaderState.setMatchAndNextIndex(id, matchIndex, nextIndex)
-}
-
-func (rf *raft) setLastApplied(index int) {
-	rf.softState.setLastApplied(index)
-}
-
-func (rf *raft) lastApplied() int {
-	return rf.softState.softLastApplied()
-}
-
-func (rf *raft) truncateEntries(index int) {
-	rf.hardState.truncateEntries(index)
-}
-
-func (rf *raft) clearEntries() {
-	rf.hardState.clearEntries()
 }
 
 func (rf *raft) nextIndex(id NodeId) int {
@@ -144,36 +193,7 @@ func (rf *raft) setNextIndex(id NodeId, index int) {
 	rf.leaderState.setNextIndex(id, index)
 }
 
-func (rf *raft) entries(start, end int) []Entry {
-	return rf.hardState.logEntries(start, end)
-}
-
-// 降级为 Follower
-func (rf *raft) degrade(term int) error {
-	if rf.roleState.getRoleStage() == Follower {
-		return nil
-	}
-	// 更新状态
-	rf.roleState.setRoleStage(Follower)
-	return rf.hardState.setTerm(term)
-}
-
-// 更新自身 term
-func (rf *raft) setTerm(term int) error {
-	if rf.term() == term {
-		return nil
-	}
-	// 更新状态
-	return rf.hardState.setTerm(term)
-}
-
-func (rf *raft) appendEntry(entry Entry) error {
-	return rf.hardState.appendEntry(entry)
-}
-
-func (rf *raft) setCommitIndex(index int) {
-	rf.softState.setCommitIndex(index)
-}
+// ==================== logic process ====================
 
 func (rf *raft) applyFsm(applyIndex int) error {
 	prevCommit := rf.commitIndex()
