@@ -103,6 +103,7 @@ func (rf *raft) vote(id NodeId) error {
 	return rf.hardState.vote(id)
 }
 
+// 删掉指定索引及以后的所有条目
 func (rf *raft) truncateEntries(index int) {
 	rf.hardState.truncateEntries(index)
 }
@@ -279,7 +280,6 @@ func (rf *raft) election() {
 			if rf.isMe(id) {
 				// 投票给自己
 				atomic.AddInt32(&vote, 1)
-				vote += 1
 				err := rf.vote(rf.me())
 				if err != nil {
 					log.Println(err)
@@ -341,44 +341,50 @@ func (rf *raft) handleCommand(args AppendEntry, res *AppendEntryReply) error {
 
 	// 处理请求
 	prevIndex := args.prevLogIndex
-	if prevIndex >= rf.logLength() || rf.logEntryTerm(prevIndex) != args.prevLogTerm {
+	if prevIndex > rf.lastLogIndex() || rf.logEntryTerm(prevIndex) != args.prevLogTerm {
 		res.term = rfTerm
 		res.success = false
 		return nil
 	}
 
-	// ========== 接收日志条目 ==========
-	if len(args.entries) != 0 {
+	// 任期数落后或相等
+	if rf.roleStage() == Candidate {
+		// 如果是候选者，需要降级
+		err := rf.degrade(args.term)
+		if err != nil {
+			log.Println(err)
+		}
+	}
 
+	newEntryIndex := prevIndex + 1
+	if len(args.entries) != 0 {
+		// ========== 接收日志条目 ==========
 		// 如果当前节点已经有此条目但冲突
-		if rf.lastLogIndex() >= prevIndex + 1 && (rf.logEntryTerm(prevIndex+1) != args.term) {
+		if rf.lastLogIndex() >= newEntryIndex && rf.logEntryTerm(newEntryIndex) != args.term {
 			rf.truncateEntries(prevIndex+1)
 		}
 
-		// 将新条目添加到日志中，如果已经存在，则覆盖
+		// 将新条目添加到日志中
 		err := rf.appendEntry(args.entries[0])
 		if err != nil {
 			log.Println(err)
 		}
-		return nil
+	} else {
+		// ========== 接收心跳 ==========
+		rf.setLeader(args.leaderId)
+		res.term = rf.term()
+		res.success = true
 	}
 
-	// ========== 接收心跳 ==========
-	// 任期数落后或相等
-	if rf.roleStage() == Candidate {
-		// 如果是候选者，需要降级
-		rf.setRoleStage(Follower)
-	}
-	err := rf.setTerm(args.term)
-	if err != nil {
-		log.Println(err)
+	leaderCommit := args.leaderCommit
+	if leaderCommit > rf.commitIndex() {
+		if leaderCommit >= newEntryIndex {
+			rf.setCommitIndex(newEntryIndex)
+		} else {
+			rf.setCommitIndex(leaderCommit)
+		}
 	}
 
-	rf.setLeader(args.leaderId)
-	res.term = rf.term()
-	res.success = true
-
-	// 提交日志条目，并应用到状态机
 	return nil
 }
 
@@ -394,13 +400,15 @@ func (rf *raft) handleVoteReq(args RequestVote, res *RequestVoteReply) error {
 	}
 
 	if argsTerm > rfTerm {
-		err := rf.setTerm(argsTerm)
+		// 角色降级
+		var err error
+		if rf.roleStage() != Follower {
+			err = rf.degrade(argsTerm)
+		} else {
+			err = rf.setTerm(argsTerm)
+		}
 		if err != nil {
 			log.Println(err)
-		}
-		if rf.roleStage() == Candidate {
-			// 当前节点是候选者，自动降级
-			rf.setRoleStage(Follower)
 		}
 	}
 
@@ -408,9 +416,10 @@ func (rf *raft) handleVoteReq(args RequestVote, res *RequestVoteReply) error {
 	res.voteGranted = false
 	votedFor := rf.votedFor()
 	if votedFor == "" || votedFor == args.candidateId {
-		// 当前节点是追随者且没有投过票，则投出第一票
+		// 当前节点是追随者且没有投过票
 		lastIndex := rf.lastLogIndex()
 		lastTerm := rf.logEntryTerm(lastIndex)
+		// 候选者的日志比当前节点的日志要新，则投票
 		if args.lastLogTerm > lastTerm || (args.lastLogTerm == lastTerm && args.lastLogIndex >= lastIndex) {
 			err := rf.vote(args.candidateId)
 			if err != nil {
