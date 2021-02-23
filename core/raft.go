@@ -81,6 +81,40 @@ func (rf *raft) applyFsm() error {
 	return nil
 }
 
+// 更新 Leader 的提交索引
+func (rf *raft) updateLeaderCommitIndex() error {
+
+	indexCnt := make(map[int]int)
+	peers := rf.peers()
+	//
+	for id := range peers {
+		indexCnt[rf.matchIndex(id)] = 1
+	}
+
+	// 计算出多少个节点有相同的 matchIndex 值
+	for index, _ := range indexCnt {
+		for index2, cnt2 := range indexCnt {
+			if index > index2 {
+				indexCnt[index2] = cnt2 + 1
+			}
+		}
+	}
+
+	// 找出超过半数的 matchIndex 值
+	maxMajorityMatch := 0
+	for index, cnt := range indexCnt {
+		if cnt >= rf.majority() && index > maxMajorityMatch {
+			maxMajorityMatch = index
+		}
+	}
+
+	if rf.commitIndex() < maxMajorityMatch {
+		return rf.setCommitIndex(maxMajorityMatch)
+	}
+
+	return nil
+}
+
 // ==================== RoleState ====================
 
 func (rf *raft) roleStage() RoleStage {

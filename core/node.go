@@ -4,6 +4,7 @@ import (
 	"github.com/go-errors/errors"
 	"github.com/smallnest/rpcx/v6/server"
 	"log"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -131,8 +132,11 @@ func (nd *Node) ClientApply(args ClientRequest, res *ClientResponse) error {
 
 	// 给各节点发送日志条目
 	var successCnt int32 = 0
+	var wg sync.WaitGroup
 	for id, addr := range nd.raft.peers() {
+		wg.Add(1)
 		go func(id NodeId, addr NodeAddr) {
+			wg.Done()
 			nd.timerManager.stopHeartbeatTimer(id)
 			// 给节点发送日志条目
 			err := nd.raft.sendLogEntry(id, addr)
@@ -145,6 +149,7 @@ func (nd *Node) ClientApply(args ClientRequest, res *ClientResponse) error {
 		}(id, addr)
 	}
 
+	wg.Wait()
 	// 新日志成功发送到过半 Follower 节点，提交本地的日志
 	if int(successCnt) < nd.raft.majority() {
 		return errors.New("日志条目没有复制到多数节点")
@@ -152,11 +157,10 @@ func (nd *Node) ClientApply(args ClientRequest, res *ClientResponse) error {
 
 	// 将 commitIndex 设置为新条目的索引
 	// 此操作会连带提交 Leader 先前未提交的日志条目
-	err = nd.raft.setCommitIndex(nd.raft.lastLogIndex())
+	err = nd.raft.updateLeaderCommitIndex()
 	if err != nil {
 		log.Println(err)
 	}
-
 
 	// 当日志量超过阈值时，生成快照
 	snapshot, err := nd.raft.persister.LoadSnapshot()
