@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"github.com/go-errors/errors"
 	"github.com/smallnest/rpcx/v6/client"
 	"log"
@@ -61,6 +62,23 @@ func (rf *raft) degrade(term int) error {
 	// 更新状态
 	rf.roleState.setRoleStage(Follower)
 	return rf.hardState.setTerm(term)
+}
+
+// 把日志应用到状态机
+func (rf *raft) applyFsm() error {
+	commitIndex := rf.commitIndex()
+	lastApplied := rf.lastApplied()
+
+	for commitIndex > lastApplied {
+		entry := rf.logEntry(lastApplied + 1)
+		err := rf.fsm.Apply(entry.Data)
+		if err != nil {
+			return fmt.Errorf("应用状态机失败：%w", err)
+		}
+		lastApplied = rf.lastAppliedAdd()
+	}
+
+	return nil
 }
 
 // ==================== RoleState ====================
@@ -135,12 +153,17 @@ func (rf *raft) setLastApplied(index int) {
 	rf.softState.setLastApplied(index)
 }
 
+func (rf *raft) lastAppliedAdd() int {
+	return rf.softState.lastAppliedAdd()
+}
+
 func (rf *raft) lastApplied() int {
 	return rf.softState.softLastApplied()
 }
 
-func (rf *raft) setCommitIndex(index int) {
+func (rf *raft) setCommitIndex(index int) error {
 	rf.softState.setCommitIndex(index)
+	return rf.applyFsm()
 }
 
 // ==================== PeerState ====================
@@ -188,29 +211,6 @@ func (rf *raft) setNextIndex(id NodeId, index int) {
 }
 
 // ==================== logic process ====================
-
-func (rf *raft) applyFsm(applyIndex int) error {
-	prevCommit := rf.commitIndex()
-	if applyIndex > prevCommit {
-		if applyIndex >= rf.lastLogIndex() {
-			rf.setCommitIndex(rf.lastLogIndex())
-		} else {
-			rf.setCommitIndex(applyIndex)
-		}
-	}
-
-	commitIndex := rf.commitIndex()
-	if prevCommit != rf.commitIndex() {
-		logEntry := rf.logEntry(commitIndex)
-		err := rf.fsm.Apply(logEntry.Data)
-		if err != nil {
-			return err
-		}
-		rf.setLastApplied(rf.lastApplied() + 1)
-	}
-
-	return nil
-}
 
 // Leader 给某个节点发送心跳
 func (rf *raft) heartbeat(id NodeId) {
@@ -376,13 +376,16 @@ func (rf *raft) handleCommand(args AppendEntry, res *AppendEntryReply) error {
 		res.success = true
 	}
 
+	// 更新提交索引
 	leaderCommit := args.leaderCommit
 	if leaderCommit > rf.commitIndex() {
+		var err error
 		if leaderCommit >= newEntryIndex {
-			rf.setCommitIndex(newEntryIndex)
+			err = rf.setCommitIndex(newEntryIndex)
 		} else {
-			rf.setCommitIndex(leaderCommit)
+			err = rf.setCommitIndex(leaderCommit)
 		}
+		return err
 	}
 
 	return nil

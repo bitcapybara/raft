@@ -152,16 +152,11 @@ func (nd *Node) ClientApply(args ClientRequest, res *ClientResponse) error {
 
 	// 将 commitIndex 设置为新条目的索引
 	// 此操作会连带提交 Leader 先前未提交的日志条目
-	prevCommitIndex := nd.raft.commitIndex()
-	nd.raft.setCommitIndex(nd.raft.lastLogIndex())
-
-	// 将新提交的条目应用到状态机
-	for index := prevCommitIndex; index <= nd.raft.commitIndex(); index++ {
-		err = nd.raft.applyFsm(index)
-		if err != nil {
-			log.Println(err)
-		}
+	err = nd.raft.setCommitIndex(nd.raft.lastLogIndex())
+	if err != nil {
+		log.Println(err)
 	}
+
 
 	// 当日志量超过阈值时，生成快照
 	snapshot, err := nd.raft.persister.LoadSnapshot()

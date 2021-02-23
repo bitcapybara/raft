@@ -1,6 +1,8 @@
 package core
 
-import "sync"
+import (
+	"sync"
+)
 
 // ==================== RoleState ====================
 
@@ -203,6 +205,13 @@ func (st *SoftState) setLastApplied(index int) {
 	st.mu.Lock()
 	st.lastApplied = index
 	st.mu.Unlock()
+}
+
+func (st *SoftState) lastAppliedAdd() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.lastApplied += 1
+	return st.lastApplied
 }
 
 func (st *SoftState) softLastApplied() int {
