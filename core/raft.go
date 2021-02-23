@@ -100,9 +100,6 @@ func (rf *raft) votedFor() NodeId {
 }
 
 func (rf *raft) vote(id NodeId) error {
-	if rf.votedFor() == id {
-		return nil
-	}
 	return rf.hardState.vote(id)
 }
 
@@ -120,10 +117,6 @@ func (rf *raft) entries(start, end int) []Entry {
 
 // 更新自身 term
 func (rf *raft) setTerm(term int) error {
-	if rf.term() == term {
-		return nil
-	}
-	// 更新状态
 	return rf.hardState.setTerm(term)
 }
 

@@ -14,7 +14,7 @@ func TestDefaultRaftStatePersister_SaveRaftState(t *testing.T) {
 
 	raftState.Entries = append(raftState.Entries, Entry{Index: 1, Term: 1, Data: []byte("测试数据testing")})
 
-	persister := NewRaftPersister("../data/raftState.store")
+	persister := NewRaftPersister("../data")
 	err := persister.SaveRaftState(raftState)
 	if err != nil {
 		t.Errorf("保存 RaftState 测试失败：%s\n", err.Error())
@@ -23,7 +23,7 @@ func TestDefaultRaftStatePersister_SaveRaftState(t *testing.T) {
 
 func TestDefaultRaftStatePersister_LoadRaftState(t *testing.T) {
 
-	persister := NewRaftPersister("../data/raftState.store")
+	persister := NewRaftPersister("../data")
 	raftState, err := persister.LoadRaftState()
 	if err != nil {
 		t.Errorf("读取 RaftState 测试失败：%s\n", err)
@@ -40,7 +40,7 @@ func TestDefaultSnapshotPersister_SaveSnapshot(t *testing.T) {
 		Data: []byte("testing测试数据"),
 	}
 
-	persister := NewSnapshotPersister("../data/snapshot.store")
+	persister := NewSnapshotPersister("../data")
 	err := persister.SaveSnapshot(snapshot)
 
 	if err != nil {
@@ -50,7 +50,7 @@ func TestDefaultSnapshotPersister_SaveSnapshot(t *testing.T) {
 
 func TestDefaultSnapshotPersister_LoadSnapshot(t *testing.T) {
 
-	persister := NewSnapshotPersister("../data/snapshot.store")
+	persister := NewSnapshotPersister("../data")
 	snapshot, err := persister.LoadSnapshot()
 	if err != nil {
 		t.Errorf("读取 Snapshot 测试失败：%s\n", err)

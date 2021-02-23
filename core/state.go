@@ -101,6 +101,10 @@ func (st *HardState) logLength() int {
 func (st *HardState) setTerm(term int) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+
+	if st.term == term {
+		return nil
+	}
 	st.term = term
 	st.votedFor = ""
 	return st.persist()
@@ -109,6 +113,10 @@ func (st *HardState) setTerm(term int) error {
 func (st *HardState) vote(id NodeId) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+
+	if st.votedFor == id {
+		return nil
+	}
 	st.votedFor = id
 	return st.persist()
 }
