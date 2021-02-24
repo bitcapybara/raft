@@ -5,7 +5,6 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 // 构造 Node 对象时的配置参数
@@ -20,77 +19,32 @@ type Config struct {
 	ElectionMaxTimeout int
 	HeartbeatTimeout   int
 	MaxLogLength       int
+	transCh            chan timerType
 }
 
 // 代表了一个当前节点
 type Node struct {
 	raft         *raft         // 节点所具有的 raft 功能对象
 	config       Config        // 节点配置对象
-	timerManager *timerManager // 计时器
 }
 
 func NewNode(config Config) *Node {
 	return &Node{
 		raft:         newRaft(config),
 		config:       config,
-		timerManager: NewTimerManager(config),
 	}
 }
 
 func (nd *Node) Run() {
-
-	// 初始化定时器
-	nd.timerManager.initTimerManager(nd.raft.peers())
-
 	// 监听并处理计时器事件
-	nd.startTimer()
-}
-
-func (nd *Node) startTimer() {
-	// 监听并处理心跳计时器事件
-	peerTimerMap := nd.timerManager.heartbeatTimer
-	for id, tmr := range peerTimerMap {
-		// Leader 为每个 Follower 开启一个心跳计时器
-		if nd.raft.isMe(id) {
-			continue
-		}
-		go func(id NodeId, tmr *time.Timer) {
-			for {
-				// 等待心跳计时器到期
-				<-tmr.C
-
-				if nd.raft.isLeader() {
-					// 发送心跳
-					nd.raft.heartbeat(id)
-				}
-				// 重置心跳计时器
-				nd.timerManager.setHeartbeatTimer(id)
-			}
-		}(id, tmr)
-	}
-
-	// 监听并处理选举计时器事件
-	go func() {
-		for {
-			// 等待选举计时器到期
-			<-nd.timerManager.electionTimer.C
-
-			// 重置选举计时器
-			nd.timerManager.setElectionTimer()
-
-			if !nd.raft.isLeader() {
-				// 开始新选举
-				nd.raft.election()
-			}
-		}
-	}()
+	nd.raft.raftRun()
 }
 
 // Follower 和 Candidate 开放的 rpc接口，由 Leader 调用
 // 客户端接收到请求后，调用此方法
 func (nd *Node) AppendEntries(args AppendEntry, res *AppendEntryReply) error {
 	// 重置选举计时器
-	nd.timerManager.resetElectionTimer()
+	nd.raft.resetElectionTimer()
 	return nd.raft.handleCommand(args, res)
 }
 
@@ -98,11 +52,11 @@ func (nd *Node) AppendEntries(args AppendEntry, res *AppendEntryReply) error {
 // 客户端接收到请求后，调用此方法
 func (nd *Node) RequestVote(args RequestVote, res *RequestVoteReply) error {
 	err := nd.raft.handleVoteReq(args, res)
-	if err !=  nil {
+	if err != nil {
 		return err
 	}
 	if res.voteGranted {
-		nd.timerManager.resetElectionTimer()
+		nd.raft.resetElectionTimer()
 	}
 	return nil
 }
@@ -133,8 +87,12 @@ func (nd *Node) ClientApply(args ClientRequest, res *ClientResponse) error {
 	for id, addr := range nd.raft.peers() {
 		wg.Add(1)
 		go func(id NodeId, addr NodeAddr) {
-			wg.Done()
-			nd.timerManager.stopHeartbeatTimer(id)
+			defer func() {
+				wg.Done()
+				nd.raft.setAeState(id, false)
+			}()
+			// Follower 节点忙于 AE 请求，不需要发送心跳
+			nd.raft.setAeState(id, true)
 			// 给节点发送日志条目
 			err = nd.raft.sendLogEntry(id, addr)
 			if err != nil {
@@ -142,7 +100,6 @@ func (nd *Node) ClientApply(args ClientRequest, res *ClientResponse) error {
 			} else {
 				atomic.AddInt32(&successCnt, 1)
 			}
-			nd.timerManager.setHeartbeatTimer(id)
 		}(id, addr)
 	}
 

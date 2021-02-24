@@ -16,6 +16,7 @@ type raft struct {
 	softState   *SoftState        // 保存在内存中的实时状态
 	peerState   *PeerState        // 对等节点状态和路由表
 	leaderState *LeaderState      // 节点是 Leader 时，保存在内存中的状态
+	timerState  *timerState       // 计时器状态
 }
 
 func newRaft(config Config) *raft {
@@ -36,15 +37,47 @@ func newRaft(config Config) *raft {
 	hardState := raftState.toHardState(raftPst)
 
 	return &raft{
-		roleState:   NewRoleState(),
+		roleState:   NewRoleState(config.transCh),
 		persister:   snptPst,
 		fsm:         config.Fsm,
-		transport: config.Transport,
+		transport:   config.Transport,
 		hardState:   &hardState,
 		softState:   NewSoftState(),
 		peerState:   NewPeerState(config.Peers, config.Me),
 		leaderState: NewLeaderState(),
+		timerState:  NewTimerState(config),
 	}
+}
+
+func (rf *raft) raftRun() {
+	// 初始化定时器
+	rf.initTimer()
+	go func() {
+		tm := rf.timerState
+		defer close(tm.transCh)
+		for {
+			select {
+			case <-tm.timer.C:
+				if rf.isHeartbeatTick() {
+					rf.heartbeat()
+					rf.setHeartbeatTimer()
+				} else if rf.isElectionTick() {
+					rf.election()
+					rf.setElectionTimer()
+				}
+			case tp := <-tm.transCh:
+				rf.timerChangeTo(tp)
+			}
+		}
+	}()
+}
+
+func (rf *raft) isHeartbeatTick() bool {
+	return rf.timerState.getTimerType() == Heartbeat && rf.isLeader()
+}
+
+func (rf *raft) isElectionTick() bool {
+	return rf.timerState.getTimerType() == Election && !rf.isLeader()
 }
 
 func (rf *raft) isLeader() bool {
@@ -243,10 +276,52 @@ func (rf *raft) setNextIndex(id NodeId, index int) {
 	rf.leaderState.setNextIndex(id, index)
 }
 
+// ==================== timerState ====================
+
+func (rf *raft) initTimer() {
+	rf.timerState.initTimerState(rf.peers())
+}
+
+func (rf *raft) needHeartbeat(id NodeId) bool {
+	return rf.timerState.isAeBusy(id)
+}
+
+func (rf *raft) timerChangeTo(tp timerType) {
+	rf.timerState.changeTimer(tp)
+}
+
+func (rf *raft) setHeartbeatTimer() {
+	rf.timerState.setHeartbeatTimer()
+}
+
+func (rf *raft) setElectionTimer() {
+	rf.timerState.setElectionTimer()
+}
+
+func (rf *raft) setAeState(id NodeId, isBusy bool) {
+	rf.timerState.setAeState(id, isBusy)
+}
+
+func (rf *raft) resetElectionTimer() {
+	rf.timerState.resetElectionTimer()
+}
+
 // ==================== logic process ====================
 
+func (rf *raft) heartbeat() {
+	for id := range rf.peers() {
+		if rf.isMe(id) {
+			continue
+		}
+		if rf.needHeartbeat(id) {
+			rf.heartbeatTo(id)
+		}
+	}
+	rf.setHeartbeatTimer()
+}
+
 // Leader 给某个节点发送心跳
-func (rf *raft) heartbeat(id NodeId) {
+func (rf *raft) heartbeatTo(id NodeId) {
 	addr := rf.peers()[id]
 	commitIndex := rf.commitIndex()
 	if rf.isMe(id) {
@@ -263,7 +338,7 @@ func (rf *raft) heartbeat(id NodeId) {
 		leaderCommit: commitIndex,
 	}
 	res := &AppendEntryReply{}
-	err := rf.transport.SendAppendEntries(addr, args, res)
+	err := rf.transport.AppendEntries(addr, args, res)
 	if err != nil {
 		log.Printf("调用rpc服务失败：%s%s\n", addr, err)
 		return
@@ -315,7 +390,7 @@ func (rf *raft) election() {
 				candidateId: id,
 			}
 			res := &RequestVoteReply{}
-			err = rf.transport.SendRequestVote(addr, args, res)
+			err = rf.transport.RequestVote(addr, args, res)
 			if err != nil {
 				log.Printf("调用rpc服务失败：%s%s\n", addr, err)
 				return
@@ -503,7 +578,7 @@ func (rf *raft) sendLogEntry(id NodeId, addr NodeAddr) error {
 			entries:      rf.entries(prevIndex, rf.nextIndex(id)),
 		}
 		res := &AppendEntryReply{}
-		err := rf.transport.SendAppendEntries(addr, args, res)
+		err := rf.transport.AppendEntries(addr, args, res)
 		if err != nil {
 			log.Printf("调用rpc服务失败：%s%s\n", addr, err)
 			continue
@@ -550,7 +625,7 @@ func (rf *raft) sendLogEntry(id NodeId, addr NodeAddr) error {
 			entries:      rf.entries(prevIndex, rf.nextIndex(id)),
 		}
 		res := &AppendEntryReply{}
-		err := rf.transport.SendAppendEntries(addr, args, res)
+		err := rf.transport.AppendEntries(addr, args, res)
 		if err != nil {
 			log.Printf("调用rpc服务失败：%s%s\n", addr, err)
 			continue
@@ -591,7 +666,7 @@ func (rf *raft) sendSnapshot(id NodeId, addr NodeAddr, data []byte) error {
 		done:              true,
 	}
 	res := &InstallSnapshotReply{}
-	err := rf.transport.SendInstallSnapshot(addr, args, res)
+	err := rf.transport.InstallSnapshot(addr, args, res)
 	if err != nil {
 		return fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err)
 	}

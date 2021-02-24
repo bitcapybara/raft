@@ -2,9 +2,9 @@ package core
 
 type Transport interface {
 
-	SendAppendEntries(addr NodeAddr, args AppendEntry, res *AppendEntryReply) error
+	AppendEntries(addr NodeAddr, args AppendEntry, res *AppendEntryReply) error
 
-	SendRequestVote(addr NodeAddr, args RequestVote, res *RequestVoteReply) error
+	RequestVote(addr NodeAddr, args RequestVote, res *RequestVoteReply) error
 
-	SendInstallSnapshot(addr NodeAddr, args InstallSnapshot, res *InstallSnapshotReply) error
+	InstallSnapshot(addr NodeAddr, args InstallSnapshot, res *InstallSnapshotReply) error
 }

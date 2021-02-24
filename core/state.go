@@ -1,8 +1,14 @@
 package core
 
 import (
+	"math/rand"
 	"sync"
+	"time"
 )
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
 
 // ==================== RoleState ====================
 
@@ -16,19 +22,26 @@ const (
 type RoleStage uint8
 
 type RoleState struct {
-	roleStage RoleStage // 节点当前角色
+	roleStage RoleStage      // 节点当前角色
+	transCh   chan timerType // 计时器变更事件
 	mu        sync.RWMutex
 }
 
-func NewRoleState() *RoleState {
+func NewRoleState(transCh chan timerType) *RoleState {
 	return &RoleState{
 		roleStage: Follower,
+		transCh:   transCh,
 	}
 }
 
 func (st *RoleState) setRoleStage(stage RoleStage) {
 	st.mu.Lock()
 	st.roleStage = stage
+	if stage == Leader {
+		st.transCh <- Heartbeat
+	} else {
+		st.transCh <- Election
+	}
 	st.mu.Unlock()
 }
 
@@ -332,4 +345,104 @@ func (st *LeaderState) setNextIndex(id NodeId, index int) {
 	st.mu.Lock()
 	st.nextIndex[id] = index
 	st.mu.Unlock()
+}
+
+// ==================== timerState ====================
+
+type timerType uint8
+
+const (
+	Election timerType = iota
+	Heartbeat
+)
+
+type timerState struct {
+	timerType timerType       // 计时器类型
+	timer     *time.Timer     // 超时计时器
+	transCh   chan timerType  // 计时器类型变更事件
+	aeBusy    map[NodeId]bool // Follower 是否正在忙于 AE 通信
+	mu        sync.Mutex      // 修改 aeBusy 字段要加锁
+
+	electionMinTimeout int // 最小选举超时时间
+	electionMaxTimeout int // 最大选举超时时间
+	heartbeatTimeout   int // 心跳间隔时间
+}
+
+func NewTimerState(config Config) *timerState {
+	return &timerState{
+		electionMinTimeout: config.ElectionMinTimeout,
+		electionMaxTimeout: config.ElectionMaxTimeout,
+		heartbeatTimeout:   config.HeartbeatTimeout,
+	}
+}
+
+func (st *timerState) initTimerState(peers map[NodeId]NodeAddr) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	st.timer = time.NewTimer(st.electionDuration())
+
+	st.aeBusy = make(map[NodeId]bool, len(peers))
+	for id, _ := range peers {
+		st.aeBusy[id] = false
+	}
+
+	st.timerType = Election
+	st.transCh = make(chan timerType)
+}
+
+func (st *timerState) getTimerType() timerType {
+	st.mu.Lock()
+	timerT := st.timerType
+	st.mu.Unlock()
+	return timerT
+}
+
+func (st *timerState) setElectionTimer() {
+	st.timer.Reset(st.electionDuration())
+}
+
+func (st *timerState) resetElectionTimer() {
+	st.timer.Stop()
+	st.setElectionTimer()
+}
+
+func (st *timerState) setAeState(id NodeId, state bool) {
+	st.mu.Lock()
+	st.aeBusy[id] = state
+	st.mu.Unlock()
+}
+
+func (st *timerState) setHeartbeatTimer() {
+	st.timer.Reset(st.heartbeatDuration())
+}
+
+func (st *timerState) electionDuration() time.Duration {
+	randTimeout := rand.Intn(st.electionMaxTimeout-st.electionMinTimeout) + st.electionMinTimeout
+	return time.Millisecond * time.Duration(randTimeout)
+}
+
+func (st *timerState) heartbeatDuration() time.Duration {
+	return time.Millisecond * time.Duration(st.heartbeatTimeout)
+}
+
+func (st *timerState) isAeBusy(id NodeId) bool {
+	st.mu.Lock()
+	isBusy := st.aeBusy[id]
+	st.mu.Unlock()
+	return isBusy
+}
+
+func (st *timerState) changeTimer(tp timerType) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.timerType == tp {
+		return
+	}
+	st.timerType = tp
+	if tp == Heartbeat {
+		st.setHeartbeatTimer()
+	} else {
+		st.setElectionTimer()
+	}
 }
