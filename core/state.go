@@ -23,25 +23,18 @@ type RoleStage uint8
 
 type RoleState struct {
 	roleStage RoleStage      // 节点当前角色
-	transCh   chan timerType // 计时器变更事件
 	mu        sync.RWMutex
 }
 
-func NewRoleState(transCh chan timerType) *RoleState {
+func NewRoleState() *RoleState {
 	return &RoleState{
 		roleStage: Follower,
-		transCh:   transCh,
 	}
 }
 
 func (st *RoleState) setRoleStage(stage RoleStage) {
 	st.mu.Lock()
 	st.roleStage = stage
-	if stage == Leader {
-		st.transCh <- Heartbeat
-	} else {
-		st.transCh <- Election
-	}
 	st.mu.Unlock()
 }
 
@@ -359,7 +352,6 @@ const (
 type timerState struct {
 	timerType timerType       // 计时器类型
 	timer     *time.Timer     // 超时计时器
-	transCh   chan timerType  // 计时器类型变更事件
 	aeBusy    map[NodeId]bool // Follower 是否正在忙于 AE 通信
 	mu        sync.Mutex      // 修改 aeBusy 字段要加锁
 
@@ -388,7 +380,6 @@ func (st *timerState) initTimerState(peers map[NodeId]NodeAddr) {
 	}
 
 	st.timerType = Election
-	st.transCh = make(chan timerType)
 }
 
 func (st *timerState) getTimerType() timerType {
@@ -405,6 +396,11 @@ func (st *timerState) setElectionTimer() {
 func (st *timerState) resetElectionTimer() {
 	st.timer.Stop()
 	st.setElectionTimer()
+}
+
+func (st *timerState) resetHeartbeatTimer() {
+	st.timer.Stop()
+	st.setHeartbeatTimer()
 }
 
 func (st *timerState) setAeState(id NodeId, state bool) {
@@ -431,18 +427,4 @@ func (st *timerState) isAeBusy(id NodeId) bool {
 	isBusy := st.aeBusy[id]
 	st.mu.Unlock()
 	return isBusy
-}
-
-func (st *timerState) changeTimer(tp timerType) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if st.timerType == tp {
-		return
-	}
-	st.timerType = tp
-	if tp == Heartbeat {
-		st.setHeartbeatTimer()
-	} else {
-		st.setElectionTimer()
-	}
 }

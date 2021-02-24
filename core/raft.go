@@ -37,7 +37,7 @@ func newRaft(config Config) *raft {
 	hardState := raftState.toHardState(raftPst)
 
 	return &raft{
-		roleState:   NewRoleState(config.transCh),
+		roleState:   NewRoleState(),
 		persister:   snptPst,
 		fsm:         config.Fsm,
 		transport:   config.Transport,
@@ -54,19 +54,14 @@ func (rf *raft) raftRun() {
 	rf.initTimer()
 	go func() {
 		tm := rf.timerState
-		defer close(tm.transCh)
 		for {
-			select {
-			case <-tm.timer.C:
-				if rf.isHeartbeatTick() {
-					rf.heartbeat()
-					rf.setHeartbeatTimer()
-				} else if rf.isElectionTick() {
-					rf.election()
-					rf.setElectionTimer()
-				}
-			case tp := <-tm.transCh:
-				rf.timerChangeTo(tp)
+			<-tm.timer.C
+			if rf.isHeartbeatTick() {
+				rf.heartbeat()
+				rf.setHeartbeatTimer()
+			} else if rf.isElectionTick() {
+				rf.election()
+				rf.setElectionTimer()
 			}
 		}
 	}()
@@ -88,12 +83,12 @@ func (rf *raft) isLeader() bool {
 
 // 降级为 Follower
 func (rf *raft) degrade(term int) error {
-	if rf.roleState.getRoleStage() == Follower {
+	if rf.roleStage() == Follower {
 		return nil
 	}
 	// 更新状态
-	rf.roleState.setRoleStage(Follower)
-	return rf.hardState.setTerm(term)
+	rf.setRoleStage(Follower)
+	return rf.setTerm(term)
 }
 
 // 把日志应用到状态机
@@ -155,6 +150,12 @@ func (rf *raft) roleStage() RoleStage {
 
 func (rf *raft) setRoleStage(stage RoleStage) {
 	rf.roleState.setRoleStage(stage)
+	if stage == Leader {
+		rf.setLeader(rf.me())
+		rf.resetHeartbeatTimer()
+	} else {
+		rf.resetElectionTimer()
+	}
 }
 
 // ==================== HardState ====================
@@ -286,10 +287,6 @@ func (rf *raft) needHeartbeat(id NodeId) bool {
 	return rf.timerState.isAeBusy(id)
 }
 
-func (rf *raft) timerChangeTo(tp timerType) {
-	rf.timerState.changeTimer(tp)
-}
-
 func (rf *raft) setHeartbeatTimer() {
 	rf.timerState.setHeartbeatTimer()
 }
@@ -304,6 +301,10 @@ func (rf *raft) setAeState(id NodeId, isBusy bool) {
 
 func (rf *raft) resetElectionTimer() {
 	rf.timerState.resetElectionTimer()
+}
+
+func (rf *raft) resetHeartbeatTimer() {
+	rf.timerState.resetHeartbeatTimer()
 }
 
 // ==================== logic process ====================
@@ -411,7 +412,6 @@ func (rf *raft) election() {
 	if rf.roleStage() == Candidate && int(vote) > rf.majority() {
 		// 获得了大多数选票，转换为 Leader
 		rf.setRoleStage(Leader)
-		rf.setLeader(rf.me())
 		for id := range rf.peers() {
 			rf.setMatchAndNextIndex(id, 0, rf.lastLogIndex()+1)
 		}

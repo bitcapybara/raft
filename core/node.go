@@ -19,7 +19,6 @@ type Config struct {
 	ElectionMaxTimeout int
 	HeartbeatTimeout   int
 	MaxLogLength       int
-	transCh            chan timerType
 }
 
 // 代表了一个当前节点
