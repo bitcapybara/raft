@@ -1,6 +1,6 @@
 package core
 
-// 持久化器接口
+// ========== 持久化器接口，由用户实现 ==========
 type RaftStatePersister interface {
 	// 每次 raft 的状态改变，都会调用此方法
 	// entries 字段在变化之后进行持久化即可
@@ -13,7 +13,7 @@ type SnapshotPersister interface {
 	LoadSnapshot() (Snapshot, error)
 }
 
-// raft 保存的数据
+// ========== raft 保存的数据 ==========
 type RaftState struct {
 	Term     int
 	VotedFor NodeId
@@ -37,7 +37,7 @@ func (rs RaftState) toHardState(persister RaftStatePersister) HardState {
 	}
 }
 
-// 保存的快照数据
+// ========== 保存的快照数据 ==========
 type Snapshot struct {
 	LastIndex int
 	LastTerm  int
