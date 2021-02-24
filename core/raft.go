@@ -2,7 +2,6 @@ package core
 
 import (
 	"fmt"
-	"github.com/go-errors/errors"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -594,7 +593,7 @@ func (rf *raft) sendSnapshot(id NodeId, addr NodeAddr, data []byte) error {
 	res := &InstallSnapshotReply{}
 	err := rf.transport.SendInstallSnapshot(addr, args, res)
 	if err != nil {
-		return errors.Errorf("调用rpc服务失败：%s%s\n", addr, err)
+		return fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err)
 	}
 	if res.term > rf.term() {
 		// 如果任期数小，降级为 Follower

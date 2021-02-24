@@ -1,8 +1,7 @@
 package core
 
 import (
-	"github.com/go-errors/errors"
-	"github.com/smallnest/rpcx/v6/server"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -39,8 +38,6 @@ func NewNode(config Config) *Node {
 }
 
 func (nd *Node) Run() {
-	// 开启 rpc 服务器
-	go nd.rpcServer()
 
 	// 初始化定时器
 	nd.timerManager.initTimerManager(nd.raft.peers())
@@ -87,16 +84,6 @@ func (nd *Node) startTimer() {
 			}
 		}
 	}()
-}
-
-func (nd *Node) rpcServer() {
-	s := server.NewServer()
-	err := s.RegisterName("Node", nd, "")
-	if err != nil {
-		log.Fatalf("rpc 服务器注册服务失败：%s\n", err)
-	}
-	err = s.Serve("tcp", string(nd.config.Peers[nd.config.Me]))
-	log.Fatalf("rpc 服务器开启监听失败：%s\n", err)
 }
 
 // Follower 和 Candidate 开放的 rpc接口，由 Leader 调用
@@ -162,7 +149,7 @@ func (nd *Node) ClientApply(args ClientRequest, res *ClientResponse) error {
 	wg.Wait()
 	// 新日志成功发送到过半 Follower 节点，提交本地的日志
 	if int(successCnt) < nd.raft.majority() {
-		return errors.New("日志条目没有复制到多数节点")
+		return fmt.Errorf("日志条目没有复制到多数节点")
 	}
 
 	// 将 commitIndex 设置为新条目的索引
