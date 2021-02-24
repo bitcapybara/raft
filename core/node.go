@@ -131,7 +131,7 @@ func (nd *Node) ClientApply(args ClientRequest, res *ClientResponse) error {
 
 	for id, addr := range nd.raft.peers() {
 		go func(id NodeId, addr NodeAddr) {
-			err := nd.raft.sendSnapshot(id, addr, bytes)
+			err = nd.raft.sendSnapshot(id, addr, bytes)
 			if err != nil {
 				log.Println(err)
 			}

@@ -3,8 +3,6 @@ package core
 import (
 	"fmt"
 	"log"
-	"sync"
-	"sync/atomic"
 )
 
 type raft struct {
@@ -284,7 +282,7 @@ func (rf *raft) initTimer() {
 }
 
 func (rf *raft) needHeartbeat(id NodeId) bool {
-	return rf.timerState.isAeBusy(id)
+	return !rf.timerState.isAeBusy(id)
 }
 
 func (rf *raft) setHeartbeatTimer() {
@@ -364,28 +362,31 @@ func (rf *raft) heartbeatTo(id NodeId) {
 
 // Candidate / Follower 开启新一轮选举
 func (rf *raft) election() {
-	rf.setRoleStage(Candidate)
-	// 发送投票请求
-	var vote int32 = 0
+	// 增加 term 数
 	err := rf.setTerm(rf.term() + 1)
 	if err != nil {
 		log.Println(err)
 	}
-	var wg sync.WaitGroup
-	for id, addr := range rf.peers() {
-		wg.Add(1)
-		go func(id NodeId, addr NodeAddr) {
-			defer wg.Done()
-			if rf.isMe(id) {
-				// 投票给自己
-				atomic.AddInt32(&vote, 1)
-				err := rf.vote(rf.me())
-				if err != nil {
-					log.Println(err)
-				}
-				return
-			}
+	// 角色置为候选者
+	rf.setRoleStage(Candidate)
+	// 投票给自己
+	err = rf.vote(rf.me())
+	if err != nil {
+		log.Println(err)
+	}
+	// 发送 RV 请求
+	var voteCh,degradeCh,noopCh chan struct{}
+	defer func() {
+		close(voteCh)
+		close(degradeCh)
+		close(noopCh)
+	}()
 
+	for id, addr := range rf.peers() {
+		if rf.isMe(id) {
+			continue
+		}
+		go func(id NodeId, addr NodeAddr) {
 			args := RequestVote{
 				term:        rf.term(),
 				candidateId: id,
@@ -398,22 +399,40 @@ func (rf *raft) election() {
 			}
 			if res.term <= rf.term() && res.voteGranted {
 				// 成功获得选票
-				atomic.AddInt32(&vote, 1)
+				voteCh <- struct{}{}
 			} else if res.term > rf.term() {
 				// 当前节点任期落后，则退出竞选
-				err := rf.degrade(res.term)
+				err = rf.degrade(res.term)
 				if err != nil {
 					log.Println(err)
 				}
+				degradeCh <- struct{}{}
+			} else {
+				// 其它情况
+				noopCh <- struct {}{}
 			}
 		}(id, addr)
 	}
-	wg.Wait()
-	if rf.roleStage() == Candidate && int(vote) > rf.majority() {
-		// 获得了大多数选票，转换为 Leader
-		rf.setRoleStage(Leader)
-		for id := range rf.peers() {
-			rf.setMatchAndNextIndex(id, 0, rf.lastLogIndex()+1)
+
+	// todo 使用 context，在函数退出时尽快结束协程
+	voteCnt := 1
+	count := 1
+	for {
+		select {
+		case <-voteCh:
+			voteCnt += 1
+			count += 1
+			if voteCnt >= rf.majority() || count >= len(rf.peers()) {
+				rf.setRoleStage(Leader)
+				return
+			}
+		case <-degradeCh:
+			return
+		case <-noopCh:
+			count += 1
+			if count >= len(rf.peers()) {
+				return
+			}
 		}
 	}
 }
