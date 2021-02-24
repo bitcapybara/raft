@@ -14,6 +14,7 @@ type Config struct {
 	Fsm                Fsm
 	RaftStatePersister RaftStatePersister
 	SnapshotPersister  SnapshotPersister
+	Transport          Transport
 	Peers              map[NodeId]NodeAddr
 	Me                 NodeId
 	ElectionMinTimeout int
@@ -99,6 +100,7 @@ func (nd *Node) rpcServer() {
 }
 
 // Follower 和 Candidate 开放的 rpc接口，由 Leader 调用
+// 客户端接收到请求后，调用此方法
 func (nd *Node) AppendEntries(args AppendEntry, res *AppendEntryReply) error {
 	// 重置选举计时器
 	nd.timerManager.resetElectionTimer()
@@ -106,12 +108,14 @@ func (nd *Node) AppendEntries(args AppendEntry, res *AppendEntryReply) error {
 }
 
 // Follower 和 Candidate 开放的 rpc 接口，由 Candidate 调用
+// 客户端接收到请求后，调用此方法
 func (nd *Node) RequestVote(args RequestVote, res *RequestVoteReply) error {
 	// todo 向另一个节点投票后，重置选举计时器
 	return nd.raft.handleVoteReq(args, res)
 }
 
 // Follower 开放的 rpc 接口，由 Leader 调用
+// 客户端接收到请求后，调用此方法
 func (nd *Node) InstallSnapshot(args InstallSnapshot, res *InstallSnapshotReply) error {
 	return nd.raft.handleSnapshot(args, res)
 }

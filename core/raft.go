@@ -1,10 +1,8 @@
 package core
 
 import (
-	"context"
 	"fmt"
 	"github.com/go-errors/errors"
-	"github.com/smallnest/rpcx/v6/client"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -14,6 +12,7 @@ type raft struct {
 	roleState   *RoleState        // 当前节点的角色
 	persister   SnapshotPersister // 快照生成器
 	fsm         Fsm               // 客户端状态机
+	transport   Transport         // 发送请求的接口
 	hardState   *HardState        // 需要持久化存储的状态
 	softState   *SoftState        // 保存在内存中的实时状态
 	peerState   *PeerState        // 对等节点状态和路由表
@@ -41,6 +40,7 @@ func newRaft(config Config) *raft {
 		roleState:   NewRoleState(),
 		persister:   snptPst,
 		fsm:         config.Fsm,
+		transport: config.Transport,
 		hardState:   &hardState,
 		softState:   NewSoftState(),
 		peerState:   NewPeerState(config.Peers, config.Me),
@@ -81,7 +81,7 @@ func (rf *raft) applyFsm() error {
 	return nil
 }
 
-// 更新 Leader 的提交索引
+// 更新 Leader 的提交索引 todo 单元测试
 func (rf *raft) updateLeaderCommitIndex() error {
 
 	indexCnt := make(map[int]int)
@@ -253,17 +253,7 @@ func (rf *raft) heartbeat(id NodeId) {
 	if rf.isMe(id) {
 		return
 	}
-	d, err := client.NewPeer2PeerDiscovery("tcp@"+string(addr), "")
-	if err != nil {
-		log.Printf("创建rpc客户端失败：%s%s\n", addr, err)
-		return
-	}
-	xClient := client.NewXClient("Node", client.Failfast, client.RandomSelect, d, client.DefaultOption)
-	defer func() {
-		if err := xClient.Close(); err != nil {
-			log.Println("关闭客户端失败")
-		}
-	}()
+
 	term := rf.term()
 	args := AppendEntry{
 		term:         term,
@@ -274,7 +264,7 @@ func (rf *raft) heartbeat(id NodeId) {
 		leaderCommit: commitIndex,
 	}
 	res := &AppendEntryReply{}
-	err = xClient.Call(context.Background(), "AppendEntries", args, res)
+	err := rf.transport.SendAppendEntries(addr, args, res)
 	if err != nil {
 		log.Printf("调用rpc服务失败：%s%s\n", addr, err)
 		return
@@ -289,7 +279,7 @@ func (rf *raft) heartbeat(id NodeId) {
 	}
 
 	// Follower 和 Leader 的日志不匹配，则进行日志同步
-	if !res.success || rf.nextIndex(id) != rf.lastLogIndex() + 1 {
+	if !res.success || rf.nextIndex(id) != rf.lastLogIndex()+1 {
 		err := rf.sendLogEntry(id, addr)
 		if err != nil {
 			log.Println(err)
@@ -320,25 +310,16 @@ func (rf *raft) election() {
 				}
 				return
 			}
-			d, err := client.NewPeer2PeerDiscovery("tcp@"+string(addr), "")
-			if err != nil {
-				log.Printf("创建rpc客户端失败：%s%s\n", addr, err)
-				return
-			}
-			xClient := client.NewXClient("Node", client.Failtry, client.RandomSelect, d, client.DefaultOption)
+
 			args := RequestVote{
 				term:        rf.term(),
 				candidateId: id,
 			}
 			res := &RequestVoteReply{}
-			err = xClient.Call(context.Background(), "AppendEntries", args, res)
+			err = rf.transport.SendRequestVote(addr, args, res)
 			if err != nil {
 				log.Printf("调用rpc服务失败：%s%s\n", addr, err)
 				return
-			}
-			err = xClient.Close()
-			if err != nil {
-				log.Printf("关闭rpc客户端失败：%s\n", err)
 			}
 			if res.term <= rf.term() && res.voteGranted {
 				// 成功获得选票
@@ -358,7 +339,7 @@ func (rf *raft) election() {
 		rf.setRoleStage(Leader)
 		rf.setLeader(rf.me())
 		for id := range rf.peers() {
-			rf.setMatchAndNextIndex(id, 0, rf.lastLogIndex() + 1)
+			rf.setMatchAndNextIndex(id, 0, rf.lastLogIndex()+1)
 		}
 	}
 }
@@ -395,7 +376,7 @@ func (rf *raft) handleCommand(args AppendEntry, res *AppendEntryReply) error {
 		// ========== 接收日志条目 ==========
 		// 如果当前节点已经有此条目但冲突
 		if rf.lastLogIndex() >= newEntryIndex && rf.logEntryTerm(newEntryIndex) != args.term {
-			rf.truncateEntries(prevIndex+1)
+			rf.truncateEntries(prevIndex + 1)
 		}
 
 		// 将新条目添加到日志中
@@ -508,18 +489,6 @@ func (rf *raft) sendLogEntry(id NodeId, addr NodeAddr) error {
 	if rf.isMe(id) {
 		return nil
 	}
-	// 创建 rpc 客户端
-	d, err := client.NewPeer2PeerDiscovery("tcp@"+string(addr), "")
-	if err != nil {
-		log.Printf("创建rpc客户端失败：%s%s\n", addr, err)
-		return nil
-	}
-	xClient := client.NewXClient("Node", client.Failtry, client.RandomSelect, d, client.DefaultOption)
-	defer func() {
-		if err := xClient.Close(); err != nil {
-			log.Println("关闭客户端失败")
-		}
-	}()
 
 	var prevIndex int
 	// Follower 节点中必须存在第 prevIndex 条日志，才能接受第 nextIndex 条日志
@@ -535,7 +504,7 @@ func (rf *raft) sendLogEntry(id NodeId, addr NodeAddr) error {
 			entries:      rf.entries(prevIndex, rf.nextIndex(id)),
 		}
 		res := &AppendEntryReply{}
-		err = xClient.Call(context.Background(), "AppendEntries", args, res)
+		err := rf.transport.SendAppendEntries(addr, args, res)
 		if err != nil {
 			log.Printf("调用rpc服务失败：%s%s\n", addr, err)
 			continue
@@ -568,7 +537,7 @@ func (rf *raft) sendLogEntry(id NodeId, addr NodeAddr) error {
 			if err != nil {
 				log.Println(err)
 			} else {
-				rf.setMatchAndNextIndex(id, snapshot.LastIndex, snapshot.LastIndex + 1)
+				rf.setMatchAndNextIndex(id, snapshot.LastIndex, snapshot.LastIndex+1)
 			}
 		}
 
@@ -582,7 +551,7 @@ func (rf *raft) sendLogEntry(id NodeId, addr NodeAddr) error {
 			entries:      rf.entries(prevIndex, rf.nextIndex(id)),
 		}
 		res := &AppendEntryReply{}
-		err = xClient.Call(context.Background(), "AppendEntries", args, res)
+		err := rf.transport.SendAppendEntries(addr, args, res)
 		if err != nil {
 			log.Printf("调用rpc服务失败：%s%s\n", addr, err)
 			continue
@@ -608,32 +577,22 @@ func (rf *raft) sendSnapshot(id NodeId, addr NodeAddr, data []byte) error {
 		// 自己保存快照
 		newSnapshot := Snapshot{
 			LastIndex: rf.commitIndex(),
-			LastTerm: rf.term(),
-			Data: data,
+			LastTerm:  rf.term(),
+			Data:      data,
 		}
 		return rf.persister.SaveSnapshot(newSnapshot)
 	}
-	d, err := client.NewPeer2PeerDiscovery("tcp@"+string(addr), "")
-	if err != nil {
-		return errors.Errorf("创建rpc客户端失败：%s%s\n", addr, err)
-	}
-	xClient := client.NewXClient("Node", client.Failtry, client.RandomSelect, d, client.DefaultOption)
-	defer func() {
-		if err := xClient.Close(); err != nil {
-			log.Println("关闭客户端失败")
-		}
-	}()
 	args := InstallSnapshot{
-		term: rf.term(),
-		leaderId: rf.me(),
+		term:              rf.term(),
+		leaderId:          rf.me(),
 		lastIncludedIndex: rf.commitIndex(),
-		lastIncludedTerm: rf.logEntryTerm(rf.commitIndex()),
-		offset: 0,
-		data: data,
-		done: true,
+		lastIncludedTerm:  rf.logEntryTerm(rf.commitIndex()),
+		offset:            0,
+		data:              data,
+		done:              true,
 	}
 	res := &InstallSnapshotReply{}
-	err = xClient.Call(context.Background(), "AppendEntries", args, res)
+	err := rf.transport.SendInstallSnapshot(addr, args, res)
 	if err != nil {
 		return errors.Errorf("调用rpc服务失败：%s%s\n", addr, err)
 	}
