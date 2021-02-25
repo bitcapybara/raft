@@ -1,6 +1,8 @@
 package core
 
 import (
+	"fmt"
+	"log"
 	"math/rand"
 	"sync"
 	"time"
@@ -22,11 +24,11 @@ const (
 type RoleStage uint8
 
 type RoleState struct {
-	roleStage RoleStage      // 节点当前角色
+	roleStage RoleStage // 节点当前角色
 	mu        sync.RWMutex
 }
 
-func NewRoleState() *RoleState {
+func newRoleState() *RoleState {
 	return &RoleState{
 		roleStage: Follower,
 	}
@@ -135,7 +137,11 @@ func (st *HardState) persist() error {
 		VotedFor: st.votedFor,
 		Entries:  st.entries,
 	}
-	return st.persister.SaveRaftState(raftState)
+	err := st.persister.SaveRaftState(raftState)
+	if err != nil {
+		return fmt.Errorf("raft 状态持久化失败：%w", err)
+	}
+	return nil
 }
 
 func (st *HardState) appendEntry(entry Entry) error {
@@ -187,7 +193,7 @@ type SoftState struct {
 	mu          sync.Mutex
 }
 
-func NewSoftState() *SoftState {
+func newSoftState() *SoftState {
 	return &SoftState{
 		commitIndex: 0,
 		lastApplied: 0,
@@ -237,7 +243,7 @@ type PeerState struct {
 	mu     sync.Mutex
 }
 
-func NewPeerState(peers map[NodeId]NodeAddr, me NodeId) *PeerState {
+func newPeerState(peers map[NodeId]NodeAddr, me NodeId) *PeerState {
 	return &PeerState{
 		peers:  peers,
 		me:     me,
@@ -306,7 +312,7 @@ type LeaderState struct {
 	mu sync.Mutex
 }
 
-func NewLeaderState() *LeaderState {
+func newLeaderState() *LeaderState {
 	return &LeaderState{
 		nextIndex:  make(map[NodeId]int),
 		matchIndex: make(map[NodeId]int),
@@ -360,7 +366,7 @@ type timerState struct {
 	heartbeatTimeout   int // 心跳间隔时间
 }
 
-func NewTimerState(config Config) *timerState {
+func newTimerState(config Config) *timerState {
 	return &timerState{
 		electionMinTimeout: config.ElectionMinTimeout,
 		electionMaxTimeout: config.ElectionMaxTimeout,
@@ -427,4 +433,59 @@ func (st *timerState) isAeBusy(id NodeId) bool {
 	isBusy := st.aeBusy[id]
 	st.mu.Unlock()
 	return isBusy
+}
+
+// ==================== snapshotState ====================
+
+type snapshotState struct {
+	snapshot     *Snapshot
+	persister    SnapshotPersister
+	maxLogLength int
+	mu           sync.Mutex
+}
+
+func newSnapshotState(config Config) *snapshotState {
+	persister := config.SnapshotPersister
+	snapshot, err := persister.LoadSnapshot()
+	if err != nil {
+		log.Fatalln(fmt.Errorf("加载快照失败：%w", err))
+	}
+	return &snapshotState{
+		snapshot:     &snapshot,
+		persister:    persister,
+		maxLogLength: config.MaxLogLength,
+	}
+}
+
+func (st *snapshotState) save(snapshot Snapshot) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	err := st.persister.SaveSnapshot(snapshot)
+	if err != nil {
+		return fmt.Errorf("保存快照失败：%w", err)
+	}
+	st.snapshot = &snapshot
+	return nil
+}
+
+func (st *snapshotState) needGenSnapshot(commitIndex int) bool {
+	st.mu.Lock()
+	need := commitIndex - st.snapshot.LastIndex >= st.maxLogLength
+	st.mu.Unlock()
+	return need
+}
+
+func (st *snapshotState) lastIndex() int {
+	st.mu.Lock()
+	index := st.snapshot.LastIndex
+	st.mu.Unlock()
+	return index
+}
+
+func (st *snapshotState) getSnapshot() *Snapshot {
+	st.mu.Lock()
+	data := st.snapshot
+	st.mu.Unlock()
+	return data
 }

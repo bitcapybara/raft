@@ -4,23 +4,23 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync/atomic"
 )
 
 type raft struct {
-	roleState   *RoleState        // 当前节点的角色
-	persister   SnapshotPersister // 快照生成器
-	fsm         Fsm               // 客户端状态机
-	transport   Transport         // 发送请求的接口
-	hardState   *HardState        // 需要持久化存储的状态
-	softState   *SoftState        // 保存在内存中的实时状态
-	peerState   *PeerState        // 对等节点状态和路由表
-	leaderState *LeaderState      // 节点是 Leader 时，保存在内存中的状态
-	timerState  *timerState       // 计时器状态
+	roleState     *RoleState     // 当前节点的角色
+	fsm           Fsm            // 客户端状态机
+	transport     Transport      // 发送请求的接口
+	hardState     *HardState     // 需要持久化存储的状态
+	softState     *SoftState     // 保存在内存中的实时状态
+	peerState     *PeerState     // 对等节点状态和路由表
+	leaderState   *LeaderState   // 节点是 Leader 时，保存在内存中的状态
+	timerState    *timerState    // 计时器状态
+	snapshotState *snapshotState // 快照状态
 }
 
 func newRaft(config Config) *raft {
 	raftPst := config.RaftStatePersister
-	snptPst := config.SnapshotPersister
 
 	var raftState RaftState
 	if raftPst != nil {
@@ -36,15 +36,15 @@ func newRaft(config Config) *raft {
 	hardState := raftState.toHardState(raftPst)
 
 	return &raft{
-		roleState:   NewRoleState(),
-		persister:   snptPst,
-		fsm:         config.Fsm,
-		transport:   config.Transport,
-		hardState:   &hardState,
-		softState:   NewSoftState(),
-		peerState:   NewPeerState(config.Peers, config.Me),
-		leaderState: NewLeaderState(),
-		timerState:  NewTimerState(config),
+		roleState:     newRoleState(),
+		fsm:           config.Fsm,
+		transport:     config.Transport,
+		hardState:     &hardState,
+		softState:     newSoftState(),
+		peerState:     newPeerState(config.Peers, config.Me),
+		leaderState:   newLeaderState(),
+		timerState:    newTimerState(config),
+		snapshotState: newSnapshotState(config),
 	}
 }
 
@@ -74,6 +74,495 @@ func (rf *raft) isElectionTick() bool {
 	return rf.timerState.getTimerType() == Election && !rf.isLeader()
 }
 
+// ==================== logic process ====================
+
+func (rf *raft) heartbeat() {
+	for id := range rf.peers() {
+		if rf.isMe(id) {
+			continue
+		}
+		if rf.needHeartbeat(id) {
+			rf.heartbeatTo(id)
+		}
+	}
+	rf.setHeartbeatTimer()
+}
+
+// Leader 给某个节点发送心跳
+func (rf *raft) heartbeatTo(id NodeId) {
+	addr := rf.peers()[id]
+	commitIndex := rf.commitIndex()
+	if rf.isMe(id) {
+		return
+	}
+
+	term := rf.term()
+	args := AppendEntry{
+		term:         term,
+		leaderId:     rf.me(),
+		prevLogIndex: commitIndex,
+		prevLogTerm:  rf.logEntryTerm(commitIndex),
+		entries:      nil,
+		leaderCommit: commitIndex,
+	}
+	res := &AppendEntryReply{}
+	err := rf.transport.AppendEntries(addr, args, res)
+	if err != nil {
+		log.Printf("调用rpc服务失败：%s%s\n", addr, err)
+		return
+	}
+
+	if res.term > term {
+		// 当前任期数落后，降级为 Follower
+		err = rf.degrade(res.term)
+		if err != nil {
+			log.Println(err)
+		}
+	}
+
+	// Follower 和 Leader 的日志不匹配，则进行日志同步
+	if !res.success || rf.nextIndex(id) != rf.lastLogIndex()+1 {
+		err = rf.sendLogEntry(id, addr)
+		if err != nil {
+			log.Println(err)
+		}
+	}
+}
+
+type electionMsg struct {
+	vote    bool
+	degrade bool
+	noop    bool
+	err     error
+}
+
+// Candidate / Follower 开启新一轮选举
+func (rf *raft) election() {
+	// 增加 term 数
+	err := rf.setTerm(rf.term() + 1)
+	if err != nil {
+		log.Println(err)
+	}
+	// 角色置为候选者
+	rf.setRoleStage(Candidate)
+	// 投票给自己
+	err = rf.vote(rf.me())
+	if err != nil {
+		log.Println(err)
+	}
+	// 发送 RV 请求
+	ctx, cancel := context.WithCancel(context.Background())
+	msgCh := make(chan electionMsg, len(rf.peers()))
+	defer close(msgCh)
+	for id, addr := range rf.peers() {
+		if rf.isMe(id) {
+			continue
+		}
+		go rf.sendRequestVote(ctx, msgCh, id, addr)
+	}
+
+	voteCnt := 1
+	count := 1
+	for msg := range msgCh {
+		if msg.err != nil {
+			log.Println(fmt.Errorf("RequestVote Rpc 调用失败：%w", err))
+			continue
+		}
+		if msg.vote {
+			voteCnt += 1
+			count += 1
+			if voteCnt >= rf.majority() {
+				rf.setRoleStage(Leader)
+			}
+		} else if msg.noop {
+			count += 1
+		}
+		if msg.degrade || count >= len(rf.peers()) {
+			break
+		}
+	}
+	cancel()
+}
+
+type rpcState struct {
+	err error
+}
+
+func (rf *raft) sendRequestVote(ctx context.Context, msgCh chan electionMsg, id NodeId, addr NodeAddr) {
+	args := RequestVote{
+		term:        rf.term(),
+		candidateId: id,
+	}
+	res := &RequestVoteReply{}
+	finishCh := make(chan rpcState)
+	go func() {
+		err := rf.transport.RequestVote(addr, args, res)
+		if err != nil {
+			log.Printf("调用rpc服务失败：%s%s\n", addr, err)
+			finishCh <- rpcState{err: err}
+		}
+		finishCh <- rpcState{}
+	}()
+
+	var err error
+	select {
+	case <-ctx.Done():
+	case st := <-finishCh:
+		if st.err != nil {
+			msgCh <- electionMsg{err: err}
+			break
+		}
+		if res.term <= rf.term() && res.voteGranted {
+			// 成功获得选票
+			msgCh <- electionMsg{vote: true}
+		} else if res.term > rf.term() {
+			// 当前节点任期落后，则退出竞选
+			err = rf.degrade(res.term)
+			if err != nil {
+				msgCh <- electionMsg{err: err}
+			}
+			msgCh <- electionMsg{degrade: true}
+		} else {
+			// 其它情况
+			msgCh <- electionMsg{noop: true}
+		}
+	}
+}
+
+// Follower 和 Candidate 接收到来自 Leader 的 AppendEntries 调用
+func (rf *raft) handleCommand(args AppendEntry, res *AppendEntryReply) error {
+	// 重置选举计时器
+	rf.resetElectionTimer()
+
+	// 判断 term
+	rfTerm := rf.term()
+	if args.term < rfTerm {
+		// 发送请求的 Leader 任期数落后
+		res.term = rfTerm
+		res.success = false
+		return nil
+	}
+
+	// 处理请求
+	prevIndex := args.prevLogIndex
+	if prevIndex > rf.lastLogIndex() || rf.logEntryTerm(prevIndex) != args.prevLogTerm {
+		res.term = rfTerm
+		res.success = false
+		return nil
+	}
+
+	// 任期数落后或相等
+	if rf.roleStage() == Candidate {
+		// 如果是候选者，需要降级
+		err := rf.degrade(args.term)
+		if err != nil {
+			log.Println(err)
+		}
+	}
+
+	newEntryIndex := prevIndex + 1
+	if len(args.entries) != 0 {
+		// ========== 接收日志条目 ==========
+		// 如果当前节点已经有此条目但冲突
+		if rf.lastLogIndex() >= newEntryIndex && rf.logEntryTerm(newEntryIndex) != args.term {
+			rf.truncateEntries(prevIndex + 1)
+		}
+
+		// 将新条目添加到日志中
+		err := rf.appendEntry(args.entries[0])
+		if err != nil {
+			log.Println(err)
+		}
+	} else {
+		// ========== 接收心跳 ==========
+		rf.setLeader(args.leaderId)
+		res.term = rf.term()
+		res.success = true
+	}
+
+	// 更新提交索引
+	leaderCommit := args.leaderCommit
+	if leaderCommit > rf.commitIndex() {
+		var err error
+		if leaderCommit >= newEntryIndex {
+			err = rf.setCommitIndex(newEntryIndex)
+		} else {
+			err = rf.setCommitIndex(leaderCommit)
+		}
+		return err
+	}
+
+	return nil
+}
+
+// Follower 和 Candidate 接收到来自 Candidate 的 RequestVote 调用
+func (rf *raft) handleVoteReq(args RequestVote, res *RequestVoteReply) error {
+	var err error
+	argsTerm := args.term
+
+	rfTerm := rf.term()
+	if argsTerm < rfTerm {
+		// 拉票的候选者任期落后，不投票
+		res.term = rfTerm
+		res.voteGranted = false
+		return nil
+	}
+
+	if argsTerm > rfTerm {
+		// 角色降级
+		if rf.roleStage() != Follower {
+			err = rf.degrade(argsTerm)
+		} else {
+			err = rf.setTerm(argsTerm)
+		}
+		if err != nil {
+			err = fmt.Errorf("角色降级失败：%w", err)
+		}
+	}
+
+	res.term = argsTerm
+	res.voteGranted = false
+	votedFor := rf.votedFor()
+	if votedFor == "" || votedFor == args.candidateId {
+		// 当前节点是追随者且没有投过票
+		lastIndex := rf.lastLogIndex()
+		lastTerm := rf.logEntryTerm(lastIndex)
+		// 候选者的日志比当前节点的日志要新，则投票
+		if args.lastLogTerm > lastTerm || (args.lastLogTerm == lastTerm && args.lastLogIndex >= lastIndex) {
+			err = rf.vote(args.candidateId)
+			if err != nil {
+				err = fmt.Errorf("")
+			}
+			res.voteGranted = true
+		}
+	}
+
+	if res.voteGranted {
+		rf.resetElectionTimer()
+	}
+
+	return err
+}
+
+// Follower 接收来自 Leader 的 InstallSnapshot 调用
+func (rf *raft) handleSnapshot(args InstallSnapshot, res *InstallSnapshotReply) error {
+	rfTerm := rf.term()
+	if args.term < rfTerm {
+		// Leader 的 term 过期，直接返回
+		res.term = rfTerm
+		return nil
+	}
+
+	// 持久化
+	res.term = rfTerm
+	snapshot := Snapshot{args.lastIncludedIndex, args.lastIncludedTerm, args.data}
+	err := rf.saveSnapshot(snapshot)
+	if err != nil {
+		return err
+	}
+
+	if !args.done {
+		// 若传送没有完成，则继续接收数据
+		return nil
+	}
+
+	// 保存快照成功，删除多余日志
+	if args.lastIncludedIndex <= rf.logLength() && rf.logEntryTerm(args.lastIncludedIndex) == args.lastIncludedTerm {
+		rf.truncateEntries(args.lastIncludedIndex)
+		return nil
+	}
+
+	rf.clearEntries()
+	return nil
+}
+
+// 给各节点发送客户端日志
+func (rf *raft) handleClientReq(args ClientRequest, res *ClientResponse) error {
+	if !rf.isLeader() {
+		res.ok = false
+		res.leaderId = rf.leaderId()
+		return nil
+	}
+
+	// Leader 先将日志添加到内存
+	err := rf.appendEntry(Entry{Term: rf.term(), Data: args.data})
+	if err != nil {
+		log.Println(err)
+	}
+
+	// 给各节点发送日志条目
+	var successCnt int32 = 0
+	for id, addr := range rf.peers() {
+		go func(id NodeId, addr NodeAddr) {
+			defer func() {
+				rf.setAeState(id, false)
+			}()
+			// Follower 节点忙于 AE 请求，不需要发送心跳
+			rf.setAeState(id, true)
+			// 给节点发送日志条目
+			err = rf.sendLogEntry(id, addr)
+			if err != nil {
+				log.Println(err)
+			} else {
+				atomic.AddInt32(&successCnt, 1)
+			}
+		}(id, addr)
+	}
+
+	// 新日志成功发送到过半 Follower 节点，提交本地的日志
+	if int(successCnt) < rf.majority() {
+		return fmt.Errorf("日志条目没有复制到多数节点")
+	}
+
+	// 将 commitIndex 设置为新条目的索引
+	// 此操作会连带提交 Leader 先前未提交的日志条目
+	err = rf.updateLeaderCommit()
+	if err != nil {
+		log.Println(err)
+	}
+
+	// 当日志量超过阈值时，生成快照
+	if !rf.needGenSnapshot(rf.commitIndex()) {
+		return nil
+	}
+	bytes, err := rf.fsm.Serialize()
+	if err != nil {
+		return nil
+	}
+
+	// 快照数据发送给所有 Follower 节点
+	for id, addr := range rf.peers() {
+		go func(id NodeId, addr NodeAddr) {
+			err = rf.sendSnapshot(id, addr, bytes)
+			if err != nil {
+				log.Println(err)
+			}
+		}(id, addr)
+	}
+	return nil
+}
+
+// 给指定的节点发送日志条目
+func (rf *raft) sendLogEntry(id NodeId, addr NodeAddr) error {
+
+	// 不用给自己发
+	if rf.isMe(id) {
+		return nil
+	}
+
+	var prevIndex int
+	// Follower 节点中必须存在第 prevIndex 条日志，才能接受第 nextIndex 条日志
+	// 如果 Follower 节点缺少很多日志，需要找到缺少的第一条日志的索引
+	for {
+		prevIndex = rf.nextIndex(id) - 1
+		args := AppendEntry{
+			term:         rf.term(),
+			leaderId:     rf.me(),
+			prevLogIndex: prevIndex,
+			prevLogTerm:  rf.logEntryTerm(prevIndex),
+			leaderCommit: rf.commitIndex(),
+			entries:      rf.entries(prevIndex, rf.nextIndex(id)),
+		}
+		res := &AppendEntryReply{}
+		err := rf.transport.AppendEntries(addr, args, res)
+		if err != nil {
+			log.Printf("调用rpc服务失败：%s%s\n", addr, err)
+			continue
+		}
+		if res.term > rf.term() {
+			// 如果任期数小，降级为 Follower
+			err := rf.degrade(res.term)
+			if err != nil {
+				log.Println(err)
+			}
+			break
+		}
+		if res.success {
+			break
+		}
+
+		// 向前继续查找 Follower 缺少的第一条日志的索引
+		rf.setNextIndex(id, rf.nextIndex(id)-1)
+	}
+
+	// 给 Follower 发送缺失的日志，发送的日志的索引一直递增到最新
+	var err error
+	for prevIndex != rf.lastLogIndex() {
+		// 缺失的日志太多时，直接发送快照
+		snapshot := rf.snapshot()
+		if rf.nextIndex(id) <= snapshot.LastIndex {
+			err = rf.sendSnapshot(id, addr, snapshot.Data)
+			if err != nil {
+				log.Println(err)
+			} else {
+				rf.setMatchAndNextIndex(id, snapshot.LastIndex, snapshot.LastIndex+1)
+			}
+		}
+
+		prevIndex = rf.nextIndex(id) - 1
+		args := AppendEntry{
+			term:         rf.term(),
+			leaderId:     rf.me(),
+			prevLogIndex: prevIndex,
+			prevLogTerm:  rf.logEntryTerm(prevIndex),
+			leaderCommit: rf.commitIndex(),
+			entries:      rf.entries(prevIndex, rf.nextIndex(id)),
+		}
+		res := &AppendEntryReply{}
+		err = rf.transport.AppendEntries(addr, args, res)
+		if err != nil {
+			log.Printf("调用rpc服务失败：%s%s\n", addr, err)
+			continue
+		}
+		if res.term > rf.term() {
+			// 如果任期数小，降级为 Follower
+			err = rf.degrade(res.term)
+			if err != nil {
+				log.Println(err)
+			}
+			break
+		}
+
+		// 向后补充
+		rf.setMatchAndNextIndex(id, rf.nextIndex(id), rf.nextIndex(id)+1)
+	}
+
+	return nil
+}
+
+func (rf *raft) sendSnapshot(id NodeId, addr NodeAddr, data []byte) error {
+	if rf.isMe(id) {
+		// 自己保存快照
+		newSnapshot := Snapshot{
+			LastIndex: rf.commitIndex(),
+			LastTerm:  rf.term(),
+			Data:      data,
+		}
+		return rf.saveSnapshot(newSnapshot)
+	}
+	args := InstallSnapshot{
+		term:              rf.term(),
+		leaderId:          rf.me(),
+		lastIncludedIndex: rf.commitIndex(),
+		lastIncludedTerm:  rf.logEntryTerm(rf.commitIndex()),
+		offset:            0,
+		data:              data,
+		done:              true,
+	}
+	res := &InstallSnapshotReply{}
+	err := rf.transport.InstallSnapshot(addr, args, res)
+	if err != nil {
+		return fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err)
+	}
+	if res.term > rf.term() {
+		// 如果任期数小，降级为 Follower
+		return rf.degrade(res.term)
+	}
+
+	return nil
+}
+
+// 当前节点是不是 Leader
 func (rf *raft) isLeader() bool {
 	roleStage := rf.roleState.getRoleStage()
 	leaderIsMe := rf.peerState.leaderIsMe()
@@ -108,7 +597,7 @@ func (rf *raft) applyFsm() error {
 }
 
 // 更新 Leader 的提交索引 todo 单元测试
-func (rf *raft) updateLeaderCommitIndex() error {
+func (rf *raft) updateLeaderCommit() error {
 
 	indexCnt := make(map[int]int)
 	peers := rf.peers()
@@ -306,417 +795,16 @@ func (rf *raft) resetHeartbeatTimer() {
 	rf.timerState.resetHeartbeatTimer()
 }
 
-// ==================== logic process ====================
+// ==================== snapshotState ====================
 
-func (rf *raft) heartbeat() {
-	for id := range rf.peers() {
-		if rf.isMe(id) {
-			continue
-		}
-		if rf.needHeartbeat(id) {
-			rf.heartbeatTo(id)
-		}
-	}
-	rf.setHeartbeatTimer()
+func (rf *raft) saveSnapshot(snapshot Snapshot) error {
+	return rf.snapshotState.save(snapshot)
 }
 
-// Leader 给某个节点发送心跳
-func (rf *raft) heartbeatTo(id NodeId) {
-	addr := rf.peers()[id]
-	commitIndex := rf.commitIndex()
-	if rf.isMe(id) {
-		return
-	}
-
-	term := rf.term()
-	args := AppendEntry{
-		term:         term,
-		leaderId:     rf.me(),
-		prevLogIndex: commitIndex,
-		prevLogTerm:  rf.logEntryTerm(commitIndex),
-		entries:      nil,
-		leaderCommit: commitIndex,
-	}
-	res := &AppendEntryReply{}
-	err := rf.transport.AppendEntries(addr, args, res)
-	if err != nil {
-		log.Printf("调用rpc服务失败：%s%s\n", addr, err)
-		return
-	}
-
-	if res.term > term {
-		// 当前任期数落后，降级为 Follower
-		err := rf.degrade(res.term)
-		if err != nil {
-			log.Println(err)
-		}
-	}
-
-	// Follower 和 Leader 的日志不匹配，则进行日志同步
-	if !res.success || rf.nextIndex(id) != rf.lastLogIndex()+1 {
-		err := rf.sendLogEntry(id, addr)
-		if err != nil {
-			log.Println(err)
-		}
-	}
+func (rf *raft) snapshot() *Snapshot {
+	return rf.snapshotState.getSnapshot()
 }
 
-type electionMsg struct {
-	vote    bool
-	degrade bool
-	noop    bool
-	err     error
-}
-
-// Candidate / Follower 开启新一轮选举
-func (rf *raft) election() {
-	// 增加 term 数
-	err := rf.setTerm(rf.term() + 1)
-	if err != nil {
-		log.Println(err)
-	}
-	// 角色置为候选者
-	rf.setRoleStage(Candidate)
-	// 投票给自己
-	err = rf.vote(rf.me())
-	if err != nil {
-		log.Println(err)
-	}
-	// 发送 RV 请求
-	ctx, cancel := context.WithCancel(context.Background())
-	msgCh := make(chan electionMsg, len(rf.peers()))
-	defer close(msgCh)
-	for id, addr := range rf.peers() {
-		if rf.isMe(id) {
-			continue
-		}
-		go rf.sendRequestVote(ctx, msgCh, id, addr)
-	}
-
-	voteCnt := 1
-	count := 1
-	for msg := range msgCh {
-		if msg.err != nil {
-			log.Println(fmt.Errorf("RequestVote Rpc 调用失败：%w", err))
-			continue
-		}
-		if msg.vote {
-			voteCnt += 1
-			count += 1
-			if voteCnt >= rf.majority() {
-				rf.setRoleStage(Leader)
-			}
-		} else if msg.noop {
-			count += 1
-		}
-		if msg.degrade || count >= len(rf.peers()) {
-			break
-		}
-	}
-	cancel()
-}
-
-type rpcState struct {
-	err error
-}
-
-func (rf *raft) sendRequestVote(ctx context.Context, msgCh chan electionMsg, id NodeId, addr NodeAddr) {
-	args := RequestVote{
-		term:        rf.term(),
-		candidateId: id,
-	}
-	res := &RequestVoteReply{}
-	finishCh := make(chan rpcState)
-	go func() {
-		err := rf.transport.RequestVote(addr, args, res)
-		if err != nil {
-			log.Printf("调用rpc服务失败：%s%s\n", addr, err)
-			finishCh <- rpcState{err: err}
-		}
-		finishCh <- rpcState{}
-	}()
-
-	var err error
-	select {
-	case <-ctx.Done():
-	case st:= <-finishCh:
-		if st.err != nil {
-			msgCh <- electionMsg{err: err}
-			break
-		}
-		if res.term <= rf.term() && res.voteGranted {
-			// 成功获得选票
-			msgCh <- electionMsg{vote: true}
-		} else if res.term > rf.term() {
-			// 当前节点任期落后，则退出竞选
-			err = rf.degrade(res.term)
-			if err != nil {
-				msgCh <- electionMsg{err: err}
-			}
-			msgCh <- electionMsg{degrade: true}
-		} else {
-			// 其它情况
-			msgCh <- electionMsg{noop: true}
-		}
-	}
-}
-
-// Follower 和 Candidate 接收到来自 Leader 的 AppendEntries 调用
-func (rf *raft) handleCommand(args AppendEntry, res *AppendEntryReply) error {
-	rfTerm := rf.term()
-	if args.term < rfTerm {
-		// 发送请求的 Leader 任期数落后
-		res.term = rfTerm
-		res.success = false
-		return nil
-	}
-
-	// 处理请求
-	prevIndex := args.prevLogIndex
-	if prevIndex > rf.lastLogIndex() || rf.logEntryTerm(prevIndex) != args.prevLogTerm {
-		res.term = rfTerm
-		res.success = false
-		return nil
-	}
-
-	// 任期数落后或相等
-	if rf.roleStage() == Candidate {
-		// 如果是候选者，需要降级
-		err := rf.degrade(args.term)
-		if err != nil {
-			log.Println(err)
-		}
-	}
-
-	newEntryIndex := prevIndex + 1
-	if len(args.entries) != 0 {
-		// ========== 接收日志条目 ==========
-		// 如果当前节点已经有此条目但冲突
-		if rf.lastLogIndex() >= newEntryIndex && rf.logEntryTerm(newEntryIndex) != args.term {
-			rf.truncateEntries(prevIndex + 1)
-		}
-
-		// 将新条目添加到日志中
-		err := rf.appendEntry(args.entries[0])
-		if err != nil {
-			log.Println(err)
-		}
-	} else {
-		// ========== 接收心跳 ==========
-		rf.setLeader(args.leaderId)
-		res.term = rf.term()
-		res.success = true
-	}
-
-	// 更新提交索引
-	leaderCommit := args.leaderCommit
-	if leaderCommit > rf.commitIndex() {
-		var err error
-		if leaderCommit >= newEntryIndex {
-			err = rf.setCommitIndex(newEntryIndex)
-		} else {
-			err = rf.setCommitIndex(leaderCommit)
-		}
-		return err
-	}
-
-	return nil
-}
-
-// Follower 和 Candidate 接收到来自 Candidate 的 RequestVote 调用
-func (rf *raft) handleVoteReq(args RequestVote, res *RequestVoteReply) error {
-	argsTerm := args.term
-	rfTerm := rf.term()
-	if argsTerm < rfTerm {
-		// 拉票的候选者任期落后，不投票
-		res.term = rfTerm
-		res.voteGranted = false
-		return nil
-	}
-
-	if argsTerm > rfTerm {
-		// 角色降级
-		var err error
-		if rf.roleStage() != Follower {
-			err = rf.degrade(argsTerm)
-		} else {
-			err = rf.setTerm(argsTerm)
-		}
-		if err != nil {
-			log.Println(err)
-		}
-	}
-
-	res.term = argsTerm
-	res.voteGranted = false
-	votedFor := rf.votedFor()
-	if votedFor == "" || votedFor == args.candidateId {
-		// 当前节点是追随者且没有投过票
-		lastIndex := rf.lastLogIndex()
-		lastTerm := rf.logEntryTerm(lastIndex)
-		// 候选者的日志比当前节点的日志要新，则投票
-		if args.lastLogTerm > lastTerm || (args.lastLogTerm == lastTerm && args.lastLogIndex >= lastIndex) {
-			err := rf.vote(args.candidateId)
-			if err != nil {
-				log.Println(err)
-			}
-			res.voteGranted = true
-		}
-	}
-
-	return nil
-}
-
-// Follower 接收来自 Leader 的 InstallSnapshot 调用
-func (rf *raft) handleSnapshot(args InstallSnapshot, res *InstallSnapshotReply) error {
-	rfTerm := rf.term()
-	if args.term < rfTerm {
-		// Leader 的 term 过期，直接返回
-		res.term = rfTerm
-		return nil
-	}
-
-	// 持久化
-	res.term = rfTerm
-	snapshot := Snapshot{args.lastIncludedIndex, args.lastIncludedTerm, args.data}
-	err := rf.persister.SaveSnapshot(snapshot)
-	if err != nil {
-		return err
-	}
-
-	if !args.done {
-		// 若传送没有完成，则继续接收数据
-		return nil
-	}
-
-	// 保存快照成功，删除多余日志
-	if args.lastIncludedIndex <= rf.logLength() && rf.logEntryTerm(args.lastIncludedIndex) == args.lastIncludedTerm {
-		rf.truncateEntries(args.lastIncludedIndex)
-		return nil
-	}
-
-	rf.clearEntries()
-	return nil
-}
-
-// 给指定的节点发送日志条目
-func (rf *raft) sendLogEntry(id NodeId, addr NodeAddr) error {
-
-	// 不用给自己发
-	if rf.isMe(id) {
-		return nil
-	}
-
-	var prevIndex int
-	// Follower 节点中必须存在第 prevIndex 条日志，才能接受第 nextIndex 条日志
-	// 如果 Follower 节点缺少很多日志，需要找到缺少的第一条日志的索引
-	for {
-		prevIndex = rf.nextIndex(id) - 1
-		args := AppendEntry{
-			term:         rf.term(),
-			leaderId:     rf.me(),
-			prevLogIndex: prevIndex,
-			prevLogTerm:  rf.logEntryTerm(prevIndex),
-			leaderCommit: rf.commitIndex(),
-			entries:      rf.entries(prevIndex, rf.nextIndex(id)),
-		}
-		res := &AppendEntryReply{}
-		err := rf.transport.AppendEntries(addr, args, res)
-		if err != nil {
-			log.Printf("调用rpc服务失败：%s%s\n", addr, err)
-			continue
-		}
-		if res.term > rf.term() {
-			// 如果任期数小，降级为 Follower
-			err := rf.degrade(res.term)
-			if err != nil {
-				log.Println(err)
-			}
-			break
-		}
-		if res.success {
-			break
-		}
-
-		// 向前继续查找 Follower 缺少的第一条日志的索引
-		rf.setNextIndex(id, rf.nextIndex(id)-1)
-	}
-
-	// 给 Follower 发送缺失的日志，发送的日志的索引一直递增到最新
-	snapshot, err := rf.persister.LoadSnapshot()
-	if err != nil {
-		log.Println(err)
-	}
-	for prevIndex != rf.lastLogIndex() {
-		// 缺失的日志太多时，直接发送快照
-		if rf.nextIndex(id) <= snapshot.LastIndex {
-			err := rf.sendSnapshot(id, addr, snapshot.Data)
-			if err != nil {
-				log.Println(err)
-			} else {
-				rf.setMatchAndNextIndex(id, snapshot.LastIndex, snapshot.LastIndex+1)
-			}
-		}
-
-		prevIndex = rf.nextIndex(id) - 1
-		args := AppendEntry{
-			term:         rf.term(),
-			leaderId:     rf.me(),
-			prevLogIndex: prevIndex,
-			prevLogTerm:  rf.logEntryTerm(prevIndex),
-			leaderCommit: rf.commitIndex(),
-			entries:      rf.entries(prevIndex, rf.nextIndex(id)),
-		}
-		res := &AppendEntryReply{}
-		err := rf.transport.AppendEntries(addr, args, res)
-		if err != nil {
-			log.Printf("调用rpc服务失败：%s%s\n", addr, err)
-			continue
-		}
-		if res.term > rf.term() {
-			// 如果任期数小，降级为 Follower
-			err := rf.degrade(res.term)
-			if err != nil {
-				log.Println(err)
-			}
-			break
-		}
-
-		// 向后补充
-		rf.setMatchAndNextIndex(id, rf.nextIndex(id), rf.nextIndex(id)+1)
-	}
-
-	return nil
-}
-
-func (rf *raft) sendSnapshot(id NodeId, addr NodeAddr, data []byte) error {
-	if rf.isMe(id) {
-		// 自己保存快照
-		newSnapshot := Snapshot{
-			LastIndex: rf.commitIndex(),
-			LastTerm:  rf.term(),
-			Data:      data,
-		}
-		return rf.persister.SaveSnapshot(newSnapshot)
-	}
-	args := InstallSnapshot{
-		term:              rf.term(),
-		leaderId:          rf.me(),
-		lastIncludedIndex: rf.commitIndex(),
-		lastIncludedTerm:  rf.logEntryTerm(rf.commitIndex()),
-		offset:            0,
-		data:              data,
-		done:              true,
-	}
-	res := &InstallSnapshotReply{}
-	err := rf.transport.InstallSnapshot(addr, args, res)
-	if err != nil {
-		return fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err)
-	}
-	if res.term > rf.term() {
-		// 如果任期数小，降级为 Follower
-		return rf.degrade(res.term)
-	}
-
-	return nil
+func (rf *raft) needGenSnapshot(commitIndex int) bool {
+	return rf.snapshotState.needGenSnapshot(commitIndex)
 }
