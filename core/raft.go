@@ -416,25 +416,34 @@ func (rf *raft) election() {
 	cancel()
 }
 
+type rpcState struct {
+	err error
+}
+
 func (rf *raft) sendRequestVote(ctx context.Context, msgCh chan electionMsg, id NodeId, addr NodeAddr) {
 	args := RequestVote{
 		term:        rf.term(),
 		candidateId: id,
 	}
 	res := &RequestVoteReply{}
-	finishCh := make(chan struct{})
+	finishCh := make(chan rpcState)
 	go func() {
 		err := rf.transport.RequestVote(addr, args, res)
 		if err != nil {
 			log.Printf("调用rpc服务失败：%s%s\n", addr, err)
+			finishCh <- rpcState{err: err}
 		}
-		finishCh <- struct{}{}
+		finishCh <- rpcState{}
 	}()
 
 	var err error
 	select {
 	case <-ctx.Done():
-	case <-finishCh:
+	case st:= <-finishCh:
+		if st.err != nil {
+			msgCh <- electionMsg{err: err}
+			break
+		}
 		if res.term <= rf.term() && res.voteGranted {
 			// 成功获得选票
 			msgCh <- electionMsg{vote: true}
