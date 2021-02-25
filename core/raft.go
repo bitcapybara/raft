@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"sync/atomic"
 )
 
 type raft struct {
@@ -122,10 +121,8 @@ func (rf *raft) heartbeatTo(id NodeId) {
 
 	// Follower 和 Leader 的日志不匹配，则进行日志同步
 	if !res.success || rf.nextIndex(id) != rf.lastLogIndex()+1 {
-		err = rf.sendLogEntry(id, addr)
-		if err != nil {
-			log.Println(err)
-		}
+		rf.findCorrectNextIndex(context.Background(), id, addr)
+		rf.completeEntries(id, addr, prevIndex)
 	}
 }
 
@@ -198,10 +195,10 @@ func (rf *raft) sendRequestVote(ctx context.Context, msgCh chan electionMsg, id 
 	go func() {
 		err := rf.transport.RequestVote(addr, args, res)
 		if err != nil {
-			log.Printf("调用rpc服务失败：%s%s\n", addr, err)
-			finishCh <- rpcState{err: err}
+			finishCh <- rpcState{err: fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err)}
+		} else {
+			finishCh <- rpcState{}
 		}
-		finishCh <- rpcState{}
 	}()
 
 	var err error
@@ -269,7 +266,7 @@ func (rf *raft) handleCommand(args AppendEntry, res *AppendEntryReply) error {
 		}
 
 		// 将新条目添加到日志中
-		err := rf.appendEntry(args.entries[0])
+		err := rf.addEntry(args.entries[0])
 		if err != nil {
 			log.Println(err)
 		}
@@ -376,6 +373,12 @@ func (rf *raft) handleSnapshot(args InstallSnapshot, res *InstallSnapshotReply) 
 	return nil
 }
 
+type clientReqMsg struct {
+	degrade bool
+	success bool
+	err     error
+}
+
 // 给各节点发送客户端日志
 func (rf *raft) handleClientReq(args ClientRequest, res *ClientResponse) error {
 	if !rf.isLeader() {
@@ -385,34 +388,51 @@ func (rf *raft) handleClientReq(args ClientRequest, res *ClientResponse) error {
 	}
 
 	// Leader 先将日志添加到内存
-	err := rf.appendEntry(Entry{Term: rf.term(), Data: args.data})
+	err := rf.addEntry(Entry{Term: rf.term(), Data: args.data})
 	if err != nil {
 		log.Println(err)
 	}
 
 	// 给各节点发送日志条目
-	var successCnt int32 = 0
+	ctx, cancel := context.WithCancel(context.Background())
+	msgCh := make(chan clientReqMsg)
 	for id, addr := range rf.peers() {
+		// 不用给自己发
+		if rf.isMe(id) {
+			continue
+		}
 		go func(id NodeId, addr NodeAddr) {
-			defer func() {
-				rf.setAeState(id, false)
-			}()
 			// Follower 节点忙于 AE 请求，不需要发送心跳
 			rf.setAeState(id, true)
-			// 给节点发送日志条目
-			err = rf.sendLogEntry(id, addr)
-			if err != nil {
-				log.Println(err)
-			} else {
-				atomic.AddInt32(&successCnt, 1)
-			}
+
+			// Follower 节点设置为 AE 空闲，可以发送心跳
+			defer rf.setAeState(id, false)
+
+			rf.findCorrectNextIndex(ctx, id, addr, msgCh)
+			rf.completeEntries(ctx, id, addr, msgCh)
 		}(id, addr)
 	}
 
 	// 新日志成功发送到过半 Follower 节点，提交本地的日志
-	if int(successCnt) < rf.majority() {
-		return fmt.Errorf("日志条目没有复制到多数节点")
+	successCnt := 0
+	count := 1
+	for msg := range msgCh {
+		if msg.degrade {
+			cancel()
+			return nil
+		}
+		if msg.success {
+			successCnt += 1
+			if successCnt >= rf.majority() {
+				break
+			}
+		}
+		count += 1
+		if count >= len(rf.peers()) {
+			break
+		}
 	}
+	cancel()
 
 	// 将 commitIndex 设置为新条目的索引
 	// 此操作会连带提交 Leader 先前未提交的日志条目
@@ -442,92 +462,99 @@ func (rf *raft) handleClientReq(args ClientRequest, res *ClientResponse) error {
 	return nil
 }
 
-// 给指定的节点发送日志条目
-func (rf *raft) sendLogEntry(id NodeId, addr NodeAddr) error {
-
-	// 不用给自己发
-	if rf.isMe(id) {
-		return nil
-	}
-
-	var prevIndex int
+func (rf *raft) findCorrectNextIndex(ctx context.Context, id NodeId, addr NodeAddr, msgCh chan clientReqMsg) {
 	// Follower 节点中必须存在第 prevIndex 条日志，才能接受第 nextIndex 条日志
 	// 如果 Follower 节点缺少很多日志，需要找到缺少的第一条日志的索引
 	for {
-		prevIndex = rf.nextIndex(id) - 1
-		args := AppendEntry{
-			term:         rf.term(),
-			leaderId:     rf.me(),
-			prevLogIndex: prevIndex,
-			prevLogTerm:  rf.logEntryTerm(prevIndex),
-			leaderCommit: rf.commitIndex(),
-			entries:      rf.entries(prevIndex, rf.nextIndex(id)),
-		}
-		res := &AppendEntryReply{}
-		err := rf.transport.AppendEntries(addr, args, res)
-		if err != nil {
-			log.Printf("调用rpc服务失败：%s%s\n", addr, err)
-			continue
-		}
-		if res.term > rf.term() {
-			// 如果任期数小，降级为 Follower
-			err := rf.degrade(res.term)
-			if err != nil {
-				log.Println(err)
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			prevIndex := rf.nextIndex(id) - 1
+			args := AppendEntry{
+				term:         rf.term(),
+				leaderId:     rf.me(),
+				prevLogIndex: prevIndex,
+				prevLogTerm:  rf.logEntryTerm(prevIndex),
+				leaderCommit: rf.commitIndex(),
+				entries:      rf.entries(prevIndex, rf.nextIndex(id)),
 			}
-			break
-		}
-		if res.success {
-			break
-		}
+			res := &AppendEntryReply{}
+			err := rf.transport.AppendEntries(addr, args, res)
+			if err != nil {
+				msgCh <- clientReqMsg{err: fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err)}
+				return
+			}
+			if res.term > rf.term() {
+				// 如果任期数小，降级为 Follower
+				err = rf.degrade(res.term)
+				if err != nil {
+					log.Println(err)
+				}
+				msgCh <- clientReqMsg{degrade: true}
+				return
+			}
+			if res.success {
+				return
+			}
 
-		// 向前继续查找 Follower 缺少的第一条日志的索引
-		rf.setNextIndex(id, rf.nextIndex(id)-1)
+			// 向前继续查找 Follower 缺少的第一条日志的索引
+			rf.setNextIndex(id, rf.nextIndex(id)-1)
+		}
 	}
+}
 
-	// 给 Follower 发送缺失的日志，发送的日志的索引一直递增到最新
+// 给 Follower 发送缺失的日志，发送的日志的索引一直递增到最新
+func (rf *raft) completeEntries(ctx context.Context, id NodeId, addr NodeAddr, msgCh chan clientReqMsg) {
 	var err error
-	for prevIndex != rf.lastLogIndex() {
-		// 缺失的日志太多时，直接发送快照
-		snapshot := rf.snapshot()
-		if rf.nextIndex(id) <= snapshot.LastIndex {
-			err = rf.sendSnapshot(id, addr, snapshot.Data)
-			if err != nil {
-				log.Println(err)
-			} else {
-				rf.setMatchAndNextIndex(id, snapshot.LastIndex, snapshot.LastIndex+1)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			if rf.nextIndex(id) - 1 != rf.lastLogIndex() {
+				msgCh <- clientReqMsg{success: true}
+				return
 			}
-		}
-
-		prevIndex = rf.nextIndex(id) - 1
-		args := AppendEntry{
-			term:         rf.term(),
-			leaderId:     rf.me(),
-			prevLogIndex: prevIndex,
-			prevLogTerm:  rf.logEntryTerm(prevIndex),
-			leaderCommit: rf.commitIndex(),
-			entries:      rf.entries(prevIndex, rf.nextIndex(id)),
-		}
-		res := &AppendEntryReply{}
-		err = rf.transport.AppendEntries(addr, args, res)
-		if err != nil {
-			log.Printf("调用rpc服务失败：%s%s\n", addr, err)
-			continue
-		}
-		if res.term > rf.term() {
-			// 如果任期数小，降级为 Follower
-			err = rf.degrade(res.term)
-			if err != nil {
-				log.Println(err)
+			// 缺失的日志太多时，直接发送快照
+			snapshot := rf.snapshot()
+			if rf.nextIndex(id) <= snapshot.LastIndex {
+				err = rf.sendSnapshot(id, addr, snapshot.Data)
+				if err != nil {
+					log.Println(err)
+				} else {
+					rf.setMatchAndNextIndex(id, snapshot.LastIndex, snapshot.LastIndex+1)
+				}
 			}
-			break
-		}
 
-		// 向后补充
-		rf.setMatchAndNextIndex(id, rf.nextIndex(id), rf.nextIndex(id)+1)
+			prevIndex := rf.nextIndex(id) - 1
+			args := AppendEntry{
+				term:         rf.term(),
+				leaderId:     rf.me(),
+				prevLogIndex: prevIndex,
+				prevLogTerm:  rf.logEntryTerm(prevIndex),
+				leaderCommit: rf.commitIndex(),
+				entries:      rf.entries(prevIndex, rf.nextIndex(id)),
+			}
+			res := &AppendEntryReply{}
+			err = rf.transport.AppendEntries(addr, args, res)
+			if err != nil {
+				msgCh <- clientReqMsg{err: fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err)}
+				return
+			}
+			if res.term > rf.term() {
+				// 如果任期数小，降级为 Follower
+				err = rf.degrade(res.term)
+				if err != nil {
+					log.Println(err)
+				}
+				msgCh <- clientReqMsg{degrade: true}
+			}
+
+			// 向后补充
+			rf.setMatchAndNextIndex(id, rf.nextIndex(id), rf.nextIndex(id)+1)
+		}
 	}
-
-	return nil
 }
 
 func (rf *raft) sendSnapshot(id NodeId, addr NodeAddr, data []byte) error {
@@ -596,7 +623,7 @@ func (rf *raft) applyFsm() error {
 	return nil
 }
 
-// 更新 Leader 的提交索引 todo 单元测试
+// 更新 Leader 的提交索引
 func (rf *raft) updateLeaderCommit() error {
 
 	indexCnt := make(map[int]int)
@@ -694,7 +721,7 @@ func (rf *raft) setTerm(term int) error {
 	return rf.hardState.setTerm(term)
 }
 
-func (rf *raft) appendEntry(entry Entry) error {
+func (rf *raft) addEntry(entry Entry) error {
 	return rf.hardState.appendEntry(entry)
 }
 
