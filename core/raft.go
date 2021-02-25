@@ -107,7 +107,7 @@ func (rf *raft) heartbeatTo(id NodeId) {
 	res := &AppendEntryReply{}
 	err := rf.transport.AppendEntries(addr, args, res)
 	if err != nil {
-		log.Printf("调用rpc服务失败：%s%s\n", addr, err)
+		log.Print(fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err))
 		return
 	}
 
@@ -120,9 +120,24 @@ func (rf *raft) heartbeatTo(id NodeId) {
 	}
 
 	// Follower 和 Leader 的日志不匹配，则进行日志同步
+	ctx := context.Background()
+	msgCh := make(chan clientReqMsg)
+	defer close(msgCh)
 	if !res.success || rf.nextIndex(id) != rf.lastLogIndex()+1 {
-		rf.findCorrectNextIndex(context.Background(), id, addr)
-		rf.completeEntries(id, addr, prevIndex)
+		// Follower 节点忙于 AE 请求，不需要发送心跳
+		rf.setAeState(id, true)
+		// Follower 节点设置为 AE 空闲，可以发送心跳
+		defer rf.setAeState(id, false)
+		// 同步日志
+		rf.findCorrectNextIndex(ctx, id, addr, msgCh)
+		rf.completeEntries(ctx, id, addr, msgCh)
+	}
+
+	for msg := range msgCh {
+		if msg.err != nil {
+			log.Print(fmt.Errorf("日志同步失败：%s%w\n", addr, err))
+		}
+		break
 	}
 }
 
@@ -396,6 +411,7 @@ func (rf *raft) handleClientReq(args ClientRequest, res *ClientResponse) error {
 	// 给各节点发送日志条目
 	ctx, cancel := context.WithCancel(context.Background())
 	msgCh := make(chan clientReqMsg)
+	defer close(msgCh)
 	for id, addr := range rf.peers() {
 		// 不用给自己发
 		if rf.isMe(id) {
