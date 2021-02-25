@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"fmt"
 	"log"
 )
@@ -360,6 +361,13 @@ func (rf *raft) heartbeatTo(id NodeId) {
 	}
 }
 
+type electionMsg struct {
+	vote    bool
+	degrade bool
+	noop    bool
+	err     error
+}
+
 // Candidate / Follower 开启新一轮选举
 func (rf *raft) election() {
 	// 增加 term 数
@@ -375,64 +383,71 @@ func (rf *raft) election() {
 		log.Println(err)
 	}
 	// 发送 RV 请求
-	var voteCh,degradeCh,noopCh chan struct{}
-	defer func() {
-		close(voteCh)
-		close(degradeCh)
-		close(noopCh)
-	}()
-
+	ctx, cancel := context.WithCancel(context.Background())
+	msgCh := make(chan electionMsg, len(rf.peers()))
+	defer close(msgCh)
 	for id, addr := range rf.peers() {
 		if rf.isMe(id) {
 			continue
 		}
-		go func(id NodeId, addr NodeAddr) {
-			args := RequestVote{
-				term:        rf.term(),
-				candidateId: id,
-			}
-			res := &RequestVoteReply{}
-			err = rf.transport.RequestVote(addr, args, res)
-			if err != nil {
-				log.Printf("调用rpc服务失败：%s%s\n", addr, err)
-				return
-			}
-			if res.term <= rf.term() && res.voteGranted {
-				// 成功获得选票
-				voteCh <- struct{}{}
-			} else if res.term > rf.term() {
-				// 当前节点任期落后，则退出竞选
-				err = rf.degrade(res.term)
-				if err != nil {
-					log.Println(err)
-				}
-				degradeCh <- struct{}{}
-			} else {
-				// 其它情况
-				noopCh <- struct {}{}
-			}
-		}(id, addr)
+		go rf.sendRequestVote(ctx, msgCh, id, addr)
 	}
 
-	// todo 使用 context，在函数退出时尽快结束协程
 	voteCnt := 1
 	count := 1
-	for {
-		select {
-		case <-voteCh:
+	for msg := range msgCh {
+		if msg.err != nil {
+			log.Println(fmt.Errorf("RequestVote Rpc 调用失败：%w", err))
+			continue
+		}
+		if msg.vote {
 			voteCnt += 1
 			count += 1
-			if voteCnt >= rf.majority() || count >= len(rf.peers()) {
+			if voteCnt >= rf.majority() {
 				rf.setRoleStage(Leader)
-				return
 			}
-		case <-degradeCh:
-			return
-		case <-noopCh:
+		} else if msg.noop {
 			count += 1
-			if count >= len(rf.peers()) {
-				return
+		}
+		if msg.degrade || count >= len(rf.peers()) {
+			break
+		}
+	}
+	cancel()
+}
+
+func (rf *raft) sendRequestVote(ctx context.Context, msgCh chan electionMsg, id NodeId, addr NodeAddr) {
+	args := RequestVote{
+		term:        rf.term(),
+		candidateId: id,
+	}
+	res := &RequestVoteReply{}
+	finishCh := make(chan struct{})
+	go func() {
+		err := rf.transport.RequestVote(addr, args, res)
+		if err != nil {
+			log.Printf("调用rpc服务失败：%s%s\n", addr, err)
+		}
+		finishCh <- struct{}{}
+	}()
+
+	var err error
+	select {
+	case <-ctx.Done():
+	case <-finishCh:
+		if res.term <= rf.term() && res.voteGranted {
+			// 成功获得选票
+			msgCh <- electionMsg{vote: true}
+		} else if res.term > rf.term() {
+			// 当前节点任期落后，则退出竞选
+			err = rf.degrade(res.term)
+			if err != nil {
+				msgCh <- electionMsg{err: err}
 			}
+			msgCh <- electionMsg{degrade: true}
+		} else {
+			// 其它情况
+			msgCh <- electionMsg{noop: true}
 		}
 	}
 }
