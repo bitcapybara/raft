@@ -112,7 +112,7 @@ func (rf *raft) heartbeatTo(ctx context.Context, id NodeId, msgCh chan clientReq
 	prevIndex := rf.leaderState.peerNextIndex(id) - 1
 	args := AppendEntry{
 		term:         term,
-		leaderId:     rf.peerState.identity(),
+		leaderId:     rf.peerState.myId(),
 		prevLogIndex: prevIndex,
 		prevLogTerm:  rf.logTerm(prevIndex),
 		entries:      nil,
@@ -163,7 +163,7 @@ func (rf *raft) election() {
 	// 角色置为候选者
 	rf.setRoleStage(Candidate)
 	// 投票给自己
-	err = rf.hardState.vote(rf.peerState.identity())
+	err = rf.hardState.vote(rf.peerState.myId())
 	if err != nil {
 		log.Println(err)
 	}
@@ -411,7 +411,7 @@ func (rf *raft) handleVoteReq(args RequestVote, res *RequestVoteReply) error {
 
 	res.term = argsTerm
 	res.voteGranted = false
-	votedFor := rf.hardState.getVotedFor()
+	votedFor := rf.hardState.voted()
 	if votedFor == "" || votedFor == args.candidateId {
 		// 当前节点是追随者且没有投过票
 		lastIndex := rf.lastLogIndex()
@@ -590,7 +590,7 @@ func (rf *raft) findCorrectNextIndex(ctx context.Context, id NodeId, addr NodeAd
 			}
 			args := AppendEntry{
 				term:         rf.hardState.currentTerm(),
-				leaderId:     rf.peerState.identity(),
+				leaderId:     rf.peerState.myId(),
 				prevLogIndex: prevIndex,
 				prevLogTerm:  rf.logTerm(prevIndex),
 				leaderCommit: rf.softState.softCommitIndex(),
@@ -657,7 +657,7 @@ func (rf *raft) completeEntries(ctx context.Context, id NodeId, addr NodeAddr, m
 			prevIndex := rl.peerNextIndex(id) - 1
 			args := AppendEntry{
 				term:         rf.hardState.currentTerm(),
-				leaderId:     rf.peerState.identity(),
+				leaderId:     rf.peerState.myId(),
 				prevLogIndex: prevIndex,
 				prevLogTerm:  rf.logTerm(prevIndex),
 				leaderCommit: rf.softState.softCommitIndex(),
@@ -696,7 +696,7 @@ func (rf *raft) sendSnapshot(id NodeId, addr NodeAddr, data []byte) error {
 	}
 	args := InstallSnapshot{
 		term:              rf.hardState.currentTerm(),
-		leaderId:          rf.peerState.identity(),
+		leaderId:          rf.peerState.myId(),
 		lastIncludedIndex: rf.softState.softCommitIndex(),
 		lastIncludedTerm:  rf.logTerm(rf.softState.softCommitIndex()),
 		offset:            0,
@@ -737,7 +737,7 @@ func (rf *raft) degrade(term int) error {
 func (rf *raft) setRoleStage(stage RoleStage) {
 	rf.roleState.setRoleStage(stage)
 	if stage == Leader {
-		rf.peerState.setLeader(rf.peerState.identity())
+		rf.peerState.setLeader(rf.peerState.myId())
 		rf.timerState.resetHeartbeatTimer()
 	} else {
 		rf.timerState.resetElectionTimer()
