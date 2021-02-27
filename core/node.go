@@ -1,29 +1,15 @@
 package core
 
-// 构造 Node 对象时的配置参数
-type Config struct {
-	Fsm                Fsm
-	RaftStatePersister RaftStatePersister
-	SnapshotPersister  SnapshotPersister
-	Transport          Transport
-	Peers              map[NodeId]NodeAddr
-	Me                 NodeId
-	ElectionMinTimeout int
-	ElectionMaxTimeout int
-	HeartbeatTimeout   int
-	MaxLogLength       int
-}
-
 // 代表了一个当前节点
 type Node struct {
-	raft         *raft         // 节点所具有的 raft 功能对象
-	config       Config        // 节点配置对象
+	raft   *raft
+	config Config // 节点配置对象
 }
 
 func NewNode(config Config) *Node {
 	return &Node{
-		raft:         newRaft(config),
-		config:       config,
+		raft:   newRaft(config),
+		config: config,
 	}
 }
 

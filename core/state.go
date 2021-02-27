@@ -146,7 +146,7 @@ func (st *HardState) persist() error {
 
 func (st *HardState) appendEntry(entry Entry) error {
 	st.mu.Lock()
-	entry.Index = st.lastLogIndex() + 1
+	defer st.mu.Unlock()
 	st.entries = append(st.entries, entry)
 	return st.persist()
 }
