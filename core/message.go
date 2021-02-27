@@ -12,8 +12,10 @@ type AppendEntry struct {
 }
 
 type AppendEntryReply struct {
-	term    int  // 当前时刻所属任期，用于领导者更新自身
-	success bool // 如果关注者包含与prevLogIndex和prevLogTerm匹配的条目，则为true
+	term               int  // 当前时刻所属任期，用于领导者更新自身
+	conflictTerm       int  // 当前节点与 Leader 发生冲突的日志的 term
+	conflictStartIndex int  // 发生冲突的 term 包含的第一条日志
+	success            bool // 如果关注者包含与prevLogIndex和prevLogTerm匹配的条目，则为true
 }
 
 // ==================== RequestVote ====================

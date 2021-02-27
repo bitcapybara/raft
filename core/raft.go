@@ -114,7 +114,7 @@ func (rf *raft) heartbeatTo(ctx context.Context, id NodeId, msgCh chan clientReq
 		term:         term,
 		leaderId:     rf.peerState.identity(),
 		prevLogIndex: prevIndex,
-		prevLogTerm:  rf.hardState.logEntryTerm(prevIndex),
+		prevLogTerm:  rf.logTerm(prevIndex),
 		entries:      nil,
 		leaderCommit: commitIndex,
 	}
@@ -215,7 +215,7 @@ func (rf *raft) becomeLeader() {
 		if rf.peerState.isMe(id) {
 			continue
 		}
-		rf.leaderState.setMatchAndNextIndex(id, 0, rf.hardState.lastLogIndex()+1)
+		rf.leaderState.setMatchAndNextIndex(id, 0, rf.lastLogIndex()+1)
 		go rf.heartbeatTo(ctx, id, msgCh)
 	}
 
@@ -300,9 +300,35 @@ func (rf *raft) handleCommand(args AppendEntry, res *AppendEntryReply) error {
 		return nil
 	}
 
-	// 处理请求
+	// 日志一致性检查
 	prevIndex := args.prevLogIndex
-	if prevIndex > rf.hardState.lastLogIndex() || rf.hardState.logEntryTerm(prevIndex) != args.prevLogTerm {
+	if prevIndex > rf.lastLogIndex() {
+		// 当前节点不包含索引为 prevIndex 的日志
+		// 返回最后一个日志条目的 term 及此 term 的首个条目的索引
+		logLength := rf.hardState.logLength()
+		if logLength <= 0 {
+			res.conflictStartIndex = rf.snapshotState.lastIndex()
+			res.conflictTerm = rf.snapshotState.lastTerm()
+		} else {
+			res.conflictTerm = rf.logTerm(logLength-1)
+			res.conflictStartIndex = rf.hardState.lastEntryIndex()
+			for i := logLength-1; i>=0 && rf.logTerm(i) == res.conflictTerm; i-- {
+				res.conflictStartIndex = rf.hardState.logEntry(i).Index
+			}
+		}
+		res.term = rfTerm
+		res.success = false
+		return nil
+	}
+	prevTerm := rf.logTerm(prevIndex)
+	if prevTerm != args.prevLogTerm {
+		// 节点包含索引为 prevIndex 的日志但是 term 数不同
+		// 返回 prevIndex 所在 term 及此 term 的首个条目的索引
+		res.conflictTerm = prevTerm
+		res.conflictStartIndex = prevIndex
+		for i := prevIndex-1; i>=0 && rf.logTerm(i) == res.conflictTerm; i-- {
+			res.conflictStartIndex = rf.hardState.logEntry(i).Index
+		}
 		res.term = rfTerm
 		res.success = false
 		return nil
@@ -321,7 +347,7 @@ func (rf *raft) handleCommand(args AppendEntry, res *AppendEntryReply) error {
 	if len(args.entries) != 0 {
 		// ========== 接收日志条目 ==========
 		// 如果当前节点已经有此条目但冲突
-		if rf.hardState.lastLogIndex() >= newEntryIndex && rf.hardState.logEntryTerm(newEntryIndex) != args.term {
+		if rf.lastLogIndex() >= newEntryIndex && rf.logTerm(newEntryIndex) != args.term {
 			rf.hardState.truncateEntries(prevIndex + 1)
 		}
 
@@ -330,12 +356,14 @@ func (rf *raft) handleCommand(args AppendEntry, res *AppendEntryReply) error {
 		if err != nil {
 			log.Println(err)
 		}
-	} else {
-		// ========== 接收心跳 ==========
-		rf.peerState.setLeader(args.leaderId)
-		res.term = rf.hardState.currentTerm()
-		res.success = true
+		// 添加日志后不提交，下次心跳来了再提交
+		return nil
 	}
+
+	// ========== 接收心跳 ==========
+	rf.peerState.setLeader(args.leaderId)
+	res.term = rf.hardState.currentTerm()
+	res.success = true
 
 	// 更新提交索引
 	leaderCommit := args.leaderCommit
@@ -386,8 +414,8 @@ func (rf *raft) handleVoteReq(args RequestVote, res *RequestVoteReply) error {
 	votedFor := rf.hardState.getVotedFor()
 	if votedFor == "" || votedFor == args.candidateId {
 		// 当前节点是追随者且没有投过票
-		lastIndex := rf.hardState.lastLogIndex()
-		lastTerm := rf.hardState.logEntryTerm(lastIndex)
+		lastIndex := rf.lastLogIndex()
+		lastTerm := rf.logTerm(lastIndex)
 		// 候选者的日志比当前节点的日志要新，则投票
 		if args.lastLogTerm > lastTerm || (args.lastLogTerm == lastTerm && args.lastLogIndex >= lastIndex) {
 			err = rf.hardState.vote(args.candidateId)
@@ -430,7 +458,7 @@ func (rf *raft) handleSnapshot(args InstallSnapshot, res *InstallSnapshotReply) 
 	}
 
 	// 保存快照成功，删除多余日志
-	if args.lastIncludedIndex <= rf.hardState.logLength() && rf.hardState.logEntryTerm(args.lastIncludedIndex) == args.lastIncludedTerm {
+	if args.lastIncludedIndex <= rf.hardState.logLength() && rf.logTerm(args.lastIncludedIndex) == args.lastIncludedTerm {
 		rf.hardState.truncateEntries(args.lastIncludedIndex)
 		return nil
 	}
@@ -564,7 +592,7 @@ func (rf *raft) findCorrectNextIndex(ctx context.Context, id NodeId, addr NodeAd
 				term:         rf.hardState.currentTerm(),
 				leaderId:     rf.peerState.identity(),
 				prevLogIndex: prevIndex,
-				prevLogTerm:  rf.hardState.logEntryTerm(prevIndex),
+				prevLogTerm:  rf.logTerm(prevIndex),
 				leaderCommit: rf.softState.softCommitIndex(),
 				entries:      entries,
 			}
@@ -587,8 +615,18 @@ func (rf *raft) findCorrectNextIndex(ctx context.Context, id NodeId, addr NodeAd
 				return
 			}
 
+			conflictStartIndex := res.conflictStartIndex
+			// Follower 日志是空的，则 nextIndex 置为 1
+			if conflictStartIndex <= 0 {
+				conflictStartIndex = 1
+			}
+			// conflictStartIndex 处的日志是一致的，则 nextIndex 置为下一个
+			if rf.logTerm(conflictStartIndex) == res.conflictTerm {
+				conflictStartIndex += 1
+			}
+
 			// 向前继续查找 Follower 缺少的第一条日志的索引
-			rl.setNextIndex(id, rl.peerNextIndex(id)-1)
+			rl.setNextIndex(id, conflictStartIndex)
 		}
 	}
 }
@@ -601,7 +639,7 @@ func (rf *raft) completeEntries(ctx context.Context, id NodeId, addr NodeAddr, m
 		case <-ctx.Done():
 			return
 		default:
-			if rl.peerNextIndex(id)-1 == rf.hardState.lastLogIndex() {
+			if rl.peerNextIndex(id)-1 == rf.lastLogIndex() {
 				msgCh <- clientReqMsg{success: true}
 				return
 			}
@@ -621,7 +659,7 @@ func (rf *raft) completeEntries(ctx context.Context, id NodeId, addr NodeAddr, m
 				term:         rf.hardState.currentTerm(),
 				leaderId:     rf.peerState.identity(),
 				prevLogIndex: prevIndex,
-				prevLogTerm:  rf.hardState.logEntryTerm(prevIndex),
+				prevLogTerm:  rf.logTerm(prevIndex),
 				leaderCommit: rf.softState.softCommitIndex(),
 				entries:      rf.hardState.logEntries(prevIndex, rl.peerNextIndex(id)),
 			}
@@ -660,7 +698,7 @@ func (rf *raft) sendSnapshot(id NodeId, addr NodeAddr, data []byte) error {
 		term:              rf.hardState.currentTerm(),
 		leaderId:          rf.peerState.identity(),
 		lastIncludedIndex: rf.softState.softCommitIndex(),
-		lastIncludedTerm:  rf.hardState.logEntryTerm(rf.softState.softCommitIndex()),
+		lastIncludedTerm:  rf.logTerm(rf.softState.softCommitIndex()),
 		offset:            0,
 		data:              data,
 		done:              true,
@@ -708,8 +746,8 @@ func (rf *raft) setRoleStage(stage RoleStage) {
 
 // 添加新日志
 func (rf *raft) addEntry(entry Entry) error {
-	index := 0
-	lastLogIndex := rf.hardState.lastLogIndex()
+	index := 1
+	lastLogIndex := rf.lastLogIndex()
 	lastSnapshotIndex := rf.snapshotState.lastIndex()
 	if lastLogIndex <= 0 {
 		if lastSnapshotIndex <= 0 {
@@ -772,4 +810,23 @@ func (rf *raft) updateLeaderCommit() error {
 	}
 
 	return nil
+}
+
+// 获取最后一个日志条目的算法索引
+func (rf *raft) lastLogIndex() int {
+	index := rf.hardState.lastEntryIndex()
+	if index <= 0 {
+		index = rf.snapshotState.lastIndex()
+	}
+	return index
+}
+
+// 传入的是逻辑索引
+func (rf *raft) logTerm(index int) int {
+	realIndex := index - rf.snapshotState.lastIndex() - 1
+	if realIndex < 0 {
+		return 0
+	} else {
+		return rf.logTerm(realIndex)
+	}
 }

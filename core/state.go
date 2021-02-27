@@ -51,7 +51,7 @@ func (st *RoleState) getRoleStage() RoleStage {
 
 // 日志条目
 type Entry struct {
-	Index int    // 此条目的索引
+	Index int    // 此条目的逻辑索引， 从 1 开始
 	Term  int    // 日志项所在term
 	Data  []byte // 状态机命令
 }
@@ -78,12 +78,14 @@ func NewHardState(persister RaftStatePersister) HardState {
 	}
 }
 
-func (st *HardState) lastLogIndex() int {
-	lastIndex := st.logLength() - 1
-	if lastIndex <= 0 {
+func (st *HardState) lastEntryIndex() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	lastLogIndex := len(st.entries) - 1
+	if lastLogIndex < 0 {
 		return 0
 	} else {
-		return lastIndex
+		return st.entries[lastLogIndex].Index
 	}
 }
 
@@ -94,8 +96,12 @@ func (st *HardState) currentTerm() int {
 	return term
 }
 
+// todo 传入的必须是物理索引
 func (st *HardState) logEntryTerm(index int) int {
 	st.mu.Lock()
+	if len(st.entries) - 1 < index {
+		return 0
+	}
 	term := st.entries[index].Term
 	st.mu.Unlock()
 	return term
@@ -467,6 +473,13 @@ func (st *snapshotState) needGenSnapshot(commitIndex int) bool {
 func (st *snapshotState) lastIndex() int {
 	st.mu.Lock()
 	index := st.snapshot.LastIndex
+	st.mu.Unlock()
+	return index
+}
+
+func (st *snapshotState) lastTerm() int {
+	st.mu.Lock()
+	index := st.snapshot.LastTerm
 	st.mu.Unlock()
 	return index
 }
