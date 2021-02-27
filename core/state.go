@@ -271,6 +271,13 @@ func (st *PeerState) peersMap() map[NodeId]NodeAddr {
 	return peers
 }
 
+func (st *PeerState) peersCnt() int {
+	st.mu.Lock()
+	cnt := len(st.peers)
+	st.mu.Unlock()
+	return cnt
+}
+
 func (st *PeerState) isMe(id NodeId) bool {
 	st.mu.Lock()
 	isMe := id == st.me
