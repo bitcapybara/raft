@@ -18,7 +18,11 @@ type raft struct {
 	timerState    *timerState    // 计时器状态
 	snapshotState *snapshotState // 快照状态
 
+	// 所有方法都加锁，保证同一时间 raft 只接收一个改变状态的请求
 	mu sync.Mutex
+
+	// 开始心跳后，如果 clientReq 还没有处理完，使用此通道结束
+	stopCh chan struct{}
 }
 
 func newRaft(config Config) *raft {
@@ -52,7 +56,7 @@ func newRaft(config Config) *raft {
 
 func (rf *raft) raftRun() {
 	// 初始化定时器
-	rf.timerState.initTimerState(rf.peerState.peersMap())
+	rf.timerState.initTimerState()
 	go func() {
 		tm := rf.timerState
 		for {
@@ -61,7 +65,6 @@ func (rf *raft) raftRun() {
 				rf.heartbeat()
 			} else if rf.isElectionTick() {
 				rf.election()
-
 			}
 		}
 	}()
@@ -78,14 +81,17 @@ func (rf *raft) isElectionTick() bool {
 // ==================== logic process ====================
 
 func (rf *raft) heartbeat() {
-	defer rf.timerState.setHeartbeatTimer()
+	rf.stopCh <- struct{}{}
+	rf.mu.Lock()
+	defer func() {
+		rf.timerState.setHeartbeatTimer()
+		rf.mu.Unlock()
+	}()
 	for id := range rf.peerState.peersMap() {
 		if rf.peerState.isMe(id) {
 			continue
 		}
-		if !rf.timerState.isAeBusy(id) {
-			rf.heartbeatTo(id)
-		}
+		rf.heartbeatTo(id)
 	}
 }
 
@@ -127,19 +133,16 @@ func (rf *raft) heartbeatTo(id NodeId) {
 	msgCh := make(chan clientReqMsg)
 	defer close(msgCh)
 	if !res.success || rf.leaderState.peerNextIndex(id) != rf.hardState.lastLogIndex()+1 {
-		// Follower 节点忙于 AE 请求，不需要发送心跳
-		rf.timerState.setAeState(id, true)
-		// Follower 节点设置为 AE 空闲，可以发送心跳
-		defer rf.timerState.setAeState(id, false)
-		// 同步日志
-		rf.findCorrectNextIndex(ctx, id, addr, msgCh)
-		rf.completeEntries(ctx, id, addr, msgCh)
+		go rf.appendPeerEntry(ctx, id, addr, msgCh)
 	}
 
-	for msg := range msgCh {
+	select {
+	case msg := <-msgCh:
 		if msg.err != nil {
 			log.Print(fmt.Errorf("日志同步失败：%s%w\n", addr, err))
 		}
+		break
+	case <- rf.stopCh:
 		break
 	}
 }
@@ -153,7 +156,11 @@ type electionMsg struct {
 
 // Candidate / Follower 开启新一轮选举
 func (rf *raft) election() {
-	defer rf.timerState.setElectionTimer()
+	rf.mu.Lock()
+	defer func() {
+		rf.timerState.setElectionTimer()
+		rf.mu.Unlock()
+	}()
 
 	// 增加 term 数
 	err := rf.hardState.setTerm(rf.hardState.currentTerm() + 1)
@@ -248,6 +255,8 @@ func (rf *raft) sendRequestVote(ctx context.Context, msgCh chan electionMsg, id 
 
 // Follower 和 Candidate 接收到来自 Leader 的 AppendEntries 调用
 func (rf *raft) handleCommand(args AppendEntry, res *AppendEntryReply) error {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	// 重置选举计时器
 	rf.timerState.resetElectionTimer()
 
@@ -302,9 +311,11 @@ func (rf *raft) handleCommand(args AppendEntry, res *AppendEntryReply) error {
 	if leaderCommit > rf.softState.softCommitIndex() {
 		var err error
 		if leaderCommit >= newEntryIndex {
-			err = rf.setCommitIndex(newEntryIndex)
+			rf.softState.setCommitIndex(newEntryIndex)
+			err = rf.applyFsm()
 		} else {
-			err = rf.setCommitIndex(leaderCommit)
+			rf.softState.setCommitIndex(leaderCommit)
+			err = rf.applyFsm()
 		}
 		return err
 	}
@@ -314,6 +325,8 @@ func (rf *raft) handleCommand(args AppendEntry, res *AppendEntryReply) error {
 
 // Follower 和 Candidate 接收到来自 Candidate 的 RequestVote 调用
 func (rf *raft) handleVoteReq(args RequestVote, res *RequestVoteReply) error {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	var err error
 	argsTerm := args.term
 
@@ -363,6 +376,8 @@ func (rf *raft) handleVoteReq(args RequestVote, res *RequestVoteReply) error {
 
 // Follower 接收来自 Leader 的 InstallSnapshot 调用
 func (rf *raft) handleSnapshot(args InstallSnapshot, res *InstallSnapshotReply) error {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rfTerm := rf.hardState.currentTerm()
 	if args.term < rfTerm {
 		// Leader 的 term 过期，直接返回
@@ -401,6 +416,15 @@ type clientReqMsg struct {
 
 // 给各节点发送客户端日志
 func (rf *raft) handleClientReq(args ClientRequest, res *ClientResponse) error {
+	// 结束仍未完成的复制日志操作
+	<- rf.stopCh
+
+	rf.mu.Lock()
+	defer func() {
+		rf.timerState.setHeartbeatTimer()
+		rf.mu.Unlock()
+	}()
+
 	if !rf.isLeader() {
 		res.ok = false
 		res.leaderId = rf.peerState.leaderId()
@@ -422,33 +446,30 @@ func (rf *raft) handleClientReq(args ClientRequest, res *ClientResponse) error {
 		if rf.peerState.isMe(id) {
 			continue
 		}
-		go func(id NodeId, addr NodeAddr) {
-			// Follower 节点忙于 AE 请求，不需要发送心跳
-			rf.timerState.setAeState(id, true)
-
-			// Follower 节点设置为 AE 空闲，可以发送心跳
-			defer rf.timerState.setAeState(id, false)
-
-			rf.findCorrectNextIndex(ctx, id, addr, msgCh)
-			rf.completeEntries(ctx, id, addr, msgCh)
-		}(id, addr)
+		go rf.appendPeerEntry(ctx, id, addr, msgCh)
 	}
 
 	// 新日志成功发送到过半 Follower 节点，提交本地的日志
 	successCnt := 0
 	count := 1
-	for msg := range msgCh {
-		if msg.degrade {
-			cancel()
-			return fmt.Errorf("term 过期，降级为 Follower")
-		} else if msg.success {
-			successCnt += 1
-		} else if msg.err != nil {
-			log.Println(err)
-		}
-		count += 1
-		if count >= len(rf.peerState.peersMap()) {
-			break
+	loop := true
+	for loop {
+		select {
+		case msg := <-msgCh:
+			if msg.degrade {
+				cancel()
+				return fmt.Errorf("term 过期，降级为 Follower")
+			} else if msg.success {
+				successCnt += 1
+			} else if msg.err != nil {
+				log.Println(err)
+			}
+			count += 1
+			if count >= len(rf.peerState.peersMap()) {
+				loop = false
+			}
+		case <-rf.stopCh:
+			loop = false
 		}
 	}
 	cancel()
@@ -485,9 +506,16 @@ func (rf *raft) handleClientReq(args ClientRequest, res *ClientResponse) error {
 	return nil
 }
 
-func (rf *raft) findCorrectNextIndex(ctx context.Context, id NodeId, addr NodeAddr, msgCh chan clientReqMsg) {
+func (rf *raft) appendPeerEntry(ctx context.Context, id NodeId, addr NodeAddr, msgCh chan clientReqMsg) {
 	// Follower 节点中必须存在第 prevIndex 条日志，才能接受第 nextIndex 条日志
 	// 如果 Follower 节点缺少很多日志，需要找到缺少的第一条日志的索引
+	rf.findCorrectNextIndex(ctx, id, addr, msgCh)
+
+	// 给 Follower 发送缺失的日志，发送的日志的索引一直递增到最新
+	rf.completeEntries(ctx, id, addr, msgCh)
+}
+
+func (rf *raft) findCorrectNextIndex(ctx context.Context, id NodeId, addr NodeAddr, msgCh chan clientReqMsg) {
 	rl := rf.leaderState
 	for rl.peerNextIndex(id) >= 0 {
 		select {
@@ -528,7 +556,6 @@ func (rf *raft) findCorrectNextIndex(ctx context.Context, id NodeId, addr NodeAd
 	}
 }
 
-// 给 Follower 发送缺失的日志，发送的日志的索引一直递增到最新
 func (rf *raft) completeEntries(ctx context.Context, id NodeId, addr NodeAddr, msgCh chan clientReqMsg) {
 	var err error
 	rl := rf.leaderState
@@ -616,9 +643,6 @@ func (rf *raft) sendSnapshot(id NodeId, addr NodeAddr, data []byte) error {
 
 // 当前节点是不是 Leader
 func (rf *raft) isLeader() bool {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	roleStage := rf.roleState.getRoleStage()
 	leaderIsMe := rf.peerState.leaderIsMe()
 	isLeader := roleStage == Leader && leaderIsMe
@@ -627,9 +651,6 @@ func (rf *raft) isLeader() bool {
 
 // 降级为 Follower
 func (rf *raft) degrade(term int) error {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	if rf.roleState.getRoleStage() == Follower {
 		return nil
 	}
@@ -639,9 +660,6 @@ func (rf *raft) degrade(term int) error {
 }
 
 func (rf *raft) setRoleStage(stage RoleStage) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	rf.roleState.setRoleStage(stage)
 	if stage == Leader {
 		rf.peerState.setLeader(rf.peerState.identity())
@@ -691,10 +709,10 @@ func (rf *raft) applyFsm() error {
 	return nil
 }
 
-
-
 // 更新 Leader 的提交索引
 func (rf *raft) updateLeaderCommit() error {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	
 	indexCnt := make(map[int]int)
 	peers := rf.peerState.peersMap()
@@ -721,15 +739,9 @@ func (rf *raft) updateLeaderCommit() error {
 	}
 
 	if rf.softState.softCommitIndex() < maxMajorityMatch {
-		return rf.setCommitIndex(maxMajorityMatch)
+		rf.softState.setCommitIndex(maxMajorityMatch)
+		return rf.applyFsm()
 	}
 
 	return nil
-}
-
-func (rf *raft) setCommitIndex(index int) error {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.softState.setCommitIndex(index)
-	return rf.applyFsm()
 }

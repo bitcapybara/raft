@@ -112,7 +112,7 @@ func (st *HardState) setTerm(term int) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
-	if st.term == term {
+	if st.term >= term {
 		return nil
 	}
 	st.term = term
@@ -358,7 +358,6 @@ const (
 type timerState struct {
 	timerType timerType       // 计时器类型
 	timer     *time.Timer     // 超时计时器
-	aeBusy    map[NodeId]bool // Follower 是否正在忙于 AE 通信
 	mu        sync.Mutex      // 修改 aeBusy 字段要加锁
 
 	electionMinTimeout int // 最小选举超时时间
@@ -374,16 +373,11 @@ func newTimerState(config Config) *timerState {
 	}
 }
 
-func (st *timerState) initTimerState(peers map[NodeId]NodeAddr) {
+func (st *timerState) initTimerState() {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
 	st.timer = time.NewTimer(st.electionDuration())
-
-	st.aeBusy = make(map[NodeId]bool, len(peers))
-	for id, _ := range peers {
-		st.aeBusy[id] = false
-	}
 
 	st.timerType = Election
 }
@@ -409,12 +403,6 @@ func (st *timerState) resetHeartbeatTimer() {
 	st.setHeartbeatTimer()
 }
 
-func (st *timerState) setAeState(id NodeId, state bool) {
-	st.mu.Lock()
-	st.aeBusy[id] = state
-	st.mu.Unlock()
-}
-
 func (st *timerState) setHeartbeatTimer() {
 	st.timer.Reset(st.heartbeatDuration())
 }
@@ -426,13 +414,6 @@ func (st *timerState) electionDuration() time.Duration {
 
 func (st *timerState) heartbeatDuration() time.Duration {
 	return time.Millisecond * time.Duration(st.heartbeatTimeout)
-}
-
-func (st *timerState) isAeBusy(id NodeId) bool {
-	st.mu.Lock()
-	isBusy := st.aeBusy[id]
-	st.mu.Unlock()
-	return isBusy
 }
 
 // ==================== snapshotState ====================
