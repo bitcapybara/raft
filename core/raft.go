@@ -435,13 +435,11 @@ func (rf *raft) handleClientReq(args ClientRequest, res *ClientResponse) error {
 	for msg := range msgCh {
 		if msg.degrade {
 			cancel()
-			return nil
-		}
-		if msg.success {
+			return fmt.Errorf("term 过期，降级为 Follower")
+		} else if msg.success {
 			successCnt += 1
-			if successCnt >= rf.majority() {
-				break
-			}
+		} else if msg.err != nil {
+			log.Println(err)
 		}
 		count += 1
 		if count >= len(rf.peers()) {
@@ -450,8 +448,12 @@ func (rf *raft) handleClientReq(args ClientRequest, res *ClientResponse) error {
 	}
 	cancel()
 
+	if successCnt < rf.majority() {
+		return fmt.Errorf("rpc 完成，但日志未复制到多数节点")
+	}
+
 	// 将 commitIndex 设置为新条目的索引
-	// 此操作会连带提交 Leader 先前未提交的日志条目
+	// 此操作会连带提交 Leader 先前未提交的日志条目并应用到状态季节
 	err = rf.updateLeaderCommit()
 	if err != nil {
 		log.Println(err)
@@ -481,7 +483,7 @@ func (rf *raft) handleClientReq(args ClientRequest, res *ClientResponse) error {
 func (rf *raft) findCorrectNextIndex(ctx context.Context, id NodeId, addr NodeAddr, msgCh chan clientReqMsg) {
 	// Follower 节点中必须存在第 prevIndex 条日志，才能接受第 nextIndex 条日志
 	// 如果 Follower 节点缺少很多日志，需要找到缺少的第一条日志的索引
-	for {
+	for rf.nextIndex(id) >= 0 {
 		select {
 		case <-ctx.Done():
 			return
@@ -528,7 +530,7 @@ func (rf *raft) completeEntries(ctx context.Context, id NodeId, addr NodeAddr, m
 		case <-ctx.Done():
 			return
 		default:
-			if rf.nextIndex(id) - 1 != rf.lastLogIndex() {
+			if rf.nextIndex(id) - 1 == rf.lastLogIndex() {
 				msgCh <- clientReqMsg{success: true}
 				return
 			}
