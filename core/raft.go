@@ -20,9 +20,6 @@ type raft struct {
 
 	// 所有方法都加锁，保证同一时间 raft 只接收一个改变状态的请求
 	mu sync.Mutex
-
-	// 开始心跳后，如果 clientReq 还没有处理完，使用此通道结束
-	stopCh chan struct{}
 }
 
 func newRaft(config Config) *raft {
@@ -81,11 +78,11 @@ func (rf *raft) isElectionTick() bool {
 // ==================== logic process ====================
 
 func (rf *raft) heartbeat() {
-	rf.stopCh <- struct{}{}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
+	// 重置心跳计时器
 	rf.timerState.setHeartbeatTimer()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	msgCh := make(chan clientReqMsg)
 	defer close(msgCh)
@@ -150,11 +147,12 @@ type electionMsg struct {
 
 // Candidate / Follower 开启新一轮选举
 func (rf *raft) election() {
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// 重置选举计时器
 	rf.timerState.setElectionTimer()
+
 	// 增加 term 数
 	err := rf.hardState.setTerm(rf.hardState.currentTerm() + 1)
 	if err != nil {
@@ -288,6 +286,7 @@ func (rf *raft) sendRequestVote(ctx context.Context, msgCh chan electionMsg, id 
 func (rf *raft) handleCommand(args AppendEntry, res *AppendEntryReply) error {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	// 重置选举计时器
 	rf.timerState.resetElectionTimer()
 
@@ -386,9 +385,9 @@ func (rf *raft) handleCommand(args AppendEntry, res *AppendEntryReply) error {
 func (rf *raft) handleVoteReq(args RequestVote, res *RequestVoteReply) error {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	var err error
 	argsTerm := args.term
-
 	rfTerm := rf.hardState.currentTerm()
 	if argsTerm < rfTerm {
 		// 拉票的候选者任期落后，不投票
@@ -438,6 +437,7 @@ func (rf *raft) handleVoteReq(args RequestVote, res *RequestVoteReply) error {
 func (rf *raft) handleSnapshot(args InstallSnapshot, res *InstallSnapshotReply) error {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	rfTerm := rf.hardState.currentTerm()
 	if args.term < rfTerm {
 		// Leader 的 term 过期，直接返回
@@ -476,11 +476,9 @@ type clientReqMsg struct {
 
 // 给各节点发送客户端日志
 func (rf *raft) handleClientReq(args ClientRequest, res *ClientResponse) error {
-	// 结束仍未完成的复制日志操作
-	<-rf.stopCh
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// 重置心跳计时器
 	rf.timerState.setHeartbeatTimer()
 
 	if !rf.isLeader() {
@@ -510,24 +508,18 @@ func (rf *raft) handleClientReq(args ClientRequest, res *ClientResponse) error {
 	// 新日志成功发送到过半 Follower 节点，提交本地的日志
 	successCnt := 0
 	count := 1
-	loop := true
-	for loop {
-		select {
-		case msg := <-msgCh:
-			if msg.degrade {
-				cancel()
-				return fmt.Errorf("term 过期，降级为 Follower")
-			} else if msg.success {
-				successCnt += 1
-			} else if msg.err != nil {
-				log.Println(err)
-			}
-			count += 1
-			if count >= len(rf.peerState.peersMap()) {
-				loop = false
-			}
-		case <-rf.stopCh:
-			loop = false
+	for msg := range msgCh {
+		if msg.degrade {
+			cancel()
+			return fmt.Errorf("term 过期，降级为 Follower")
+		} else if msg.success {
+			successCnt += 1
+		} else if msg.err != nil {
+			log.Println(err)
+		}
+		count += 1
+		if count >= len(rf.peerState.peersMap()) {
+			break
 		}
 	}
 	cancel()
