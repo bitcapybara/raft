@@ -155,7 +155,7 @@ func (st *HardState) logEntries(start, end int) []Entry {
 
 // 保存在内存中的实时状态
 type SoftState struct {
-	commitIndex int // 已经提交的最大的日志索引，由当前节点维护
+	commitIndex int // 已经提交的最大的日志索引，由当前节点维护，初始化为0
 	lastApplied int // 应用到状态机的最后一个日志索引
 	mu          sync.Mutex
 }

@@ -417,6 +417,7 @@ func (rf *raft) handleVoteReq(args RequestVote, res *RequestVoteReply) error {
 		lastIndex := rf.lastLogIndex()
 		lastTerm := rf.logTerm(lastIndex)
 		// 候选者的日志比当前节点的日志要新，则投票
+		// 先比较 term，term 相同则比较日志长度
 		if args.lastLogTerm > lastTerm || (args.lastLogTerm == lastTerm && args.lastLogIndex >= lastIndex) {
 			err = rf.hardState.vote(args.candidateId)
 			if err != nil {
