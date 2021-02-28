@@ -480,10 +480,8 @@ func (rf *raft) handleClientReq(args ClientRequest, res *ClientResponse) error {
 	<-rf.stopCh
 
 	rf.mu.Lock()
-	defer func() {
-		rf.timerState.setHeartbeatTimer()
-		rf.mu.Unlock()
-	}()
+	defer rf.mu.Unlock()
+	rf.timerState.setHeartbeatTimer()
 
 	if !rf.isLeader() {
 		res.ok = false
@@ -578,27 +576,28 @@ func (rf *raft) appendPeerEntry(ctx context.Context, id NodeId, addr NodeAddr, m
 func (rf *raft) findCorrectNextIndex(ctx context.Context, id NodeId, addr NodeAddr, msgCh chan clientReqMsg) {
 	rl := rf.leaderState
 	for rl.peerNextIndex(id) >= 0 {
+		prevIndex := rl.peerNextIndex(id) - 1
+
+		// 找到匹配点之前，发送空日志节省带宽
+		var entries []Entry
+		if rl.peerMatchIndex(id) == prevIndex {
+			rf.hardState.logEntries(prevIndex, prevIndex + 1)
+		}
+		args := AppendEntry{
+			term:         rf.hardState.currentTerm(),
+			leaderId:     rf.peerState.myId(),
+			prevLogIndex: prevIndex,
+			prevLogTerm:  rf.logTerm(prevIndex),
+			leaderCommit: rf.softState.softCommitIndex(),
+			entries:      entries,
+		}
+		res := &AppendEntryReply{}
+		err := rf.transport.AppendEntries(addr, args, res)
+
 		select {
-		case <-ctx.Done():
+		case <- ctx.Done():
 			return
 		default:
-			prevIndex := rl.peerNextIndex(id) - 1
-
-			// 找到匹配点之前，发送空日志节省带宽
-			var entries []Entry
-			if rl.peerMatchIndex(id) == prevIndex {
-				rf.hardState.logEntries(prevIndex, prevIndex + 1)
-			}
-			args := AppendEntry{
-				term:         rf.hardState.currentTerm(),
-				leaderId:     rf.peerState.myId(),
-				prevLogIndex: prevIndex,
-				prevLogTerm:  rf.logTerm(prevIndex),
-				leaderCommit: rf.softState.softCommitIndex(),
-				entries:      entries,
-			}
-			res := &AppendEntryReply{}
-			err := rf.transport.AppendEntries(addr, args, res)
 			if err != nil {
 				msgCh <- clientReqMsg{err: fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err)}
 				return
@@ -615,20 +614,20 @@ func (rf *raft) findCorrectNextIndex(ctx context.Context, id NodeId, addr NodeAd
 			if res.success {
 				return
 			}
-
-			conflictStartIndex := res.conflictStartIndex
-			// Follower 日志是空的，则 nextIndex 置为 1
-			if conflictStartIndex <= 0 {
-				conflictStartIndex = 1
-			}
-			// conflictStartIndex 处的日志是一致的，则 nextIndex 置为下一个
-			if rf.logTerm(conflictStartIndex) == res.conflictTerm {
-				conflictStartIndex += 1
-			}
-
-			// 向前继续查找 Follower 缺少的第一条日志的索引
-			rl.setNextIndex(id, conflictStartIndex)
 		}
+
+		conflictStartIndex := res.conflictStartIndex
+		// Follower 日志是空的，则 nextIndex 置为 1
+		if conflictStartIndex <= 0 {
+			conflictStartIndex = 1
+		}
+		// conflictStartIndex 处的日志是一致的，则 nextIndex 置为下一个
+		if rf.logTerm(conflictStartIndex) == res.conflictTerm {
+			conflictStartIndex += 1
+		}
+
+		// 向前继续查找 Follower 缺少的第一条日志的索引
+		rl.setNextIndex(id, conflictStartIndex)
 	}
 }
 
@@ -636,36 +635,37 @@ func (rf *raft) completeEntries(ctx context.Context, id NodeId, addr NodeAddr, m
 	var err error
 	rl := rf.leaderState
 	for {
+		if rl.peerNextIndex(id)-1 == rf.lastLogIndex() {
+			msgCh <- clientReqMsg{success: true}
+			return
+		}
+		// 缺失的日志太多时，直接发送快照
+		snapshot := rf.snapshotState.getSnapshot()
+		if rl.peerNextIndex(id) <= snapshot.LastIndex {
+			err = rf.sendSnapshot(id, addr, snapshot.Data)
+			if err != nil {
+				log.Println(err)
+			} else {
+				rf.leaderState.setMatchAndNextIndex(id, snapshot.LastIndex, snapshot.LastIndex+1)
+			}
+		}
+
+		prevIndex := rl.peerNextIndex(id) - 1
+		args := AppendEntry{
+			term:         rf.hardState.currentTerm(),
+			leaderId:     rf.peerState.myId(),
+			prevLogIndex: prevIndex,
+			prevLogTerm:  rf.logTerm(prevIndex),
+			leaderCommit: rf.softState.softCommitIndex(),
+			entries:      rf.hardState.logEntries(prevIndex, rl.peerNextIndex(id)),
+		}
+		res := &AppendEntryReply{}
+		err = rf.transport.AppendEntries(addr, args, res)
+
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			if rl.peerNextIndex(id)-1 == rf.lastLogIndex() {
-				msgCh <- clientReqMsg{success: true}
-				return
-			}
-			// 缺失的日志太多时，直接发送快照
-			snapshot := rf.snapshotState.getSnapshot()
-			if rl.peerNextIndex(id) <= snapshot.LastIndex {
-				err = rf.sendSnapshot(id, addr, snapshot.Data)
-				if err != nil {
-					log.Println(err)
-				} else {
-					rf.leaderState.setMatchAndNextIndex(id, snapshot.LastIndex, snapshot.LastIndex+1)
-				}
-			}
-
-			prevIndex := rl.peerNextIndex(id) - 1
-			args := AppendEntry{
-				term:         rf.hardState.currentTerm(),
-				leaderId:     rf.peerState.myId(),
-				prevLogIndex: prevIndex,
-				prevLogTerm:  rf.logTerm(prevIndex),
-				leaderCommit: rf.softState.softCommitIndex(),
-				entries:      rf.hardState.logEntries(prevIndex, rl.peerNextIndex(id)),
-			}
-			res := &AppendEntryReply{}
-			err = rf.transport.AppendEntries(addr, args, res)
 			if err != nil {
 				msgCh <- clientReqMsg{err: fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err)}
 				return
@@ -677,11 +677,12 @@ func (rf *raft) completeEntries(ctx context.Context, id NodeId, addr NodeAddr, m
 					log.Println(err)
 				}
 				msgCh <- clientReqMsg{degrade: true}
+				return
 			}
-
-			// 向后补充
-			rf.leaderState.setMatchAndNextIndex(id, rl.peerNextIndex(id), rl.peerNextIndex(id)+1)
 		}
+
+		// 向后补充
+		rf.leaderState.setMatchAndNextIndex(id, rl.peerNextIndex(id), rl.peerNextIndex(id)+1)
 	}
 }
 
