@@ -50,11 +50,46 @@ type InstallSnapshotReply struct {
 
 // ==================== ClientRequest ====================
 
+type status uint8
+
+const (
+	OK status = iota
+	NotLeader
+	Timeout
+)
+
+type server struct {
+	id   NodeId
+	addr NodeAddr
+}
+
 type ClientRequest struct {
 	data []byte // 客户端请求应用到状态机的数据
 }
 
 type ClientResponse struct {
-	ok       bool   // 客户端请求的是 Leader 节点时，返回 true
-	leaderId NodeId // 客户端请求的不是 Leader 节点时，返回 LeaderId
+	status   status // 客户端请求的是 Leader 节点时，返回 true
+	leader server // 客户端请求的不是 Leader 节点时，返回 LeaderId
+}
+
+// ==================== addServer ====================
+
+type AddServer struct {
+	newServer server
+}
+
+type AddServerReply struct {
+	status   status
+	leader server
+}
+
+// ==================== removeServer ====================
+
+type RemoveServer struct {
+	oldServer server
+}
+
+type RemoveServerReply struct {
+	status status
+	leader server
 }

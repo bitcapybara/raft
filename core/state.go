@@ -236,6 +236,13 @@ func (st *PeerState) leaderId() NodeId {
 	return st.leader
 }
 
+func (st *PeerState) getLeader() server {
+	return server{
+		id: st.leader,
+		addr: st.peers[st.leader],
+	}
+}
+
 // ==================== LeaderState ====================
 
 // 节点是 Leader 时，保存在内存中的状态

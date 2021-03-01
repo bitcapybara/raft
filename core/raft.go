@@ -475,17 +475,19 @@ type clientReqMsg struct {
 }
 
 // 给各节点发送客户端日志
-func (rf *raft) handleClientReq(args ClientRequest, res *ClientResponse) error {
+func (rf *raft) handleClientCmd(args ClientRequest, res *ClientResponse) error {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// 重置心跳计时器
 	rf.timerState.setHeartbeatTimer()
 
 	if !rf.isLeader() {
-		res.ok = false
-		res.leaderId = rf.peerState.leaderId()
+		res.status = NotLeader
+		res.leader = rf.peerState.getLeader()
 		return nil
 	}
+
+	res.status = OK
 
 	// Leader 先将日志添加到内存
 	err := rf.addEntry(Entry{Term: rf.hardState.currentTerm(), Data: args.data})
@@ -705,6 +707,32 @@ func (rf *raft) sendSnapshot(id NodeId, addr NodeAddr, data []byte) error {
 	if res.term > rf.hardState.currentTerm() {
 		// 如果任期数小，降级为 Follower
 		return rf.degrade(res.term)
+	}
+
+	return nil
+}
+
+func (rf *raft) handleServerAdd(args AddServer, res *AddServerReply) error {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if !rf.isLeader() {
+		res.status = NotLeader
+		res.leader = rf.peerState.getLeader()
+		return nil
+	}
+
+	return nil
+}
+
+func (rf *raft) handleServerRemove(args RemoveServer, res *RemoveServerReply) error {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if !rf.isLeader() {
+		res.status = NotLeader
+		res.leader = rf.peerState.getLeader()
+		return nil
 	}
 
 	return nil
