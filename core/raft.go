@@ -215,6 +215,7 @@ func (rf *raft) becomeLeader() {
 			continue
 		}
 		rf.leaderState.setMatchAndNextIndex(id, 0, rf.lastLogIndex()+1)
+		rf.leaderState.initCatchUp(id)
 		go rf.heartbeatTo(ctx, id, msgCh)
 	}
 
@@ -752,6 +753,7 @@ func (rf *raft) isLeader() bool {
 }
 
 // 降级为 Follower
+// todo 通知正在日志追赶的协程结束
 func (rf *raft) degrade(term int) error {
 	if rf.roleState.getRoleStage() == Follower {
 		return nil

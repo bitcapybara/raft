@@ -86,7 +86,7 @@ func (st *HardState) currentTerm() int {
 
 // todo 传入的必须是物理索引
 func (st *HardState) logEntryTerm(index int) int {
-	if len(st.entries) - 1 < index {
+	if len(st.entries)-1 < index {
 		return 0
 	}
 	return st.entries[index].Term
@@ -238,12 +238,29 @@ func (st *PeerState) leaderId() NodeId {
 
 func (st *PeerState) getLeader() server {
 	return server{
-		id: st.leader,
+		id:   st.leader,
 		addr: st.peers[st.leader],
 	}
 }
 
 // ==================== LeaderState ====================
+
+type catchUpMsgType uint8
+
+const (
+	degrade catchUpMsgType = iota
+	noop
+)
+
+type catchUpMsg struct {
+	msgType catchUpMsgType
+	err     error
+}
+
+type catchUpState struct {
+	isCatchingUp bool
+	msgCh        chan catchUpMsg
+}
 
 // 节点是 Leader 时，保存在内存中的状态
 type LeaderState struct {
@@ -253,12 +270,16 @@ type LeaderState struct {
 
 	// 已经复制到各节点的最大的日志索引。由 Leader 维护，初始值为0
 	matchIndex map[NodeId]int
+
+	// 日志追赶状态
+	nodeCatchUp map[NodeId]catchUpState
 }
 
 func newLeaderState() *LeaderState {
 	return &LeaderState{
 		nextIndex:  make(map[NodeId]int),
 		matchIndex: make(map[NodeId]int),
+		nodeCatchUp: make(map[NodeId]catchUpState),
 	}
 }
 
@@ -279,6 +300,13 @@ func (st *LeaderState) setNextIndex(id NodeId, index int) {
 	st.nextIndex[id] = index
 }
 
+func (st *LeaderState) initCatchUp(id NodeId) {
+	st.nodeCatchUp[id] = catchUpState{
+		isCatchingUp: false,
+		msgCh: make(chan catchUpMsg),
+	}
+}
+
 // ==================== timerState ====================
 
 type timerType uint8
@@ -289,8 +317,8 @@ const (
 )
 
 type timerState struct {
-	timerType timerType       // 计时器类型
-	timer     *time.Timer     // 超时计时器
+	timerType timerType   // 计时器类型
+	timer     *time.Timer // 超时计时器
 
 	electionMinTimeout int // 最小选举超时时间
 	electionMaxTimeout int // 最大选举超时时间
@@ -372,7 +400,7 @@ func (st *snapshotState) save(snapshot Snapshot) error {
 }
 
 func (st *snapshotState) needGenSnapshot(commitIndex int) bool {
-	need := commitIndex - st.snapshot.LastIndex >= st.maxLogLength
+	need := commitIndex-st.snapshot.LastIndex >= st.maxLogLength
 	return need
 }
 
