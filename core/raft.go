@@ -91,6 +91,7 @@ func (rf *raft) heartbeat() {
 		if rf.peerState.isMe(id) {
 			continue
 		}
+		// todo 只给当前没有在进行日志追赶的节点发送心跳
 		go rf.heartbeatTo(ctx, id, msgCh)
 	}
 
@@ -132,7 +133,7 @@ func (rf *raft) heartbeatTo(ctx context.Context, id NodeId, msgCh chan clientReq
 		return
 	}
 
-	// Follower 和 Leader 的日志不匹配，则进行日志同步
+	// Follower 和 Leader 的日志不匹配，进行日志追赶
 	if !res.success {
 		rf.appendPeerEntry(ctx, id, addr, msgCh)
 	}
@@ -558,6 +559,10 @@ func (rf *raft) handleClientCmd(args ClientRequest, res *ClientResponse) error {
 	return nil
 }
 
+// 给指定节点发送最新日志
+// todo 若日志不同步，开始进行日志追赶操作
+// 1. Follower 节点标记为日志追赶状态，下一次心跳时跳过此节点
+// 2. 日志追赶完毕或 rpc 调用失败，Follower 节点标记为普通状态
 func (rf *raft) appendPeerEntry(ctx context.Context, id NodeId, addr NodeAddr, msgCh chan clientReqMsg) {
 	// Follower 节点中必须存在第 prevIndex 条日志，才能接受第 nextIndex 条日志
 	// 如果 Follower 节点缺少很多日志，需要找到缺少的第一条日志的索引
@@ -756,6 +761,7 @@ func (rf *raft) degrade(term int) error {
 	return rf.hardState.setTerm(term)
 }
 
+// todo 更新各个 Follower 节点的日志追赶状态
 func (rf *raft) setRoleStage(stage RoleStage) {
 	rf.roleState.setRoleStage(stage)
 	if stage == Leader {
