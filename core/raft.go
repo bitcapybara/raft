@@ -1,10 +1,16 @@
 package core
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"sync"
+)
+
+type finishMsg uint8
+
+const (
+	Success finishMsg = iota
+	Failed
 )
 
 type raft struct {
@@ -83,28 +89,24 @@ func (rf *raft) heartbeat() {
 	// 重置心跳计时器
 	rf.timerState.setHeartbeatTimer()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	msgCh := make(chan clientReqMsg)
-	defer close(msgCh)
-	defer cancel()
+	finishCh := make(chan finishMsg)
+	defer close(finishCh)
 	for id := range rf.peerState.peersMap() {
 		if rf.peerState.isMe(id) {
 			continue
 		}
 		// todo 只给当前没有在进行日志追赶的节点发送心跳
-		go rf.heartbeatTo(ctx, id, msgCh)
+		go rf.heartbeatTo(id, finishCh)
 	}
 
-	rf.waitHeartbeat(msgCh)
+	rf.waitHeartbeat(finishCh)
 }
 
 // Leader 给某个节点发送心跳
-func (rf *raft) heartbeatTo(ctx context.Context, id NodeId, msgCh chan clientReqMsg) {
+func (rf *raft) heartbeatTo(id NodeId, msgCh chan finishMsg) {
+
 	addr := rf.peerState.peersMap()[id]
 	commitIndex := rf.softState.softCommitIndex()
-	if rf.peerState.isMe(id) {
-		return
-	}
 
 	term := rf.hardState.currentTerm()
 	prevIndex := rf.leaderState.peerNextIndex(id) - 1
@@ -119,7 +121,8 @@ func (rf *raft) heartbeatTo(ctx context.Context, id NodeId, msgCh chan clientReq
 	res := &AppendEntryReply{}
 	err := rf.transport.AppendEntries(addr, args, res)
 	if err != nil {
-		msgCh <- clientReqMsg{err: fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err)}
+		log.Println(fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err))
+		msgCh <- Failed
 		return
 	}
 
@@ -129,21 +132,14 @@ func (rf *raft) heartbeatTo(ctx context.Context, id NodeId, msgCh chan clientReq
 		if err != nil {
 			log.Println(err)
 		}
-		msgCh <- clientReqMsg{degrade: true}
+		msgCh <- Failed
 		return
 	}
 
 	// Follower 和 Leader 的日志不匹配，进行日志追赶
 	if !res.success {
-		rf.appendPeerEntry(ctx, id, addr, msgCh)
+		rf.appendPeerEntry(id, addr, msgCh)
 	}
-}
-
-type electionMsg struct {
-	vote    bool
-	degrade bool
-	noop    bool
-	err     error
 }
 
 // Candidate / Follower 开启新一轮选举
@@ -167,69 +163,58 @@ func (rf *raft) election() {
 		log.Println(err)
 	}
 	// 发送 RV 请求
-	ctx, cancel := context.WithCancel(context.Background())
-	msgCh := make(chan electionMsg, len(rf.peerState.peersMap()))
-	defer close(msgCh)
+	finishCh := make(chan finishMsg)
+	defer close(finishCh)
 	for id, addr := range rf.peerState.peersMap() {
 		if rf.peerState.isMe(id) {
 			continue
 		}
-		go rf.sendRequestVote(ctx, msgCh, id, addr)
+		go rf.sendRequestVote(id, addr, finishCh)
 	}
 
-	voteCnt := 1
 	count := 1
-	for msg := range msgCh {
-		if msg.err != nil {
-			log.Println(fmt.Errorf("RequestVote Rpc 调用失败：%w", err))
-			continue
-		}
-		if msg.vote {
+	voteCnt := 1
+	for msg := range finishCh {
+		if msg == Success {
 			voteCnt += 1
-			count += 1
 			if voteCnt >= rf.peerState.majority() {
 				rf.becomeLeader()
 			}
-		} else if msg.noop {
-			count += 1
 		}
-		if msg.degrade || count >= len(rf.peerState.peersMap()) {
+		count += 1
+		if count >= rf.peerState.peersCnt() {
 			break
 		}
 	}
-	cancel()
 }
 
 func (rf *raft) becomeLeader() {
 	rf.timerState.setHeartbeatTimer()
 	rf.setRoleStage(Leader)
 	// 初始化保存的各节点状态
-	ctx, cancel := context.WithCancel(context.Background())
-	msgCh := make(chan clientReqMsg)
-	defer func() {
-		close(msgCh)
-		cancel()
-	}()
+	finishCh := make(chan finishMsg)
+	defer close(finishCh)
 	for id := range rf.peerState.peersMap() {
 		if rf.peerState.isMe(id) {
 			continue
 		}
 		rf.leaderState.setMatchAndNextIndex(id, 0, rf.lastLogIndex()+1)
 		rf.leaderState.initCatchUp(id)
-		go rf.heartbeatTo(ctx, id, msgCh)
+		go rf.heartbeatTo(id, finishCh)
 	}
 
-	rf.waitHeartbeat(msgCh)
+	rf.waitHeartbeat(finishCh)
 }
 
-func (rf *raft) waitHeartbeat(msgCh chan clientReqMsg) {
+// msgCh 日志复制协程 -> 主协程，通知协程的任务完成
+func (rf *raft) waitHeartbeat(finishCh chan finishMsg) {
 	count := 1
-	for msg := range msgCh {
-		if msg.err != nil {
-			log.Println(fmt.Errorf("发送日志失败: %w", msg.err))
-			break
+	successCnt := 1
+	for msg := range finishCh {
+		if msg == Success {
+			successCnt += 1
 		}
-		if msg.degrade {
+		if successCnt >= rf.peerState.majority() {
 			break
 		}
 		count += 1
@@ -239,47 +224,30 @@ func (rf *raft) waitHeartbeat(msgCh chan clientReqMsg) {
 	}
 }
 
-type rpcState struct {
-	err error
-}
-
-func (rf *raft) sendRequestVote(ctx context.Context, msgCh chan electionMsg, id NodeId, addr NodeAddr) {
+func (rf *raft) sendRequestVote(id NodeId, addr NodeAddr, finishCh chan finishMsg) {
 	args := RequestVote{
 		term:        rf.hardState.currentTerm(),
 		candidateId: id,
 	}
 	res := &RequestVoteReply{}
-	finishCh := make(chan rpcState)
-	go func() {
-		err := rf.transport.RequestVote(addr, args, res)
-		if err != nil {
-			finishCh <- rpcState{err: fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err)}
-		} else {
-			finishCh <- rpcState{}
-		}
-	}()
+	err := rf.transport.RequestVote(addr, args, res)
+	if err != nil {
+		log.Println(fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err))
+		finishCh <- Failed
+		return
+	}
 
-	var err error
-	select {
-	case <-ctx.Done():
-	case st := <-finishCh:
-		if st.err != nil {
-			msgCh <- electionMsg{err: err}
-			break
-		}
-		if res.term <= rf.hardState.currentTerm() && res.voteGranted {
-			// 成功获得选票
-			msgCh <- electionMsg{vote: true}
-		} else if res.term > rf.hardState.currentTerm() {
-			// 当前节点任期落后，则退出竞选
-			err = rf.degrade(res.term)
-			if err != nil {
-				msgCh <- electionMsg{err: err}
-			}
-			msgCh <- electionMsg{degrade: true}
-		} else {
-			// 其它情况
-			msgCh <- electionMsg{noop: true}
+	if res.voteGranted {
+		// 成功获得选票
+		finishCh <- Success
+		return
+	}
+
+	if res.term > rf.hardState.currentTerm() {
+		// 当前节点任期落后，则退出竞选
+		err = rf.degrade(res.term)
+		if err != nil {
+			finishCh <- Failed
 		}
 	}
 }
@@ -470,12 +438,6 @@ func (rf *raft) handleSnapshot(args InstallSnapshot, res *InstallSnapshotReply) 
 	return nil
 }
 
-type clientReqMsg struct {
-	degrade bool
-	success bool
-	err     error
-}
-
 // 给各节点发送客户端日志
 func (rf *raft) handleClientCmd(args ClientRequest, res *ClientResponse) error {
 	rf.mu.Lock()
@@ -498,35 +460,25 @@ func (rf *raft) handleClientCmd(args ClientRequest, res *ClientResponse) error {
 	}
 
 	// 给各节点发送日志条目
-	ctx, cancel := context.WithCancel(context.Background())
-	msgCh := make(chan clientReqMsg)
-	defer close(msgCh)
+	finishCh := make(chan finishMsg)
+	defer close(finishCh)
 	for id, addr := range rf.peerState.peersMap() {
 		// 不用给自己发
 		if rf.peerState.isMe(id) {
 			continue
 		}
-		go rf.appendPeerEntry(ctx, id, addr, msgCh)
+		go rf.appendPeerEntry(id, addr, finishCh)
 	}
 
 	// 新日志成功发送到过半 Follower 节点，提交本地的日志
 	successCnt := 0
 	count := 1
-	for msg := range msgCh {
-		if msg.degrade {
-			cancel()
-			return fmt.Errorf("term 过期，降级为 Follower")
-		} else if msg.success {
-			successCnt += 1
-		} else if msg.err != nil {
-			log.Println(err)
-		}
+	for range finishCh {
 		count += 1
 		if count >= len(rf.peerState.peersMap()) {
 			break
 		}
 	}
-	cancel()
 
 	if successCnt < rf.peerState.majority() {
 		return fmt.Errorf("rpc 完成，但日志未复制到多数节点")
@@ -564,16 +516,16 @@ func (rf *raft) handleClientCmd(args ClientRequest, res *ClientResponse) error {
 // todo 若日志不同步，开始进行日志追赶操作
 // 1. Follower 节点标记为日志追赶状态，下一次心跳时跳过此节点
 // 2. 日志追赶完毕或 rpc 调用失败，Follower 节点标记为普通状态
-func (rf *raft) appendPeerEntry(ctx context.Context, id NodeId, addr NodeAddr, msgCh chan clientReqMsg) {
+func (rf *raft) appendPeerEntry(id NodeId, addr NodeAddr, finishCh chan finishMsg) {
 	// Follower 节点中必须存在第 prevIndex 条日志，才能接受第 nextIndex 条日志
 	// 如果 Follower 节点缺少很多日志，需要找到缺少的第一条日志的索引
-	rf.findCorrectNextIndex(ctx, id, addr, msgCh)
+	rf.findCorrectNextIndex(id, addr, finishCh)
 
 	// 给 Follower 发送缺失的日志，发送的日志的索引一直递增到最新
-	rf.completeEntries(ctx, id, addr, msgCh)
+	rf.completeEntries(id, addr, finishCh)
 }
 
-func (rf *raft) findCorrectNextIndex(ctx context.Context, id NodeId, addr NodeAddr, msgCh chan clientReqMsg) {
+func (rf *raft) findCorrectNextIndex(id NodeId, addr NodeAddr, finishCh chan finishMsg) {
 	rl := rf.leaderState
 	for rl.peerNextIndex(id) >= 0 {
 		prevIndex := rl.peerNextIndex(id) - 1
@@ -595,11 +547,13 @@ func (rf *raft) findCorrectNextIndex(ctx context.Context, id NodeId, addr NodeAd
 		err := rf.transport.AppendEntries(addr, args, res)
 
 		select {
-		case <- ctx.Done():
+		case <- rf.leaderState.catchUpCh(id):
+			// todo
 			return
 		default:
 			if err != nil {
-				msgCh <- clientReqMsg{err: fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err)}
+				log.Println(fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err))
+				finishCh <- Failed
 				return
 			}
 			if res.term > rf.hardState.currentTerm() {
@@ -608,10 +562,11 @@ func (rf *raft) findCorrectNextIndex(ctx context.Context, id NodeId, addr NodeAd
 				if err != nil {
 					log.Println(err)
 				}
-				msgCh <- clientReqMsg{degrade: true}
+				finishCh <- Failed
 				return
 			}
 			if res.success {
+				finishCh <- Success
 				return
 			}
 		}
@@ -629,14 +584,15 @@ func (rf *raft) findCorrectNextIndex(ctx context.Context, id NodeId, addr NodeAd
 		// 向前继续查找 Follower 缺少的第一条日志的索引
 		rl.setNextIndex(id, conflictStartIndex)
 	}
+	finishCh <- Failed
 }
 
-func (rf *raft) completeEntries(ctx context.Context, id NodeId, addr NodeAddr, msgCh chan clientReqMsg) {
+func (rf *raft) completeEntries(id NodeId, addr NodeAddr, finishCh chan finishMsg) {
 	var err error
 	rl := rf.leaderState
 	for {
 		if rl.peerNextIndex(id)-1 == rf.lastLogIndex() {
-			msgCh <- clientReqMsg{success: true}
+			finishCh <- Success
 			return
 		}
 		// 缺失的日志太多时，直接发送快照
@@ -663,11 +619,13 @@ func (rf *raft) completeEntries(ctx context.Context, id NodeId, addr NodeAddr, m
 		err = rf.transport.AppendEntries(addr, args, res)
 
 		select {
-		case <-ctx.Done():
+		case <- rf.leaderState.catchUpCh(id):
+			// todo
 			return
 		default:
 			if err != nil {
-				msgCh <- clientReqMsg{err: fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err)}
+				log.Println(fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err))
+				finishCh <- Failed
 				return
 			}
 			if res.term > rf.hardState.currentTerm() {
@@ -676,7 +634,7 @@ func (rf *raft) completeEntries(ctx context.Context, id NodeId, addr NodeAddr, m
 				if err != nil {
 					log.Println(err)
 				}
-				msgCh <- clientReqMsg{degrade: true}
+				finishCh <- Failed
 				return
 			}
 		}
@@ -753,7 +711,7 @@ func (rf *raft) isLeader() bool {
 }
 
 // 降级为 Follower
-// todo 通知正在日志追赶的协程结束
+// todo 给所有的日志复制协程发送消息
 func (rf *raft) degrade(term int) error {
 	if rf.roleState.getRoleStage() == Follower {
 		return nil
@@ -763,7 +721,6 @@ func (rf *raft) degrade(term int) error {
 	return rf.hardState.setTerm(term)
 }
 
-// todo 更新各个 Follower 节点的日志追赶状态
 func (rf *raft) setRoleStage(stage RoleStage) {
 	rf.roleState.setRoleStage(stage)
 	if stage == Leader {
@@ -842,7 +799,7 @@ func (rf *raft) updateLeaderCommit() error {
 	return nil
 }
 
-// 获取最后一个日志条目的算法索引
+// 获取最后一个日志条目的逻辑索引
 func (rf *raft) lastLogIndex() int {
 	index := rf.hardState.lastEntryIndex()
 	if index <= 0 {

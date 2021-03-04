@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
-	"sync"
 	"time"
 )
 
@@ -157,7 +156,6 @@ func (st *HardState) logEntries(start, end int) []Entry {
 type SoftState struct {
 	commitIndex int // 已经提交的最大的日志索引，由当前节点维护，初始化为0
 	lastApplied int // 应用到状态机的最后一个日志索引
-	mu          sync.Mutex
 }
 
 func newSoftState() *SoftState {
@@ -245,21 +243,16 @@ func (st *PeerState) getLeader() server {
 
 // ==================== LeaderState ====================
 
-type catchUpMsgType uint8
+type catchUpMsg uint8
 
 const (
-	degrade catchUpMsgType = iota
-	noop
+	MainQuit catchUpMsg = iota
 )
 
-type catchUpMsg struct {
-	msgType catchUpMsgType
-	err     error
-}
-
+// 节点追赶日志状态以及正在追赶日志的协程接收消息的通道
 type catchUpState struct {
-	isCatchingUp bool
-	msgCh        chan catchUpMsg
+	isCatchingUp bool            // 节点是否正在追赶日志
+	catchUpMsgCh chan catchUpMsg // 正在追赶日志的协程接收消息
 }
 
 // 节点是 Leader 时，保存在内存中的状态
@@ -271,15 +264,15 @@ type LeaderState struct {
 	// 已经复制到各节点的最大的日志索引。由 Leader 维护，初始值为0
 	matchIndex map[NodeId]int
 
-	// 日志追赶状态
-	nodeCatchUp map[NodeId]catchUpState
+	// 节点追赶日志状态。由 Leader 维护
+	nodeCatchUp map[NodeId]*catchUpState
 }
 
 func newLeaderState() *LeaderState {
 	return &LeaderState{
-		nextIndex:  make(map[NodeId]int),
-		matchIndex: make(map[NodeId]int),
-		nodeCatchUp: make(map[NodeId]catchUpState),
+		nextIndex:   make(map[NodeId]int),
+		matchIndex:  make(map[NodeId]int),
+		nodeCatchUp: make(map[NodeId]*catchUpState),
 	}
 }
 
@@ -301,10 +294,22 @@ func (st *LeaderState) setNextIndex(id NodeId, index int) {
 }
 
 func (st *LeaderState) initCatchUp(id NodeId) {
-	st.nodeCatchUp[id] = catchUpState{
+	st.nodeCatchUp[id] = &catchUpState{
 		isCatchingUp: false,
-		msgCh: make(chan catchUpMsg),
+		catchUpMsgCh: make(chan catchUpMsg),
 	}
+}
+
+func (st *LeaderState) setCatchUp(id NodeId, isCatchUp bool) {
+	st.nodeCatchUp[id].isCatchingUp = isCatchUp
+}
+
+func (st *LeaderState) isCatchingUp(id NodeId) bool {
+	return st.nodeCatchUp[id].isCatchingUp
+}
+
+func (st *LeaderState) catchUpCh(id NodeId) chan catchUpMsg {
+	return st.nodeCatchUp[id].catchUpMsgCh
 }
 
 // ==================== timerState ====================
