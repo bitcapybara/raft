@@ -243,16 +243,19 @@ func (st *PeerState) getLeader() server {
 
 // ==================== LeaderState ====================
 
-type catchUpMsg uint8
+type rpcMsg uint8
 
 const (
-	MainQuit catchUpMsg = iota
+	// 主进程已返回，不要再向 finishCh 发送消息
+	Quit rpcMsg = iota
+	// Leader / Candidate 降级为 Follower
+	Degrade
 )
 
 // 节点追赶日志状态以及正在追赶日志的协程接收消息的通道
-type catchUpState struct {
-	isCatchingUp bool            // 节点是否正在追赶日志
-	catchUpMsgCh chan catchUpMsg // 正在追赶日志的协程接收消息
+type rpcNotifier struct {
+	rpcBusy     bool        // 是否正在向节点发送 rpc 消息
+	notifyMsgCh chan rpcMsg // 正在追赶日志的协程接收消息
 }
 
 // 节点是 Leader 时，保存在内存中的状态
@@ -264,15 +267,15 @@ type LeaderState struct {
 	// 已经复制到各节点的最大的日志索引。由 Leader 维护，初始值为0
 	matchIndex map[NodeId]int
 
-	// 节点追赶日志状态。由 Leader 维护
-	nodeCatchUp map[NodeId]*catchUpState
+	// 。由 Leader 维护
+	nodeNotifier map[NodeId]*rpcNotifier
 }
 
 func newLeaderState() *LeaderState {
 	return &LeaderState{
-		nextIndex:   make(map[NodeId]int),
-		matchIndex:  make(map[NodeId]int),
-		nodeCatchUp: make(map[NodeId]*catchUpState),
+		nextIndex:    make(map[NodeId]int),
+		matchIndex:   make(map[NodeId]int),
+		nodeNotifier: make(map[NodeId]*rpcNotifier),
 	}
 }
 
@@ -293,23 +296,23 @@ func (st *LeaderState) setNextIndex(id NodeId, index int) {
 	st.nextIndex[id] = index
 }
 
-func (st *LeaderState) initCatchUp(id NodeId) {
-	st.nodeCatchUp[id] = &catchUpState{
-		isCatchingUp: false,
-		catchUpMsgCh: make(chan catchUpMsg),
+func (st *LeaderState) initNotifier(id NodeId) {
+	st.nodeNotifier[id] = &rpcNotifier{
+		rpcBusy:     false,
+		notifyMsgCh: make(chan rpcMsg),
 	}
 }
 
-func (st *LeaderState) setCatchUp(id NodeId, isCatchUp bool) {
-	st.nodeCatchUp[id].isCatchingUp = isCatchUp
+func (st *LeaderState) setRpcBusy(id NodeId, enable bool) {
+	st.nodeNotifier[id].rpcBusy = enable
 }
 
-func (st *LeaderState) isCatchingUp(id NodeId) bool {
-	return st.nodeCatchUp[id].isCatchingUp
+func (st *LeaderState) isRpcBusy(id NodeId) bool {
+	return st.nodeNotifier[id].rpcBusy
 }
 
-func (st *LeaderState) catchUpCh(id NodeId) chan catchUpMsg {
-	return st.nodeCatchUp[id].catchUpMsgCh
+func (st *LeaderState) notifyCh(id NodeId) chan rpcMsg {
+	return st.nodeNotifier[id].notifyMsgCh
 }
 
 // ==================== timerState ====================
