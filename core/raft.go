@@ -228,7 +228,9 @@ func (rf *raft) election() {
 	}
 
 	for id := range rf.peerState.peersMap() {
-		rf.leaderState.notifyCh(id) <- Quit
+		if rf.leaderState.isRpcBusy(id) {
+			rf.leaderState.notifyCh(id) <- Quit
+		}
 	}
 }
 
