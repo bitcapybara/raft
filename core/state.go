@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"sync"
 	"time"
 )
 
@@ -23,7 +24,8 @@ const (
 type RoleStage uint8
 
 type RoleState struct {
-	roleStage RoleStage // 节点当前角色
+	roleStage RoleStage  // 节点当前角色
+	roleLock  sync.Mutex // 角色并发访问锁
 }
 
 func newRoleState() *RoleState {
@@ -38,6 +40,14 @@ func (st *RoleState) setRoleStage(stage RoleStage) {
 
 func (st *RoleState) getRoleStage() RoleStage {
 	return st.roleStage
+}
+
+func (st *RoleState) lock() {
+	st.roleLock.Lock()
+}
+
+func (st *RoleState) unlock() {
+	st.roleLock.Unlock()
 }
 
 // ==================== HardState ====================
@@ -99,24 +109,32 @@ func (st *HardState) setTerm(term int) error {
 	if st.term >= term {
 		return nil
 	}
+	err := st.persist(term, "", st.entries)
+	if err != nil {
+		return fmt.Errorf("持久化出错，设置 term 属性值失败。%w", err)
+	}
 	st.term = term
 	st.votedFor = ""
-	return st.persist()
+	return nil
 }
 
 func (st *HardState) vote(id NodeId) error {
 	if st.votedFor == id {
 		return nil
 	}
+	err := st.persist(st.term, id, st.entries)
+	if err != nil {
+		return fmt.Errorf("持久化出错，设置 votedFor 属性值失败。%w", err)
+	}
 	st.votedFor = id
-	return st.persist()
+	return nil
 }
 
-func (st *HardState) persist() error {
+func (st *HardState) persist(term int, votedFor NodeId, entries []Entry) error {
 	raftState := RaftState{
-		Term:     st.term,
-		VotedFor: st.votedFor,
-		Entries:  st.entries,
+		Term:     term,
+		VotedFor: votedFor,
+		Entries:  entries,
 	}
 	err := st.persister.SaveRaftState(raftState)
 	if err != nil {
@@ -126,8 +144,12 @@ func (st *HardState) persist() error {
 }
 
 func (st *HardState) appendEntry(entry Entry) error {
+	err := st.persist(st.term, st.votedFor, append(st.entries[:], entry))
+	if err != nil {
+		return fmt.Errorf("持久化出错，设置 entries 属性值失败。%w", err)
+	}
 	st.entries = append(st.entries, entry)
-	return st.persist()
+	return nil
 }
 
 func (st *HardState) logEntry(index int) Entry {
@@ -243,21 +265,6 @@ func (st *PeerState) getLeader() server {
 
 // ==================== LeaderState ====================
 
-type rpcMsg uint8
-
-const (
-	// 主进程已返回，不要再向 finishCh 发送消息
-	Quit rpcMsg = iota
-	// Leader / Candidate 降级为 Follower
-	Degrade
-)
-
-// 节点追赶日志状态以及正在追赶日志的协程接收消息的通道
-type rpcNotifier struct {
-	rpcBusy     bool        // 是否正在向节点发送 rpc 消息
-	notifyMsgCh chan rpcMsg // 正在追赶日志的协程接收消息
-}
-
 // 节点是 Leader 时，保存在内存中的状态
 type LeaderState struct {
 
@@ -267,15 +274,15 @@ type LeaderState struct {
 	// 已经复制到各节点的最大的日志索引。由 Leader 维护，初始值为0
 	matchIndex map[NodeId]int
 
-	// 。由 Leader 维护
-	nodeNotifier map[NodeId]*rpcNotifier
+	// 节点是否正在 rpc 通信。由 Leader 维护
+	nodeNotifier map[NodeId]bool
 }
 
 func newLeaderState() *LeaderState {
 	return &LeaderState{
 		nextIndex:    make(map[NodeId]int),
 		matchIndex:   make(map[NodeId]int),
-		nodeNotifier: make(map[NodeId]*rpcNotifier),
+		nodeNotifier: make(map[NodeId]bool),
 	}
 }
 
@@ -297,22 +304,15 @@ func (st *LeaderState) setNextIndex(id NodeId, index int) {
 }
 
 func (st *LeaderState) initNotifier(id NodeId) {
-	st.nodeNotifier[id] = &rpcNotifier{
-		rpcBusy:     false,
-		notifyMsgCh: make(chan rpcMsg),
-	}
+	st.nodeNotifier[id] = false
 }
 
 func (st *LeaderState) setRpcBusy(id NodeId, enable bool) {
-	st.nodeNotifier[id].rpcBusy = enable
+	st.nodeNotifier[id] = enable
 }
 
 func (st *LeaderState) isRpcBusy(id NodeId) bool {
-	return st.nodeNotifier[id].rpcBusy
-}
-
-func (st *LeaderState) notifyCh(id NodeId) chan rpcMsg {
-	return st.nodeNotifier[id].notifyMsgCh
+	return st.nodeNotifier[id]
 }
 
 // ==================== timerState ====================
