@@ -42,8 +42,13 @@ func (st *RoleState) getRoleStage() RoleStage {
 	return st.roleStage
 }
 
-func (st *RoleState) lock() {
+func (st *RoleState) lock(stage RoleStage) bool {
 	st.roleLock.Lock()
+	if st.roleStage != stage {
+		st.roleLock.Unlock()
+		return false
+	}
+	return true
 }
 
 func (st *RoleState) unlock() {

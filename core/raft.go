@@ -147,7 +147,7 @@ func (rf *raft) replicationTo(ctx context.Context, id NodeId, msgCh chan finishM
 
 	if res.term > rf.hardState.currentTerm() {
 		// 当前任期数落后，降级为 Follower
-		if degradeErr := rf.degrade(res.term); degradeErr != nil {
+		if degradeErr := rf.degrade(Leader, res.term); degradeErr != nil {
 			log.Println(err)
 			msg = Success
 		} else {
@@ -159,11 +159,8 @@ func (rf *raft) replicationTo(ctx context.Context, id NodeId, msgCh chan finishM
 		go rf.appendPeerEntry(id, addr)
 	}
 
-	select {
-	case <- ctx.Done():
+	if _, ok := <-ctx.Done(); ok {
 		msg = Noop
-	default:
-		break
 	}
 }
 
@@ -227,7 +224,7 @@ func (rf *raft) election() {
 
 			if res.term > rf.hardState.currentTerm() {
 				// 当前任期数落后，降级为 Follower
-				if degradeErr := rf.degrade(res.term); degradeErr != nil {
+				if degradeErr := rf.degrade(Leader, res.term); degradeErr != nil {
 					log.Println(degradeErr)
 					msg = Success
 				} else {
@@ -236,11 +233,8 @@ func (rf *raft) election() {
 				return
 			}
 
-			select {
-			case <- ctx.Done():
+			if _, ok := <-ctx.Done(); ok {
 				msg = Noop
-			default:
-				break
 			}
 		}(id, addr, currentTerm)
 	}
@@ -359,7 +353,7 @@ func (rf *raft) handleCommand(args AppendEntry, res *AppendEntryReply) error {
 	// 任期数落后或相等
 	if rf.roleState.getRoleStage() == Candidate {
 		// 如果是候选者，需要降级
-		err := rf.degrade(args.term)
+		err := rf.degrade(Candidate, args.term)
 		if err != nil {
 			log.Println(err)
 		}
@@ -421,8 +415,9 @@ func (rf *raft) handleVoteReq(args RequestVote, res *RequestVoteReply) error {
 
 	if argsTerm > rfTerm {
 		// 角色降级
-		if rf.roleState.getRoleStage() != Follower {
-			err = rf.degrade(argsTerm)
+		stage := rf.roleState.getRoleStage()
+		if stage != Follower {
+			err = rf.degrade(stage, argsTerm)
 		} else {
 			err = rf.hardState.setTerm(argsTerm)
 		}
@@ -601,7 +596,7 @@ func (rf *raft) findCorrectNextIndex(id NodeId, addr NodeAddr) {
 		}
 		if res.term > rf.hardState.currentTerm() {
 			// 如果任期数小，降级为 Follower
-			err = rf.degrade(res.term)
+			err = rf.degrade(Leader, res.term)
 			if err != nil {
 				log.Println(err)
 			}
@@ -611,6 +606,11 @@ func (rf *raft) findCorrectNextIndex(id NodeId, addr NodeAddr) {
 			return
 		}
 
+		// 确保下面对操作在 Leader 角色下完成
+		lock := rf.roleState.lock(Leader)
+		if !lock {
+			return
+		}
 		conflictStartIndex := res.conflictStartIndex
 		// Follower 日志是空的，则 nextIndex 置为 1
 		if conflictStartIndex <= 0 {
@@ -623,6 +623,8 @@ func (rf *raft) findCorrectNextIndex(id NodeId, addr NodeAddr) {
 
 		// 向前继续查找 Follower 缺少的第一条日志的索引
 		rl.setNextIndex(id, conflictStartIndex)
+
+		rf.roleState.unlock()
 	}
 }
 
@@ -662,7 +664,7 @@ func (rf *raft) completeEntries(id NodeId, addr NodeAddr) {
 		}
 		if res.term > rf.hardState.currentTerm() {
 			// 如果任期数小，降级为 Follower
-			err = rf.degrade(res.term)
+			err = rf.degrade(Leader, res.term)
 			if err != nil {
 				log.Println(err)
 			}
@@ -700,7 +702,7 @@ func (rf *raft) sendSnapshot(id NodeId, addr NodeAddr, data []byte) error {
 	}
 	if res.term > rf.hardState.currentTerm() {
 		// 如果任期数小，降级为 Follower
-		return rf.degrade(res.term)
+		return rf.degrade(Leader, res.term)
 	}
 
 	return nil
@@ -742,10 +744,13 @@ func (rf *raft) isLeader() bool {
 
 // 降级为 Follower
 // 返回结果：(是否需要降级, 降级过程报错)
-func (rf *raft) degrade(term int) error {
-	rf.roleState.lock()
+func (rf *raft) degrade(stage RoleStage, term int) error {
+	if rf.roleState.getRoleStage() == Follower || rf.roleState.lock(stage) {
+		// 有可能其它 rpc 调用已经降级了当前节点角色
+		return nil
+	}
 	defer rf.roleState.unlock()
-	if rf.roleState.getRoleStage() == Follower || term <= rf.hardState.currentTerm() {
+	if term <= rf.hardState.currentTerm() {
 		return nil
 	}
 	// 更新状态
