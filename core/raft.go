@@ -29,6 +29,8 @@ type raft struct {
 	leaderState   *LeaderState   // 节点是 Leader 时，保存在内存中的状态
 	timerState    *timerState    // 计时器状态
 	snapshotState *snapshotState // 快照状态
+
+	rpcCh chan rpc // 主线程接收 rpc 消息
 }
 
 func newRaft(config Config) *raft {
@@ -61,27 +63,70 @@ func newRaft(config Config) *raft {
 }
 
 func (rf *raft) raftRun() {
-	// 初始化定时器
-	rf.timerState.initTimerState()
 	go func() {
-		tm := rf.timerState
 		for {
-			<-tm.timer.C
-			if rf.isHeartbeatTick() {
-				rf.heartbeat()
-			} else if rf.isElectionTick() {
-				rf.election()
+			switch rf.roleState.getRoleStage() {
+			case Leader:
+				rf.runLeader()
+			case Candidate:
+				rf.runCandidate()
+			case Follower:
+				rf.runFollower()
 			}
 		}
 	}()
 }
 
-func (rf *raft) isHeartbeatTick() bool {
-	return rf.timerState.getTimerType() == Heartbeat && rf.isLeader()
+func (rf *raft) runLeader() {
+	// 初始化心跳定时器
+	rf.timerState.setHeartbeatTimer()
+	for {
+		select {
+		case <- rf.timerState.tick():
+			// 定时器到期
+			rf.heartbeat()
+		case rpcMsg := <- rf.rpcCh:
+			switch rpcMsg.rpcType {
+			case RequestVoteRpc:
+			case ClientApplyRpc:
+			}
+		}
+	}
 }
 
-func (rf *raft) isElectionTick() bool {
-	return rf.timerState.getTimerType() == Election && !rf.isLeader()
+func (rf *raft) runCandidate() {
+	// 初始化选举计时器
+	rf.timerState.setElectionTimer()
+	for {
+		select {
+		case <- rf.timerState.tick():
+			// 定时器到期
+			rf.election()
+		case rpcMsg := <- rf.rpcCh:
+			switch rpcMsg.rpcType {
+			case AppendEntryRpc:
+			case RequestVoteRpc:
+			}
+		}
+	}
+}
+
+func (rf *raft) runFollower() {
+	// 初始化选举计时器
+	rf.timerState.setElectionTimer()
+	for {
+		select {
+		case <- rf.timerState.tick():
+			// 定时器到期
+			rf.election()
+		case rpcMsg := <- rf.rpcCh:
+			switch rpcMsg.rpcType {
+			case AppendEntryRpc:
+			case RequestVoteRpc:
+			case InstallSnapshotRpc:
+			}
+		}
+	}
 }
 
 // ==================== logic process ====================
@@ -172,11 +217,8 @@ func (rf *raft) waitRpcResult(finishCh chan finishMsg) bool {
 	count := 1
 	successCnt := 1
 	for msg := range finishCh {
-		if msg.msgType == Degrade {
-			if degradeErr := rf.becomeFollower(Candidate, msg.term); degradeErr != nil {
-				log.Println(degradeErr)
-				break
-			}
+		if msg.msgType == Degrade && rf.becomeFollower(Candidate, msg.term) {
+			break
 		}
 		if msg.msgType == Success {
 			successCnt += 1
@@ -197,7 +239,7 @@ func (rf *raft) waitRpcResult(finishCh chan finishMsg) bool {
 func (rf *raft) handleCommand(args AppendEntry, res *AppendEntryReply) error {
 
 	// 重置选举计时器
-	rf.timerState.resetElectionTimer()
+	rf.timerState.setElectionTimer()
 
 	// 判断 term
 	rfTerm := rf.hardState.currentTerm()
@@ -242,13 +284,9 @@ func (rf *raft) handleCommand(args AppendEntry, res *AppendEntryReply) error {
 		return nil
 	}
 
-	// 任期数落后或相等
-	if rf.roleState.getRoleStage() == Candidate {
-		// 如果是候选者，需要降级
-		err := rf.becomeFollower(Candidate, args.term)
-		if err != nil {
-			log.Println(err)
-		}
+	// 任期数落后或相等，如果是候选者，需要降级
+	if rf.roleState.getRoleStage() == Candidate && !rf.becomeFollower(Candidate, args.term) {
+		return nil
 	}
 
 	newEntryIndex := prevIndex + 1
@@ -305,11 +343,8 @@ func (rf *raft) handleVoteReq(args RequestVote, res *RequestVoteReply) error {
 	if argsTerm > rfTerm {
 		// 角色降级
 		stage := rf.roleState.getRoleStage()
-		if stage != Follower {
-			degradeErr := rf.becomeFollower(stage, argsTerm)
-			if degradeErr != nil {
-				return fmt.Errorf("角色降级失败：%w", degradeErr)
-			}
+		if stage != Follower && !rf.becomeFollower(stage, argsTerm) {
+			return fmt.Errorf("角色降级失失败")
 		}
 		setTermErr := rf.hardState.setTerm(argsTerm)
 		if setTermErr != nil {
@@ -337,7 +372,7 @@ func (rf *raft) handleVoteReq(args RequestVote, res *RequestVoteReply) error {
 	}
 
 	if res.voteGranted {
-		rf.timerState.resetElectionTimer()
+		rf.timerState.setElectionTimer()
 	}
 
 	return nil
@@ -377,7 +412,7 @@ func (rf *raft) handleSnapshot(args InstallSnapshot, res *InstallSnapshotReply) 
 }
 
 // 处理客户端请求
-func (rf *raft) handleClientCmd(args ClientRequest, res *ClientResponse) error {
+func (rf *raft) handleClientCmd(args ClientApply, res *ClientApplyReply) error {
 
 	// 重置心跳计时器
 	rf.timerState.setHeartbeatTimer()
@@ -401,8 +436,8 @@ func (rf *raft) handleClientCmd(args ClientRequest, res *ClientResponse) error {
 	defer close(finishCh)
 	ctx, cancel := context.WithCancel(context.Background())
 	for id := range rf.peerState.peersMap() {
-		// 不用给自己发
-		if rf.peerState.isMe(id) {
+		// 不用给自己发，正在复制日志的不发
+		if rf.peerState.isMe(id) || rf.leaderState.isRpcBusy(id) {
 			continue
 		}
 		// 发送日志
@@ -538,12 +573,8 @@ func (rf *raft) findCorrectNextIndex(id NodeId, addr NodeAddr) {
 			log.Println(fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err))
 			return
 		}
-		if res.term > rf.hardState.currentTerm() {
+		if res.term > rf.hardState.currentTerm() && !rf.becomeFollower(Leader, res.term) {
 			// 如果任期数小，降级为 Follower
-			err = rf.becomeFollower(Leader, res.term)
-			if err != nil {
-				log.Println(err)
-			}
 			return
 		}
 		if res.success {
@@ -573,7 +604,7 @@ func (rf *raft) findCorrectNextIndex(id NodeId, addr NodeAddr) {
 }
 
 func (rf *raft) completeEntries(id NodeId, addr NodeAddr) {
-	var err error
+
 	rl := rf.leaderState
 	for {
 		if rl.peerNextIndex(id)-1 == rf.lastLogIndex() {
@@ -581,13 +612,21 @@ func (rf *raft) completeEntries(id NodeId, addr NodeAddr) {
 		}
 		// 缺失的日志太多时，直接发送快照
 		snapshot := rf.snapshotState.getSnapshot()
+		finishCh := make(chan finishMsg)
 		if rl.peerNextIndex(id) <= snapshot.LastIndex {
-			err = rf.snapshotTo(id, addr, snapshot.Data)
-			if err != nil {
-				log.Println(err)
-			} else {
-				rf.leaderState.setMatchAndNextIndex(id, snapshot.LastIndex, snapshot.LastIndex+1)
+			rf.snapshotTo(context.Background(), id, addr, snapshot.Data, finishCh)
+			msg := <-finishCh
+			if msg.msgType != Success {
+				if msg.msgType == Degrade && rf.becomeFollower(Leader, msg.term) {
+					return
+				}
 			}
+
+			if rf.roleState.lock(Leader) {
+				rf.leaderState.setMatchAndNextIndex(id, snapshot.LastIndex, snapshot.LastIndex+1)
+				rf.roleState.unlock()
+			}
+
 		}
 
 		prevIndex := rl.peerNextIndex(id) - 1
@@ -600,23 +639,22 @@ func (rf *raft) completeEntries(id NodeId, addr NodeAddr) {
 			entries:      rf.hardState.logEntries(prevIndex, rl.peerNextIndex(id)),
 		}
 		res := &AppendEntryReply{}
-		err = rf.transport.AppendEntries(addr, args, res)
+		rpcErr := rf.transport.AppendEntries(addr, args, res)
 
-		if err != nil {
-			log.Println(fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err))
+		if rpcErr != nil {
+			log.Println(fmt.Errorf("调用rpc服务失败：%s%w\n", addr, rpcErr))
 			return
 		}
-		if res.term > rf.hardState.currentTerm() {
+		if res.term > rf.hardState.currentTerm() && rf.becomeFollower(Leader, res.term) {
 			// 如果任期数小，降级为 Follower
-			err = rf.becomeFollower(Leader, res.term)
-			if err != nil {
-				log.Println(err)
-			}
 			return
 		}
 
 		// 向后补充
-		rf.leaderState.setMatchAndNextIndex(id, rl.peerNextIndex(id), rl.peerNextIndex(id)+1)
+		if rf.roleState.lock(Leader) {
+			rf.leaderState.setMatchAndNextIndex(id, rl.peerNextIndex(id), rl.peerNextIndex(id)+1)
+			rf.roleState.unlock()
+		}
 	}
 }
 
@@ -652,11 +690,14 @@ func (rf *raft) snapshotTo(ctx context.Context, id NodeId, addr NodeAddr, data [
 	if err != nil {
 		log.Println(fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err))
 		msg = finishMsg{msgType: RpcFailed}
+		return
 	}
 	if res.term > rf.hardState.currentTerm() {
 		// 如果任期数小，降级为 Follower
 		msg = finishMsg{msgType: Degrade, term: res.term}
+		return
 	}
+	msg = finishMsg{msgType: Success}
 }
 
 func (rf *raft) handleServerAdd(args AddServer, res *AddServerReply) error {
@@ -709,6 +750,9 @@ func (rf *raft) becomeLeader() bool {
 	// 权柄建立成功，将自己置为 Leader
 	if rf.waitRpcResult(finishCh) {
 		rf.setRoleStage(Leader)
+		rf.roleState.lock(Leader)
+		defer rf.roleState.unlock()
+
 		rf.peerState.setLeader(rf.peerState.myId())
 		for id := range rf.peerState.peersMap() {
 			// 初始化保存的各节点状态
@@ -736,31 +780,28 @@ func (rf *raft) becomeCandidate() bool {
 }
 
 // 降级为 Follower
-func (rf *raft) becomeFollower(stage RoleStage, term int) error {
-	if rf.roleState.getRoleStage() == Follower || rf.roleState.lock(stage) {
-		// 有可能其它 rpc 调用已经降级了当前节点角色
-		return nil
+func (rf *raft) becomeFollower(stage RoleStage, term int) bool {
+	if !rf.roleState.lock(stage) {
+		return false
 	}
 	defer rf.roleState.unlock()
-	if term <= rf.hardState.currentTerm() {
-		return nil
-	}
-	// 更新状态
+
 	err := rf.hardState.setTerm(term)
 	if err != nil {
-		return fmt.Errorf("降级失败%w", err)
+		log.Println(fmt.Errorf("降级失败%w", err))
+		return false
 	}
 	rf.setRoleStage(Follower)
-	return nil
+	return true
 }
 
 func (rf *raft) setRoleStage(stage RoleStage) {
 	rf.roleState.setRoleStage(stage)
 	if stage == Leader {
 		rf.peerState.setLeader(rf.peerState.myId())
-		rf.timerState.resetHeartbeatTimer()
+		rf.timerState.setHeartbeatTimer()
 	} else {
-		rf.timerState.resetElectionTimer()
+		rf.timerState.setElectionTimer()
 	}
 }
 

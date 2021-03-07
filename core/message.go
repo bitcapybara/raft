@@ -1,5 +1,25 @@
 package core
 
+type rpcType uint8
+
+const (
+	AppendEntryRpc rpcType = iota
+	RequestVoteRpc
+	InstallSnapshotRpc
+	ClientApplyRpc
+)
+
+type rpc struct {
+	rpcType rpcType
+	req interface{}
+	res chan rpcReply
+}
+
+type rpcReply struct {
+	res interface{}
+	err error
+}
+
 // ==================== AppendEntry ====================
 
 type AppendEntry struct {
@@ -48,7 +68,7 @@ type InstallSnapshotReply struct {
 	term int // 接收的 Follower 的当前 term
 }
 
-// ==================== ClientRequest ====================
+// ==================== ClientApply ====================
 
 type status uint8
 
@@ -63,11 +83,11 @@ type server struct {
 	addr NodeAddr
 }
 
-type ClientRequest struct {
+type ClientApply struct {
 	data []byte // 客户端请求应用到状态机的数据
 }
 
-type ClientResponse struct {
+type ClientApplyReply struct {
 	status   status // 客户端请求的是 Leader 节点时，返回 true
 	leader server // 客户端请求的不是 Leader 节点时，返回 LeaderId
 }

@@ -419,9 +419,7 @@ const (
 )
 
 type timerState struct {
-	timerType timerType   // 计时器类型
-	timer     *time.Timer // 超时计时器
-	mu        sync.Mutex
+	timeoutTimer *time.Timer // 超时计时器
 
 	electionMinTimeout int // 最小选举超时时间
 	electionMaxTimeout int // 最大选举超时时间
@@ -436,35 +434,23 @@ func newTimerState(config Config) *timerState {
 	}
 }
 
-func (st *timerState) initTimerState() {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.timer = time.NewTimer(st.electionDuration())
-	st.timerType = Election
-}
-
-func (st *timerState) getTimerType() timerType {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	return st.timerType
-}
-
+// 用于计时器已到期后重置
 func (st *timerState) setElectionTimer() {
-	st.timer.Reset(st.electionDuration())
-}
-
-func (st *timerState) resetElectionTimer() {
-	st.timer.Stop()
-	st.timer.Reset(st.electionDuration())
-}
-
-func (st *timerState) resetHeartbeatTimer() {
-	st.timer.Stop()
-	st.timer.Reset(st.heartbeatDuration())
+	if st.timeoutTimer == nil {
+		st.timeoutTimer = time.NewTimer(st.electionDuration())
+	} else {
+		st.timeoutTimer.Stop()
+		st.timeoutTimer.Reset(st.electionDuration())
+	}
 }
 
 func (st *timerState) setHeartbeatTimer() {
-	st.timer.Reset(st.heartbeatDuration())
+	if st.timeoutTimer == nil {
+		st.timeoutTimer = time.NewTimer(st.heartbeatDuration())
+	} else {
+		st.timeoutTimer.Stop()
+		st.timeoutTimer.Reset(st.heartbeatDuration())
+	}
 }
 
 func (st *timerState) electionDuration() time.Duration {
@@ -474,6 +460,10 @@ func (st *timerState) electionDuration() time.Duration {
 
 func (st *timerState) heartbeatDuration() time.Duration {
 	return time.Millisecond * time.Duration(st.heartbeatTimeout)
+}
+
+func (st *timerState) tick() <-chan time.Time {
+	return st.timeoutTimer.C
 }
 
 // ==================== snapshotState ====================
