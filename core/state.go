@@ -25,7 +25,7 @@ type RoleStage uint8
 
 type RoleState struct {
 	roleStage RoleStage  // 节点当前角色
-	roleLock  sync.Mutex // 角色并发访问锁
+	mu        sync.Mutex // 角色并发访问锁
 }
 
 func newRoleState() *RoleState {
@@ -35,24 +35,28 @@ func newRoleState() *RoleState {
 }
 
 func (st *RoleState) setRoleStage(stage RoleStage) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	st.roleStage = stage
 }
 
 func (st *RoleState) getRoleStage() RoleStage {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return st.roleStage
 }
 
 func (st *RoleState) lock(stage RoleStage) bool {
-	st.roleLock.Lock()
+	st.mu.Lock()
 	if st.roleStage != stage {
-		st.roleLock.Unlock()
+		st.mu.Unlock()
 		return false
 	}
 	return true
 }
 
 func (st *RoleState) unlock() {
-	st.roleLock.Unlock()
+	st.mu.Unlock()
 }
 
 // ==================== HardState ====================
@@ -74,6 +78,7 @@ type HardState struct {
 	votedFor  NodeId             // 当前任期获得选票的 Candidate
 	entries   []Entry            // 当前节点保存的日志
 	persister RaftStatePersister // 持久化器
+	mu        sync.Mutex
 }
 
 func NewHardState(persister RaftStatePersister) HardState {
@@ -86,6 +91,8 @@ func NewHardState(persister RaftStatePersister) HardState {
 }
 
 func (st *HardState) lastEntryIndex() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	lastLogIndex := len(st.entries) - 1
 	if lastLogIndex < 0 {
 		return 0
@@ -95,11 +102,15 @@ func (st *HardState) lastEntryIndex() int {
 }
 
 func (st *HardState) currentTerm() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return st.term
 }
 
 // todo 传入的必须是物理索引
 func (st *HardState) logEntryTerm(index int) int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	if len(st.entries)-1 < index {
 		return 0
 	}
@@ -107,10 +118,14 @@ func (st *HardState) logEntryTerm(index int) int {
 }
 
 func (st *HardState) logLength() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return len(st.entries)
 }
 
 func (st *HardState) setTerm(term int) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	if st.term >= term {
 		return nil
 	}
@@ -123,7 +138,22 @@ func (st *HardState) setTerm(term int) error {
 	return nil
 }
 
+func (st *HardState) termAddAndVote(delta int, voteTo NodeId) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	newTerm := st.term + delta
+	err := st.persist(newTerm, voteTo, st.entries)
+	if err != nil {
+		return fmt.Errorf("持久化出错，设置 term 属性值失败。%w", err)
+	}
+	st.term = newTerm
+	st.votedFor = voteTo
+	return nil
+}
+
 func (st *HardState) vote(id NodeId) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	if st.votedFor == id {
 		return nil
 	}
@@ -149,6 +179,8 @@ func (st *HardState) persist(term int, votedFor NodeId, entries []Entry) error {
 }
 
 func (st *HardState) appendEntry(entry Entry) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	err := st.persist(st.term, st.votedFor, append(st.entries[:], entry))
 	if err != nil {
 		return fmt.Errorf("持久化出错，设置 entries 属性值失败。%w", err)
@@ -158,24 +190,35 @@ func (st *HardState) appendEntry(entry Entry) error {
 }
 
 func (st *HardState) logEntry(index int) Entry {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return st.entries[index]
 }
 
 func (st *HardState) voted() NodeId {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return st.votedFor
 }
 
 func (st *HardState) truncateEntries(index int) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	st.entries = st.entries[:index]
 }
 
 func (st *HardState) clearEntries() {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	st.entries = make([]Entry, 0)
 }
 
 func (st *HardState) logEntries(start, end int) []Entry {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return st.entries[start:end]
 }
+
 
 // ==================== SoftState ====================
 
@@ -183,6 +226,7 @@ func (st *HardState) logEntries(start, end int) []Entry {
 type SoftState struct {
 	commitIndex int // 已经提交的最大的日志索引，由当前节点维护，初始化为0
 	lastApplied int // 应用到状态机的最后一个日志索引
+	mu          sync.Mutex
 }
 
 func newSoftState() *SoftState {
@@ -193,23 +237,33 @@ func newSoftState() *SoftState {
 }
 
 func (st *SoftState) softCommitIndex() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return st.commitIndex
 }
 
 func (st *SoftState) setCommitIndex(index int) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	st.commitIndex = index
 }
 
 func (st *SoftState) setLastApplied(index int) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	st.lastApplied = index
 }
 
 func (st *SoftState) lastAppliedAdd() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	st.lastApplied += 1
 	return st.lastApplied
 }
 
 func (st *SoftState) softLastApplied() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return st.lastApplied
 }
 
@@ -220,6 +274,7 @@ type PeerState struct {
 	peers  map[NodeId]NodeAddr // 所有节点
 	me     NodeId              // 当前节点在 peers 中的索引
 	leader NodeId              // 当前 leader 在 peers 中的索引
+	mu     sync.Mutex
 }
 
 func newPeerState(peers map[NodeId]NodeAddr, me NodeId) *PeerState {
@@ -231,37 +286,55 @@ func newPeerState(peers map[NodeId]NodeAddr, me NodeId) *PeerState {
 }
 
 func (st *PeerState) leaderIsMe() bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return st.leader == st.me
 }
 
 func (st *PeerState) majority() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return len(st.peers)/2 + 1
 }
 func (st *PeerState) peersMap() map[NodeId]NodeAddr {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return st.peers
 }
 
 func (st *PeerState) peersCnt() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return len(st.peers)
 }
 
 func (st *PeerState) isMe(id NodeId) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return id == st.me
 }
 
 func (st *PeerState) myId() NodeId {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return st.me
 }
 
 func (st *PeerState) setLeader(id NodeId) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	st.leader = id
 }
 
 func (st *PeerState) leaderId() NodeId {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return st.leader
 }
 
 func (st *PeerState) getLeader() server {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return server{
 		id:   st.leader,
 		addr: st.peers[st.leader],
@@ -281,6 +354,8 @@ type LeaderState struct {
 
 	// 节点是否正在 rpc 通信。由 Leader 维护
 	nodeNotifier map[NodeId]bool
+
+	mu sync.Mutex
 }
 
 func newLeaderState() *LeaderState {
@@ -292,31 +367,45 @@ func newLeaderState() *LeaderState {
 }
 
 func (st *LeaderState) peerMatchIndex(id NodeId) int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return st.matchIndex[id]
 }
 
 func (st *LeaderState) setMatchAndNextIndex(id NodeId, matchIndex, nextIndex int) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	st.matchIndex[id] = matchIndex
 	st.nextIndex[id] = nextIndex
 }
 
 func (st *LeaderState) peerNextIndex(id NodeId) int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return st.nextIndex[id]
 }
 
 func (st *LeaderState) setNextIndex(id NodeId, index int) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	st.nextIndex[id] = index
 }
 
 func (st *LeaderState) initNotifier(id NodeId) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	st.nodeNotifier[id] = false
 }
 
 func (st *LeaderState) setRpcBusy(id NodeId, enable bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	st.nodeNotifier[id] = enable
 }
 
 func (st *LeaderState) isRpcBusy(id NodeId) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return st.nodeNotifier[id]
 }
 
@@ -332,6 +421,7 @@ const (
 type timerState struct {
 	timerType timerType   // 计时器类型
 	timer     *time.Timer // 超时计时器
+	mu        sync.Mutex
 
 	electionMinTimeout int // 最小选举超时时间
 	electionMaxTimeout int // 最大选举超时时间
@@ -347,11 +437,15 @@ func newTimerState(config Config) *timerState {
 }
 
 func (st *timerState) initTimerState() {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	st.timer = time.NewTimer(st.electionDuration())
 	st.timerType = Election
 }
 
 func (st *timerState) getTimerType() timerType {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return st.timerType
 }
 
@@ -361,12 +455,12 @@ func (st *timerState) setElectionTimer() {
 
 func (st *timerState) resetElectionTimer() {
 	st.timer.Stop()
-	st.setElectionTimer()
+	st.timer.Reset(st.electionDuration())
 }
 
 func (st *timerState) resetHeartbeatTimer() {
 	st.timer.Stop()
-	st.setHeartbeatTimer()
+	st.timer.Reset(st.heartbeatDuration())
 }
 
 func (st *timerState) setHeartbeatTimer() {
@@ -388,6 +482,7 @@ type snapshotState struct {
 	snapshot     *Snapshot
 	persister    SnapshotPersister
 	maxLogLength int
+	mu           sync.Mutex
 }
 
 func newSnapshotState(config Config) *snapshotState {
@@ -404,6 +499,8 @@ func newSnapshotState(config Config) *snapshotState {
 }
 
 func (st *snapshotState) save(snapshot Snapshot) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	err := st.persister.SaveSnapshot(snapshot)
 	if err != nil {
 		return fmt.Errorf("保存快照失败：%w", err)
@@ -413,18 +510,26 @@ func (st *snapshotState) save(snapshot Snapshot) error {
 }
 
 func (st *snapshotState) needGenSnapshot(commitIndex int) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	need := commitIndex-st.snapshot.LastIndex >= st.maxLogLength
 	return need
 }
 
 func (st *snapshotState) lastIndex() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return st.snapshot.LastIndex
 }
 
 func (st *snapshotState) lastTerm() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return st.snapshot.LastTerm
 }
 
 func (st *snapshotState) getSnapshot() *Snapshot {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return st.snapshot
 }
