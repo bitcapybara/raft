@@ -89,7 +89,7 @@ func (rf *raft) runLeader() {
 			case AppendEntryRpc:
 				rf.handleCommand(msg)
 			case RequestVoteRpc:
-
+				rf.handleVoteReq(msg)
 			case ClientApplyRpc:
 				rf.handleClientCmd(msg)
 			}
@@ -132,6 +132,7 @@ func (rf *raft) runCandidate() {
 			case AppendEntryRpc:
 				rf.handleCommand(msg)
 			case RequestVoteRpc:
+				rf.handleVoteReq(msg)
 			}
 		case msg := <-finishCh:
 			// 降级
@@ -158,11 +159,14 @@ func (rf *raft) runFollower() {
 			// 成为候选者
 			rf.becomeCandidate()
 			return
-		case rpcMsg := <-rf.rpcCh:
-			switch rpcMsg.rpcType {
+		case msg := <-rf.rpcCh:
+			switch msg.rpcType {
 			case AppendEntryRpc:
+				rf.handleCommand(msg)
 			case RequestVoteRpc:
+				rf.handleVoteReq(msg)
 			case InstallSnapshotRpc:
+				rf.handleSnapshot(msg)
 			}
 		}
 	}
@@ -284,6 +288,7 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 	}
 
 	// 任期数落后或相等，如果是候选者，需要降级
+	// 后续操作都在 Follower 角色下完成
 	if args.term > rfTerm || rf.roleState.getRoleStage() != Follower {
 		if !rf.becomeFollower(rf.roleState.getRoleStage(), args.term) {
 			reply.err = fmt.Errorf("节点降级失败")
@@ -363,7 +368,12 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 }
 
 // Follower 和 Candidate 接收到来自 Candidate 的 RequestVote 调用
-func (rf *raft) handleVoteReq(args RequestVote, res *RequestVoteReply) error {
+func (rf *raft) handleVoteReq(rpcMsg rpc) {
+
+	args := rpcMsg.req.(RequestVote)
+	reply := rpcReply{}
+	res := reply.res.(RequestVoteReply)
+	defer func() { rpcMsg.res <- reply }()
 
 	argsTerm := args.term
 	rfTerm := rf.hardState.currentTerm()
@@ -371,18 +381,20 @@ func (rf *raft) handleVoteReq(args RequestVote, res *RequestVoteReply) error {
 		// 拉票的候选者任期落后，不投票
 		res.term = rfTerm
 		res.voteGranted = false
-		return nil
+		return
 	}
 
 	if argsTerm > rfTerm {
 		// 角色降级
 		stage := rf.roleState.getRoleStage()
 		if stage != Follower && !rf.becomeFollower(stage, argsTerm) {
-			return fmt.Errorf("角色降级失失败")
+			reply.err = fmt.Errorf("角色降级失失败")
+			return
 		}
 		setTermErr := rf.hardState.setTerm(argsTerm)
 		if setTermErr != nil {
-			return fmt.Errorf("设置 term 值失败：%w", setTermErr)
+			reply.err = fmt.Errorf("设置 term 值失败：%w", setTermErr)
+			return
 		}
 	}
 
@@ -408,41 +420,44 @@ func (rf *raft) handleVoteReq(args RequestVote, res *RequestVoteReply) error {
 	if res.voteGranted {
 		rf.timerState.setElectionTimer()
 	}
-
-	return nil
 }
 
 // Follower 接收来自 Leader 的 InstallSnapshot 调用
-func (rf *raft) handleSnapshot(args InstallSnapshot, res *InstallSnapshotReply) error {
+func (rf *raft) handleSnapshot(rpcMsg rpc) {
+
+	args := rpcMsg.req.(InstallSnapshot)
+	reply := rpcReply{}
+	res := reply.res.(InstallSnapshotReply)
+	defer func() { rpcMsg.res <- reply }()
 
 	rfTerm := rf.hardState.currentTerm()
 	if args.term < rfTerm {
 		// Leader 的 term 过期，直接返回
 		res.term = rfTerm
-		return nil
+		return
 	}
 
 	// 持久化
 	res.term = rfTerm
 	snapshot := Snapshot{args.lastIncludedIndex, args.lastIncludedTerm, args.data}
-	err := rf.snapshotState.save(snapshot)
-	if err != nil {
-		return err
+	saveErr := rf.snapshotState.save(snapshot)
+	if saveErr != nil {
+		reply.err = saveErr
+		return
 	}
 
 	if !args.done {
 		// 若传送没有完成，则继续接收数据
-		return nil
+		return
 	}
 
 	// 保存快照成功，删除多余日志
 	if args.lastIncludedIndex <= rf.hardState.logLength() && rf.logTerm(args.lastIncludedIndex) == args.lastIncludedTerm {
 		rf.hardState.truncateEntries(args.lastIncludedIndex)
-		return nil
+		return
 	}
 
 	rf.hardState.clearEntries()
-	return nil
 }
 
 // 处理客户端请求
