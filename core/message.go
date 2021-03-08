@@ -3,9 +3,13 @@ package core
 type rpcType uint8
 
 const (
+	// 来自 Leader 的日志复制请求
 	AppendEntryRpc rpcType = iota
+	// 来自 Candidate 的投票请求
 	RequestVoteRpc
+	// 来自 Leader 的安装快照请求
 	InstallSnapshotRpc
+	// 来自客户端的安装命令请求
 	ClientApplyRpc
 )
 
