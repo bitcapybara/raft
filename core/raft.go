@@ -82,6 +82,14 @@ func (rf *raft) runLeader() {
 	// 初始化心跳定时器
 	rf.timerState.setHeartbeatTimer()
 
+	rf.runReplication()
+
+	defer func() {
+		for id := range rf.peerState.peersMap() {
+			rf.leaderState.followerState[id].stopCh <- struct{}{}
+		}
+	}()
+
 	for rf.roleState.getRoleStage() == Leader {
 		select {
 		case msg := <-rf.rpcCh:
@@ -265,6 +273,32 @@ func (rf *raft) waitRpcResult(finishCh chan finishMsg) bool {
 	return false
 }
 
+func (rf *raft) runReplication() {
+	for id, addr := range rf.peerState.peersMap() {
+		st, ok := rf.leaderState.followerState[id]
+		if !ok {
+			st = &followerReplication{
+				id: id,
+				addr: addr,
+				nextIndex: rf.lastLogIndex() + 1,
+				matchIndex: 0,
+				stepDownCh: rf.leaderState.stepDownCh,
+				stopCh: make(chan struct{}),
+				triggerCh: make(chan struct{}),
+			}
+			rf.leaderState.followerState[id] = st
+		}
+		go func() {
+			for {
+				select {
+				case <-st.stopCh:
+				case <-st.triggerCh:
+				}
+			}
+		}()
+	}
+}
+
 // Follower 和 Candidate 接收到来自 Leader 的 AppendEntries 调用
 func (rf *raft) handleCommand(rpcMsg rpc) {
 
@@ -280,10 +314,8 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 	rfTerm := rf.hardState.currentTerm()
 	if args.term < rfTerm {
 		// 发送请求的 Leader 任期数落后
-		reply.res = AppendEntryReply{
-			term: rfTerm,
-			success: false,
-		}
+		res.term = rfTerm
+		res.success = false
 		return
 	}
 

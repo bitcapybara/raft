@@ -219,7 +219,6 @@ func (st *HardState) logEntries(start, end int) []Entry {
 	return st.entries[start:end]
 }
 
-
 // ==================== SoftState ====================
 
 // 保存在内存中的实时状态
@@ -343,70 +342,53 @@ func (st *PeerState) getLeader() server {
 
 // ==================== LeaderState ====================
 
+type followerReplication struct {
+	id         NodeId        // 节点标识
+	addr       NodeAddr      // 节点地址
+	nextIndex  int           // 下一次要发送给各节点的日志索引。由 Leader 维护，初始值为 Leader 最后一个日志的索引 + 1
+	matchIndex int           // 已经复制到各节点的最大的日志索引。由 Leader 维护，初始值为0
+	stepDownCh chan struct{} // 通知主线程降级
+	stopCh     chan struct{} // 接收主线程发来的降级通知
+	triggerCh  chan struct{} // 触发复制请求
+}
+
 // 节点是 Leader 时，保存在内存中的状态
 type LeaderState struct {
-
-	// 下一次要发送给各节点的日志索引。由 Leader 维护，初始值为 Leader 最后一个日志的索引 + 1
-	nextIndex map[NodeId]int
-
-	// 已经复制到各节点的最大的日志索引。由 Leader 维护，初始值为0
-	matchIndex map[NodeId]int
-
-	// 节点是否正在 rpc 通信。由 Leader 维护
-	nodeNotifier map[NodeId]bool
-
-	mu sync.Mutex
+	stepDownCh    chan struct{}
+	followerState map[NodeId]*followerReplication
 }
 
 func newLeaderState() *LeaderState {
 	return &LeaderState{
-		nextIndex:    make(map[NodeId]int),
-		matchIndex:   make(map[NodeId]int),
-		nodeNotifier: make(map[NodeId]bool),
 	}
 }
 
 func (st *LeaderState) peerMatchIndex(id NodeId) int {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	return st.matchIndex[id]
+	panic("")
 }
 
 func (st *LeaderState) setMatchAndNextIndex(id NodeId, matchIndex, nextIndex int) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.matchIndex[id] = matchIndex
-	st.nextIndex[id] = nextIndex
+	panic("")
 }
 
 func (st *LeaderState) peerNextIndex(id NodeId) int {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	return st.nextIndex[id]
+	panic("")
 }
 
 func (st *LeaderState) setNextIndex(id NodeId, index int) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.nextIndex[id] = index
+	panic("")
 }
 
 func (st *LeaderState) initNotifier(id NodeId) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.nodeNotifier[id] = false
+	panic("")
 }
 
 func (st *LeaderState) setRpcBusy(id NodeId, enable bool) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.nodeNotifier[id] = enable
+	panic("")
 }
 
 func (st *LeaderState) isRpcBusy(id NodeId) bool {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	return st.nodeNotifier[id]
+	panic("")
 }
 
 // ==================== timerState ====================
