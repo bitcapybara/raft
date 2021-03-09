@@ -347,14 +347,14 @@ type followerReplication struct {
 	addr       NodeAddr      // 节点地址
 	nextIndex  int           // 下一次要发送给各节点的日志索引。由 Leader 维护，初始值为 Leader 最后一个日志的索引 + 1
 	matchIndex int           // 已经复制到各节点的最大的日志索引。由 Leader 维护，初始值为0
-	stepDownCh chan struct{} // 通知主线程降级
+	stepDownCh chan int // 通知主线程降级
 	stopCh     chan struct{} // 接收主线程发来的降级通知
 	triggerCh  chan struct{} // 触发复制请求
 }
 
 // 节点是 Leader 时，保存在内存中的状态
 type LeaderState struct {
-	stepDownCh    chan struct{}
+	stepDownCh    chan int
 	followerState map[NodeId]*followerReplication
 }
 

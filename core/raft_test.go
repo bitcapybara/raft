@@ -1,6 +1,7 @@
 package core
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -8,15 +9,25 @@ import (
 func TestStop(t *testing.T) {
 
 	stopCh := make(chan struct{})
-	close(stopCh)
 
+
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
-		if _, ok := <- stopCh; ok {
-			println("接收到信号")
-		} else {
-			println("未接收到信号")
+		defer wg.Done()
+		for {
+			select {
+			case <-stopCh:
+				println("接收到信号")
+				return
+			default:
+			}
 		}
 	}()
 
 	time.Sleep(time.Second * 2)
+	close(stopCh)
+	wg.Wait()
+
+
 }

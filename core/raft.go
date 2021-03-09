@@ -1,7 +1,6 @@
 package core
 
 import (
-	"context"
 	"fmt"
 	"log"
 )
@@ -82,11 +81,13 @@ func (rf *raft) runLeader() {
 	// 初始化心跳定时器
 	rf.timerState.setHeartbeatTimer()
 
+	// 开启日志复制循环
 	rf.runReplication()
 
+	// 节点退出 Leader 状态，收尾工作
 	defer func() {
-		for id := range rf.peerState.peersMap() {
-			rf.leaderState.followerState[id].stopCh <- struct{}{}
+		for _, st := range rf.leaderState.followerState {
+			close(st.stopCh)
 		}
 	}()
 
@@ -106,7 +107,7 @@ func (rf *raft) runLeader() {
 			finishCh := rf.heartbeat(stopCh)
 			successCnt := 1
 			for msg := range finishCh {
-				if msg.msgType == Degrade && rf.becomeFollower(Candidate, msg.term) {
+				if msg.msgType == Degrade && rf.becomeFollower(Leader, msg.term) {
 					return
 				}
 				if msg.msgType == Success {
@@ -117,6 +118,11 @@ func (rf *raft) runLeader() {
 				}
 			}
 			close(stopCh)
+		case msg := <-rf.leaderState.stepDownCh:
+			// 接收到降级消息
+			if rf.becomeFollower(Leader, msg) {
+				return
+			}
 		}
 	}
 }
@@ -278,13 +284,13 @@ func (rf *raft) runReplication() {
 		st, ok := rf.leaderState.followerState[id]
 		if !ok {
 			st = &followerReplication{
-				id: id,
-				addr: addr,
-				nextIndex: rf.lastLogIndex() + 1,
+				id:         id,
+				addr:       addr,
+				nextIndex:  rf.lastLogIndex() + 1,
 				matchIndex: 0,
 				stepDownCh: rf.leaderState.stepDownCh,
-				stopCh: make(chan struct{}),
-				triggerCh: make(chan struct{}),
+				stopCh:     make(chan struct{}),
+				triggerCh:  make(chan struct{}),
 			}
 			rf.leaderState.followerState[id] = st
 		}
@@ -292,7 +298,9 @@ func (rf *raft) runReplication() {
 			for {
 				select {
 				case <-st.stopCh:
+					return
 				case <-st.triggerCh:
+					rf.replicate(st)
 				}
 			}
 		}()
@@ -565,10 +573,11 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 func (rf *raft) sendSnapshot(bytes []byte) {
 	finishCh := make(chan finishMsg)
 	defer close(finishCh)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
 	for id, addr := range rf.peerState.peersMap() {
-		go rf.snapshotTo(ctx, id, addr, bytes, finishCh)
+		go rf.snapshotTo(id, addr, bytes, finishCh, stopCh)
 	}
 	rf.waitRpcResult(finishCh)
 }
@@ -620,7 +629,7 @@ func (rf *raft) replicationTo(id NodeId, finishCH chan finishMsg, stopCh chan st
 		msg = finishMsg{msgType: Degrade, term: res.term}
 	} else {
 		// Follower 和 Leader 的日志不匹配，进行日志追赶
-		go rf.appendPeerEntry(id, addr)
+		rf.leaderState.followerState[id].triggerCh <- struct{}{}
 	}
 }
 
@@ -628,24 +637,24 @@ func (rf *raft) replicationTo(id NodeId, finishCH chan finishMsg, stopCh chan st
 // 若日志不同步，开始进行日志追赶操作
 // 1. Follower 节点标记为日志追赶状态，下一次心跳时跳过此节点
 // 2. 日志追赶完毕或 rpc 调用失败，Follower 节点标记为普通状态
-func (rf *raft) appendPeerEntry(id NodeId, addr NodeAddr) {
+func (rf *raft) replicate(s *followerReplication) {
 	// 向前查找 nextIndex 值
-	rf.findCorrectNextIndex(id, addr)
-
-	// 递增更新 matchIndex 值
-	rf.completeEntries(id, addr)
+	if rf.findCorrectNextIndex(s) {
+		// 递增更新 matchIndex 值
+		rf.completeEntries(s)
+	}
 }
 
-func (rf *raft) findCorrectNextIndex(id NodeId, addr NodeAddr) {
+func (rf *raft) findCorrectNextIndex(s *followerReplication) bool {
 	rl := rf.leaderState
-	peerNextIndex := rl.peerNextIndex(id)
+	peerNextIndex := rl.peerNextIndex(s.id)
 
 	for peerNextIndex >= 0 {
-		prevIndex := rl.peerNextIndex(id) - 1
+		prevIndex := rl.peerNextIndex(s.id) - 1
 
 		// 找到匹配点之前，发送空日志节省带宽
 		var entries []Entry
-		if rl.peerMatchIndex(id) == prevIndex {
+		if rl.peerMatchIndex(s.id) == prevIndex {
 			rf.hardState.logEntries(prevIndex, prevIndex+1)
 		}
 		args := AppendEntry{
@@ -657,25 +666,27 @@ func (rf *raft) findCorrectNextIndex(id NodeId, addr NodeAddr) {
 			entries:      entries,
 		}
 		res := &AppendEntryReply{}
-		err := rf.transport.AppendEntries(addr, args, res)
+		err := rf.transport.AppendEntries(s.addr, args, res)
+
+		// 确保下面对操作在 Leader 角色下完成
+		select {
+		case <-s.stopCh:
+			return false
+		default:
+		}
 
 		if err != nil {
-			log.Println(fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err))
-			return
+			log.Println(fmt.Errorf("调用rpc服务失败：%s%w\n", s.addr, err))
+			return false
 		}
 		if res.term > rf.hardState.currentTerm() && !rf.becomeFollower(Leader, res.term) {
 			// 如果任期数小，降级为 Follower
-			return
+			return false
 		}
 		if res.success {
-			return
+			return true
 		}
 
-		// 确保下面对操作在 Leader 角色下完成
-		lock := rf.roleState.lock(Leader)
-		if !lock {
-			return
-		}
 		conflictStartIndex := res.conflictStartIndex
 		// Follower 日志是空的，则 nextIndex 置为 1
 		if conflictStartIndex <= 0 {
@@ -687,24 +698,23 @@ func (rf *raft) findCorrectNextIndex(id NodeId, addr NodeAddr) {
 		}
 
 		// 向前继续查找 Follower 缺少的第一条日志的索引
-		rl.setNextIndex(id, conflictStartIndex)
-
-		rf.roleState.unlock()
+		rl.setNextIndex(s.id, conflictStartIndex)
 	}
+	return true
 }
 
-func (rf *raft) completeEntries(id NodeId, addr NodeAddr) {
+func (rf *raft) completeEntries(s *followerReplication) {
 
 	rl := rf.leaderState
 	for {
-		if rl.peerNextIndex(id)-1 == rf.lastLogIndex() {
+		if rl.peerNextIndex(s.id)-1 == rf.lastLogIndex() {
 			return
 		}
 		// 缺失的日志太多时，直接发送快照
 		snapshot := rf.snapshotState.getSnapshot()
 		finishCh := make(chan finishMsg)
-		if rl.peerNextIndex(id) <= snapshot.LastIndex {
-			rf.snapshotTo(context.Background(), id, addr, snapshot.Data, finishCh)
+		if rl.peerNextIndex(s.id) <= snapshot.LastIndex {
+			rf.snapshotTo(s.id, s.addr, snapshot.Data, finishCh, make(chan struct{}))
 			msg := <-finishCh
 			if msg.msgType != Success {
 				if msg.msgType == Degrade && rf.becomeFollower(Leader, msg.term) {
@@ -712,27 +722,35 @@ func (rf *raft) completeEntries(id NodeId, addr NodeAddr) {
 				}
 			}
 
-			if rf.roleState.lock(Leader) {
-				rf.leaderState.setMatchAndNextIndex(id, snapshot.LastIndex, snapshot.LastIndex+1)
-				rf.roleState.unlock()
+			select {
+			case <-s.stopCh:
+				return
+			default:
 			}
 
+			rf.leaderState.setMatchAndNextIndex(s.id, snapshot.LastIndex, snapshot.LastIndex+1)
 		}
 
-		prevIndex := rl.peerNextIndex(id) - 1
+		prevIndex := rl.peerNextIndex(s.id) - 1
 		args := AppendEntry{
 			term:         rf.hardState.currentTerm(),
 			leaderId:     rf.peerState.myId(),
 			prevLogIndex: prevIndex,
 			prevLogTerm:  rf.logTerm(prevIndex),
 			leaderCommit: rf.softState.softCommitIndex(),
-			entries:      rf.hardState.logEntries(prevIndex, rl.peerNextIndex(id)),
+			entries:      rf.hardState.logEntries(prevIndex, rl.peerNextIndex(s.id)),
 		}
 		res := &AppendEntryReply{}
-		rpcErr := rf.transport.AppendEntries(addr, args, res)
+		rpcErr := rf.transport.AppendEntries(s.addr, args, res)
+
+		select {
+		case <-s.stopCh:
+			return
+		default:
+		}
 
 		if rpcErr != nil {
-			log.Println(fmt.Errorf("调用rpc服务失败：%s%w\n", addr, rpcErr))
+			log.Println(fmt.Errorf("调用rpc服务失败：%s%w\n", s.addr, rpcErr))
 			return
 		}
 		if res.term > rf.hardState.currentTerm() && rf.becomeFollower(Leader, res.term) {
@@ -741,17 +759,16 @@ func (rf *raft) completeEntries(id NodeId, addr NodeAddr) {
 		}
 
 		// 向后补充
-		if rf.roleState.lock(Leader) {
-			rf.leaderState.setMatchAndNextIndex(id, rl.peerNextIndex(id), rl.peerNextIndex(id)+1)
-			rf.roleState.unlock()
-		}
+		rf.leaderState.setMatchAndNextIndex(s.id, rl.peerNextIndex(s.id), rl.peerNextIndex(s.id)+1)
 	}
 }
 
-func (rf *raft) snapshotTo(ctx context.Context, id NodeId, addr NodeAddr, data []byte, finishCh chan finishMsg) {
+func (rf *raft) snapshotTo(id NodeId, addr NodeAddr, data []byte, finishCh chan finishMsg, stopCh chan struct{}) {
 	var msg finishMsg
 	defer func() {
-		if _, ok := <-ctx.Done(); !ok {
+		select {
+		case <-stopCh:
+		default:
 			finishCh <- msg
 		}
 	}()
