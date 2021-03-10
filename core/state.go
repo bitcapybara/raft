@@ -347,7 +347,9 @@ type followerReplication struct {
 	addr       NodeAddr      // 节点地址
 	nextIndex  int           // 下一次要发送给各节点的日志索引。由 Leader 维护，初始值为 Leader 最后一个日志的索引 + 1
 	matchIndex int           // 已经复制到各节点的最大的日志索引。由 Leader 维护，初始值为0
-	stepDownCh chan int // 通知主线程降级
+	rpcBusy    bool          // 是否正在通信
+	mu         sync.Mutex    // 锁
+	stepDownCh chan int      // 通知主线程降级
 	stopCh     chan struct{} // 接收主线程发来的降级通知
 	triggerCh  chan struct{} // 触发复制请求
 }
@@ -358,37 +360,41 @@ type LeaderState struct {
 	followerState map[NodeId]*followerReplication
 }
 
-func newLeaderState() *LeaderState {
-	return &LeaderState{
-	}
-}
-
-func (st *LeaderState) peerMatchIndex(id NodeId) int {
-	panic("")
+func (st *LeaderState) matchIndex(id NodeId) int {
+	st.followerState[id].mu.Lock()
+	defer st.followerState[id].mu.Unlock()
+	return st.followerState[id].matchIndex
 }
 
 func (st *LeaderState) setMatchAndNextIndex(id NodeId, matchIndex, nextIndex int) {
-	panic("")
+	st.followerState[id].mu.Lock()
+	defer st.followerState[id].mu.Unlock()
+	st.followerState[id].matchIndex = matchIndex
+	st.followerState[id].nextIndex = nextIndex
 }
 
-func (st *LeaderState) peerNextIndex(id NodeId) int {
-	panic("")
+func (st *LeaderState) nextIndex(id NodeId) int {
+	st.followerState[id].mu.Lock()
+	defer st.followerState[id].mu.Unlock()
+	return st.followerState[id].nextIndex
 }
 
 func (st *LeaderState) setNextIndex(id NodeId, index int) {
-	panic("")
-}
-
-func (st *LeaderState) initNotifier(id NodeId) {
-	panic("")
+	st.followerState[id].mu.Lock()
+	defer st.followerState[id].mu.Unlock()
+	st.followerState[id].nextIndex = index
 }
 
 func (st *LeaderState) setRpcBusy(id NodeId, enable bool) {
-	panic("")
+	st.followerState[id].mu.Lock()
+	defer st.followerState[id].mu.Unlock()
+	st.followerState[id].rpcBusy = enable
 }
 
 func (st *LeaderState) isRpcBusy(id NodeId) bool {
-	panic("")
+	st.followerState[id].mu.Lock()
+	defer st.followerState[id].mu.Unlock()
+	return st.followerState[id].rpcBusy
 }
 
 // ==================== timerState ====================

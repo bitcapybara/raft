@@ -55,7 +55,7 @@ func newRaft(config Config) *raft {
 		hardState:     &hardState,
 		softState:     newSoftState(),
 		peerState:     newPeerState(config.Peers, config.Me),
-		leaderState:   newLeaderState(),
+		leaderState:   nil,
 		timerState:    newTimerState(config),
 		snapshotState: newSnapshotState(config),
 	}
@@ -300,7 +300,9 @@ func (rf *raft) runReplication() {
 				case <-st.stopCh:
 					return
 				case <-st.triggerCh:
+					rf.leaderState.setRpcBusy(st.id, true)
 					rf.replicate(st)
+					rf.leaderState.setRpcBusy(st.id, false)
 				}
 			}
 		}()
@@ -596,7 +598,7 @@ func (rf *raft) replicationTo(id NodeId, finishCH chan finishMsg, stopCh chan st
 
 	// 发起 RPC 调用
 	addr := rf.peerState.peersMap()[id]
-	prevIndex := rf.leaderState.peerNextIndex(id) - 1
+	prevIndex := rf.leaderState.nextIndex(id) - 1
 	var entries []Entry
 	if withEntry {
 		entries = rf.hardState.logEntries(rf.hardState.lastEntryIndex(), rf.hardState.logLength())
@@ -647,14 +649,14 @@ func (rf *raft) replicate(s *followerReplication) {
 
 func (rf *raft) findCorrectNextIndex(s *followerReplication) bool {
 	rl := rf.leaderState
-	peerNextIndex := rl.peerNextIndex(s.id)
+	peerNextIndex := rl.nextIndex(s.id)
 
 	for peerNextIndex >= 0 {
-		prevIndex := rl.peerNextIndex(s.id) - 1
+		prevIndex := rl.nextIndex(s.id) - 1
 
 		// 找到匹配点之前，发送空日志节省带宽
 		var entries []Entry
-		if rl.peerMatchIndex(s.id) == prevIndex {
+		if rl.matchIndex(s.id) == prevIndex {
 			rf.hardState.logEntries(prevIndex, prevIndex+1)
 		}
 		args := AppendEntry{
@@ -707,13 +709,13 @@ func (rf *raft) completeEntries(s *followerReplication) {
 
 	rl := rf.leaderState
 	for {
-		if rl.peerNextIndex(s.id)-1 == rf.lastLogIndex() {
+		if rl.nextIndex(s.id)-1 == rf.lastLogIndex() {
 			return
 		}
 		// 缺失的日志太多时，直接发送快照
 		snapshot := rf.snapshotState.getSnapshot()
 		finishCh := make(chan finishMsg)
-		if rl.peerNextIndex(s.id) <= snapshot.LastIndex {
+		if rl.nextIndex(s.id) <= snapshot.LastIndex {
 			rf.snapshotTo(s.id, s.addr, snapshot.Data, finishCh, make(chan struct{}))
 			msg := <-finishCh
 			if msg.msgType != Success {
@@ -731,14 +733,14 @@ func (rf *raft) completeEntries(s *followerReplication) {
 			rf.leaderState.setMatchAndNextIndex(s.id, snapshot.LastIndex, snapshot.LastIndex+1)
 		}
 
-		prevIndex := rl.peerNextIndex(s.id) - 1
+		prevIndex := rl.nextIndex(s.id) - 1
 		args := AppendEntry{
 			term:         rf.hardState.currentTerm(),
 			leaderId:     rf.peerState.myId(),
 			prevLogIndex: prevIndex,
 			prevLogTerm:  rf.logTerm(prevIndex),
 			leaderCommit: rf.softState.softCommitIndex(),
-			entries:      rf.hardState.logEntries(prevIndex, rl.peerNextIndex(s.id)),
+			entries:      rf.hardState.logEntries(prevIndex, rl.nextIndex(s.id)),
 		}
 		res := &AppendEntryReply{}
 		rpcErr := rf.transport.AppendEntries(s.addr, args, res)
@@ -759,7 +761,7 @@ func (rf *raft) completeEntries(s *followerReplication) {
 		}
 
 		// 向后补充
-		rf.leaderState.setMatchAndNextIndex(s.id, rl.peerNextIndex(s.id), rl.peerNextIndex(s.id)+1)
+		rf.leaderState.setMatchAndNextIndex(s.id, rl.nextIndex(s.id), rl.nextIndex(s.id)+1)
 	}
 }
 
@@ -860,11 +862,6 @@ func (rf *raft) becomeLeader() bool {
 		defer rf.roleState.unlock()
 
 		rf.peerState.setLeader(rf.peerState.myId())
-		for id := range rf.peerState.peersMap() {
-			// 初始化保存的各节点状态
-			rf.leaderState.setMatchAndNextIndex(id, 0, rf.lastLogIndex()+1)
-			rf.leaderState.initNotifier(id)
-		}
 		return true
 	}
 	return false
@@ -951,7 +948,7 @@ func (rf *raft) updateLeaderCommit() error {
 	peers := rf.peerState.peersMap()
 	//
 	for id := range peers {
-		indexCnt[rf.leaderState.peerMatchIndex(id)] = 1
+		indexCnt[rf.leaderState.matchIndex(id)] = 1
 	}
 
 	// 计算出多少个节点有相同的 matchIndex 值
