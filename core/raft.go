@@ -521,7 +521,7 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 	}
 
 	// Leader 先将日志添加到内存
-	addEntryErr := rf.addEntry(Entry{Term: rf.hardState.currentTerm(), Data: args.data})
+	addEntryErr := rf.addEntry(Entry{Term: rf.hardState.currentTerm(), Type: EntryNormal, Data: args.data})
 	if addEntryErr != nil {
 		reply.err = fmt.Errorf("leader 添加客户端日志失败：%w", addEntryErr)
 		return
