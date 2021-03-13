@@ -308,7 +308,6 @@ func (rf *raft) runReplication() {
 			for {
 				select {
 				case <-st.stopCh:
-					// todo rf.isLeader() == false 或 followerReplication 节点被移除
 					return
 				case <-st.triggerCh:
 					rf.leaderState.setRpcBusy(st.id, true)
@@ -404,7 +403,6 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 		// ========== 接收心跳 ==========
 		rf.peerState.setLeader(args.leaderId)
 		res.term = rf.hardState.currentTerm()
-		res.success = true
 
 		// 更新提交索引
 		leaderCommit := args.leaderCommit
@@ -412,18 +410,28 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 			var err error
 			if leaderCommit >= newEntryIndex {
 				rf.softState.setCommitIndex(newEntryIndex)
-				err = rf.applyFsm()
 			} else {
 				rf.softState.setCommitIndex(leaderCommit)
-				err = rf.applyFsm()
 			}
-			reply.err = err
+			applyErr := rf.applyFsm()
+			if applyErr != nil {
+				reply.err = err
+				res.success = false
+			} else {
+				res.success = true
+			}
 		}
 		return
 	}
 
 	if args.entryType == EntryChangeConf {
-		// todo 接收到成员变更请求
+		configData := args.entries[0].Data
+		peerErr := rf.peerState.replacePeersWithBytes(configData)
+		if peerErr != nil {
+			reply.err = peerErr
+			res.success = false
+		}
+		res.success = true
 	}
 }
 
@@ -659,9 +667,7 @@ func (rf *raft) sendConfiguration(oldNewPeers map[NodeId]NodeAddr, msg rpc) bool
 			continue
 		}
 		// 发送日志
-		go func() {
-			// todo
-		}()
+		go rf.replicationTo(id, finishCh, stopCh, EntryChangeConf)
 	}
 
 	count := 1
@@ -712,13 +718,11 @@ func (rf *raft) sendSnapshot(bytes []byte) {
 }
 
 // Leader 给某个节点发送心跳/日志
-func (rf *raft) replicationTo(id NodeId, finishCH chan finishMsg, stopCh chan struct{}, entryType EntryType) {
+func (rf *raft) replicationTo(id NodeId, finishCh chan finishMsg, stopCh chan struct{}, entryType EntryType) {
 	var msg finishMsg
 	defer func() {
-		rf.leaderState.setRpcBusy(id, false)
-
 		if _, ok := <-stopCh; !ok {
-			finishCH <- msg
+			finishCh <- msg
 		}
 	}()
 
@@ -726,7 +730,7 @@ func (rf *raft) replicationTo(id NodeId, finishCH chan finishMsg, stopCh chan st
 	addr := rf.peerState.peers()[id]
 	prevIndex := rf.leaderState.nextIndex(id) - 1
 	var entries []Entry
-	if entryType == EntryReplicate || entryType == EntryChangeConf {
+	if entryType != EntryHeartbeat {
 		entries = rf.hardState.logEntries(rf.hardState.lastEntryIndex(), rf.hardState.logLength())
 	}
 	args := AppendEntry{

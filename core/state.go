@@ -312,29 +312,6 @@ func (st *PeerState) peers() map[NodeId]NodeAddr {
 	return st.peersMap
 }
 
-func (st *PeerState) appendPeers(peers map[NodeId]NodeAddr) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	for id, addr := range peers {
-		st.peersMap[id] = addr
-	}
-}
-
-func (st *PeerState) appendPeersWithBytes(from []byte) error {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	// 	获取新节点集
-	peers, err := decodePeersMap(from)
-	if err != nil {
-		return err
-	}
-	// 安装新节点
-	for id, addr := range peers {
-		st.peersMap[id] = addr
-	}
-	return nil
-}
-
 func (st *PeerState) replacePeers(peers map[NodeId]NodeAddr) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -351,6 +328,17 @@ func (st *PeerState) replacePeersWithBytes(from []byte) error {
 	}
 	st.peersMap = peers
 	return nil
+}
+
+func decodePeersMap(from []byte) (map[NodeId]NodeAddr, error) {
+	var peers map[NodeId]NodeAddr
+	decoder := gob.NewDecoder(bytes.NewBuffer(from))
+	err := decoder.Decode(&peers)
+	if err != nil {
+		return nil, err
+	} else {
+		return peers, nil
+	}
 }
 
 func (st *PeerState) peersCnt() int {
@@ -389,17 +377,6 @@ func (st *PeerState) getLeader() server {
 	return server{
 		id:   st.leader,
 		addr: st.peersMap[st.leader],
-	}
-}
-
-func decodePeersMap(from []byte) (map[NodeId]NodeAddr, error) {
-	var peers map[NodeId]NodeAddr
-	decoder := gob.NewDecoder(bytes.NewBuffer(from))
-	err := decoder.Decode(&peers)
-	if err != nil {
-		return nil, err
-	} else {
-		return peers, nil
 	}
 }
 
