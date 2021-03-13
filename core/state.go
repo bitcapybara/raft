@@ -1,6 +1,8 @@
 package core
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"log"
 	"math/rand"
@@ -64,8 +66,9 @@ func (st *RoleState) unlock() {
 type EntryType uint8
 
 const (
-	EntryNormal EntryType = iota
-	EntryConfChange
+	EntryReplicate EntryType = iota
+	EntryChangeConf
+	EntryHeartbeat
 )
 
 // 日志条目
@@ -278,17 +281,17 @@ func (st *SoftState) softLastApplied() int {
 
 // 对等节点状态和路由表
 type PeerState struct {
-	peers  map[NodeId]NodeAddr // 所有节点
-	me     NodeId              // 当前节点在 peers 中的索引
-	leader NodeId              // 当前 leader 在 peers 中的索引
-	mu     sync.Mutex
+	peersMap map[NodeId]NodeAddr // 所有节点
+	me       NodeId              // 当前节点在 peersMap 中的索引
+	leader   NodeId              // 当前 leader 在 peersMap 中的索引
+	mu       sync.Mutex
 }
 
 func newPeerState(peers map[NodeId]NodeAddr, me NodeId) *PeerState {
 	return &PeerState{
-		peers:  peers,
-		me:     me,
-		leader: "",
+		peersMap: peers,
+		me:       me,
+		leader:   "",
 	}
 }
 
@@ -301,18 +304,59 @@ func (st *PeerState) leaderIsMe() bool {
 func (st *PeerState) majority() int {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	return len(st.peers)/2 + 1
+	return len(st.peersMap)/2 + 1
 }
-func (st *PeerState) peersMap() map[NodeId]NodeAddr {
+func (st *PeerState) peers() map[NodeId]NodeAddr {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	return st.peers
+	return st.peersMap
+}
+
+func (st *PeerState) appendPeers(peers map[NodeId]NodeAddr) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for id, addr := range peers {
+		st.peersMap[id] = addr
+	}
+}
+
+func (st *PeerState) appendPeersWithBytes(from []byte) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	// 	获取新节点集
+	peers, err := decodePeersMap(from)
+	if err != nil {
+		return err
+	}
+	// 安装新节点
+	for id, addr := range peers {
+		st.peersMap[id] = addr
+	}
+	return nil
+}
+
+func (st *PeerState) replacePeers(peers map[NodeId]NodeAddr) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.peersMap = peers
+}
+
+func (st *PeerState) replacePeersWithBytes(from []byte) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	// 	获取新节点集
+	peers, err := decodePeersMap(from)
+	if err != nil {
+		return err
+	}
+	st.peersMap = peers
+	return nil
 }
 
 func (st *PeerState) peersCnt() int {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	return len(st.peers)
+	return len(st.peersMap)
 }
 
 func (st *PeerState) isMe(id NodeId) bool {
@@ -344,7 +388,18 @@ func (st *PeerState) getLeader() server {
 	defer st.mu.Unlock()
 	return server{
 		id:   st.leader,
-		addr: st.peers[st.leader],
+		addr: st.peersMap[st.leader],
+	}
+}
+
+func decodePeersMap(from []byte) (map[NodeId]NodeAddr, error) {
+	var peers map[NodeId]NodeAddr
+	decoder := gob.NewDecoder(bytes.NewBuffer(from))
+	err := decoder.Decode(&peers)
+	if err != nil {
+		return nil, err
+	} else {
+		return peers, nil
 	}
 }
 
@@ -365,7 +420,7 @@ type followerReplication struct {
 // 节点是 Leader 时，保存在内存中的状态
 type LeaderState struct {
 	stepDownCh    chan int
-	followerState map[NodeId]*followerReplication
+	followerState map[NodeId]*followerReplication // todo 配置变更后，需要清空
 }
 
 func (st *LeaderState) matchIndex(id NodeId) int {
@@ -403,6 +458,10 @@ func (st *LeaderState) isRpcBusy(id NodeId) bool {
 	st.followerState[id].mu.Lock()
 	defer st.followerState[id].mu.Unlock()
 	return st.followerState[id].rpcBusy
+}
+
+func (st *LeaderState) followers() map[NodeId]*followerReplication {
+	return st.followerState
 }
 
 // ==================== timerState ====================

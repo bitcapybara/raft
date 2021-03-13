@@ -6,8 +6,3 @@
 * 接收到网络请求后，需要调用Node的相应方法执行逻辑
 * RaftPersister 持久化 raft 的状态信息
 * SnapshotPersister 持久化快照数据
-
-### TODO
-* leader transfer
-* pre-vote
-* joint consensus

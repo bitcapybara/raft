@@ -54,23 +54,23 @@ func (nd *Node) InstallSnapshot(args InstallSnapshot, res *InstallSnapshotReply)
 }
 
 // Leader 开放的 rpc 接口，由客户端调用
-func (nd *Node) ApplyCommand(args ClientApply, res *ClientApplyReply) error {
-	if msg := nd.sendRpc(ClientApplyRpc, args); msg.err != nil {
+func (nd *Node) ApplyCommand(args ApplyCommand, res *ApplyCommandReply) error {
+	if msg := nd.sendRpc(ApplyCommandRpc, args); msg.err != nil {
 		return msg.err
 	} else {
-		*res = msg.res.(ClientApplyReply)
+		*res = msg.res.(ApplyCommandReply)
 		return nil
 	}
 }
 
-// Leader 开放的 rpc 接口，由客户端调用，添加新节点
-func (nd *Node) AddServer(args AddServer, res *AddServerReply) error {
-	return nd.raft.handleServerAdd(args, res)
-}
-
-// Leader 开放的 rpc 接口，由客户端调用，移除旧节点
-func (nd *Node) RemoveServer(args RemoveServer, res *RemoveServerReply) error {
-	return nd.raft.handleServerRemove(args, res)
+// Leader 开放的 rpc 接口，由客户端调用，添加新配置
+func (nd *Node) ChangeConfig(args ChangeConfig, res *ChangeConfigReply) error {
+	if msg := nd.sendRpc(ChangeConfigRpc, args); msg.err != nil {
+		return msg.err
+	} else {
+		*res = msg.res.(ChangeConfigReply)
+		return nil
+	}
 }
 
 func (nd *Node) sendRpc(rpcType rpcType, args interface{}) rpcReply {

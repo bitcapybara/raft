@@ -10,13 +10,15 @@ const (
 	// 来自 Leader 的安装快照请求
 	InstallSnapshotRpc
 	// 来自客户端的安装命令请求
-	ClientApplyRpc
+	ApplyCommandRpc
+	// 来自客户端的成员变更请求
+	ChangeConfigRpc
 )
 
 type rpc struct {
 	rpcType rpcType
-	req interface{}
-	res chan rpcReply
+	req     interface{}
+	res     chan rpcReply
 }
 
 type rpcReply struct {
@@ -27,12 +29,13 @@ type rpcReply struct {
 // ==================== AppendEntry ====================
 
 type AppendEntry struct {
-	term         int     // 当前时刻所属任期
-	leaderId     NodeId  // 领导者的地址，方便 follower 重定向
-	prevLogIndex int     // 要发送的日志条目的前一个条目的索引
-	prevLogTerm  int     // prevLogIndex 条目所处任期
-	leaderCommit int     // Leader 提交的索引
-	entries      []Entry // 日志条目（心跳为空；todo 为提高效率可能发送多个）
+	entryType    EntryType // 载荷的条目类型
+	term         int       // 当前时刻所属任期
+	leaderId     NodeId    // 领导者的地址，方便 follower 重定向
+	prevLogIndex int       // 要发送的日志条目的前一个条目的索引
+	prevLogTerm  int       // prevLogIndex 条目所处任期
+	leaderCommit int       // Leader 提交的索引
+	entries      []Entry   // 日志条目（心跳为空；todo 为提高效率可能发送多个）
 }
 
 type AppendEntryReply struct {
@@ -72,7 +75,7 @@ type InstallSnapshotReply struct {
 	term int // 接收的 Follower 的当前 term
 }
 
-// ==================== ClientApply ====================
+// ==================== ApplyCommand ====================
 
 type status uint8
 
@@ -87,33 +90,21 @@ type server struct {
 	addr NodeAddr
 }
 
-type ClientApply struct {
+type ApplyCommand struct {
 	data []byte // 客户端请求应用到状态机的数据
 }
 
-type ClientApplyReply struct {
-	status   status // 客户端请求的是 Leader 节点时，返回 true
+type ApplyCommandReply struct {
+	status status // 客户端请求的是 Leader 节点时，返回 true
 	leader server // 客户端请求的不是 Leader 节点时，返回 LeaderId
 }
 
-// ==================== addServer ====================
+// ==================== changeConfig ====================
 
-type AddServer struct {
-	newServer server
+type ChangeConfig struct {
+	peers map[NodeId]NodeAddr
 }
 
-type AddServerReply struct {
-	status   status
-	leader server
-}
-
-// ==================== removeServer ====================
-
-type RemoveServer struct {
-	oldServer server
-}
-
-type RemoveServerReply struct {
+type ChangeConfigReply struct {
 	status status
-	leader server
 }
