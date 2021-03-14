@@ -111,6 +111,8 @@ func (rf *raft) runLeader() {
 				rf.handleClientCmd(msg)
 			case ChangeConfigRpc:
 				rf.handleConfiguration(msg)
+			case TransferLeadershipRpc:
+				rf.handleTransfer(msg)
 			}
 		case <-rf.timerState.tick():
 			stopCh := make(chan struct{})
@@ -526,6 +528,10 @@ func (rf *raft) handleSnapshot(rpcMsg rpc) {
 	}
 
 	rf.hardState.clearEntries()
+}
+
+func (rf *raft) handleTransfer(msg rpc) {
+
 }
 
 // 处理客户端请求

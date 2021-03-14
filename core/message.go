@@ -2,29 +2,40 @@ package core
 
 type rpcType uint8
 
+// 日志类型
+type EntryType uint8
+
 const (
-	// 来自 Leader 的日志复制请求
-	AppendEntryRpc rpcType = iota
-	// 来自 Candidate 的投票请求
-	RequestVoteRpc
-	// 来自 Leader 的安装快照请求
-	InstallSnapshotRpc
-	// 来自客户端的安装命令请求
-	ApplyCommandRpc
-	// 来自客户端的成员变更请求
-	ChangeConfigRpc
+	EntryReplicate EntryType = iota
+	EntryChangeConf
+	EntryHeartbeat
+	EntryTimeoutNow
 )
 
-type rpc struct {
-	rpcType rpcType
-	req     interface{}
-	res     chan rpcReply
+// 日志条目
+type Entry struct {
+	Index int       // 此条目的逻辑索引， 从 1 开始
+	Term  int       // 日志项所在term
+	Type  EntryType // 日志类型
+	Data  []byte    // 状态机命令
 }
 
-type rpcReply struct {
-	res interface{}
-	err error
+type status uint8
+
+const (
+	OK status = iota
+	NotLeader
+	Timeout
+)
+
+type server struct {
+	id   NodeId
+	addr NodeAddr
 }
+
+type NodeId string
+
+type NodeAddr string
 
 // ==================== AppendEntry ====================
 
@@ -77,19 +88,6 @@ type InstallSnapshotReply struct {
 
 // ==================== ApplyCommand ====================
 
-type status uint8
-
-const (
-	OK status = iota
-	NotLeader
-	Timeout
-)
-
-type server struct {
-	id   NodeId
-	addr NodeAddr
-}
-
 type ApplyCommand struct {
 	data []byte // 客户端请求应用到状态机的数据
 }
@@ -99,12 +97,22 @@ type ApplyCommandReply struct {
 	leader server // 客户端请求的不是 Leader 节点时，返回 LeaderId
 }
 
-// ==================== changeConfig ====================
+// ==================== ChangeConfig ====================
 
 type ChangeConfig struct {
-	peers map[NodeId]NodeAddr
+	peers map[NodeId]NodeAddr // 新配置的集群各节点
 }
 
 type ChangeConfigReply struct {
+	status status // 配置变更结果
+}
+
+// ==================== TransferLeadership ====================
+
+type TransferLeadership struct {
+	peer []server
+}
+
+type TransferLeadershipReply struct {
 	status status
 }

@@ -63,26 +63,6 @@ func (st *RoleState) unlock() {
 
 // ==================== HardState ====================
 
-type EntryType uint8
-
-const (
-	EntryReplicate EntryType = iota
-	EntryChangeConf
-	EntryHeartbeat
-)
-
-// 日志条目
-type Entry struct {
-	Index int       // 此条目的逻辑索引， 从 1 开始
-	Term  int       // 日志项所在term
-	Type  EntryType // 日志类型
-	Data  []byte    // 状态机命令
-}
-
-type NodeId string
-
-type NodeAddr string
-
 // 需要持久化存储的状态
 type HardState struct {
 	term      int                // 当前时刻所处的 term

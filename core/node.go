@@ -1,5 +1,31 @@
 package core
 
+const (
+	// 来自 Leader 的日志复制请求
+	AppendEntryRpc rpcType = iota
+	// 来自 Candidate 的投票请求
+	RequestVoteRpc
+	// 来自 Leader 的安装快照请求
+	InstallSnapshotRpc
+	// 来自客户端的安装命令请求
+	ApplyCommandRpc
+	// 来自客户端的成员变更请求
+	ChangeConfigRpc
+	// 来自客户端的领导权转移请求
+	TransferLeadershipRpc
+)
+
+type rpc struct {
+	rpcType rpcType
+	req     interface{}
+	res     chan rpcReply
+}
+
+type rpcReply struct {
+	res interface{}
+	err error
+}
+
 // 代表了一个当前节点
 type Node struct {
 	raft   *raft
@@ -69,6 +95,16 @@ func (nd *Node) ChangeConfig(args ChangeConfig, res *ChangeConfigReply) error {
 		return msg.err
 	} else {
 		*res = msg.res.(ChangeConfigReply)
+		return nil
+	}
+}
+
+// Leader 开放的 rpc 接口，由客户端调用，转移领导权
+func (nd *Node) TransferLeadership(args TransferLeadership, res *TransferLeadershipReply) error {
+	if msg := nd.sendRpc(TransferLeadershipRpc, args); msg.err != nil {
+		return msg.err
+	} else {
+		*res = msg.res.(TransferLeadershipReply)
 		return nil
 	}
 }
