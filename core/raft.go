@@ -170,7 +170,10 @@ func (rf *raft) runCandidate() {
 			case RequestVoteRpc:
 				rf.handleVoteReq(msg)
 			}
-		case msg := <-finishCh:
+		case msg, ok := <-finishCh:
+			if !ok {
+				return
+			}
 			// 降级
 			if msg.msgType == Degrade && rf.becomeFollower(Candidate, msg.term) {
 				return
@@ -230,6 +233,24 @@ func (rf *raft) heartbeat(stopCh chan struct{}) <-chan finishMsg {
 // Candidate / Follower 开启新一轮选举
 func (rf *raft) election(stopCh chan struct{}) <-chan finishMsg {
 
+	// pre-vote
+	preVoteFinishCh := rf.sendRequestVote(stopCh)
+	defer close(preVoteFinishCh)
+
+	if !rf.waitRpcResult(preVoteFinishCh) {
+		return preVoteFinishCh
+	}
+
+	// 增加 term 数
+	err := rf.hardState.termAddAndVote(1, rf.peerState.myId())
+	if err != nil {
+		log.Println(err)
+	}
+
+	return rf.sendRequestVote(stopCh)
+}
+
+func (rf *raft) sendRequestVote(stopCh <-chan struct{}) chan finishMsg {
 	// 发送 RV 请求
 	finishCh := make(chan finishMsg)
 
@@ -279,7 +300,7 @@ func (rf *raft) election(stopCh chan struct{}) <-chan finishMsg {
 }
 
 // msgCh 日志复制协程 -> 主协程，通知协程的任务完成
-func (rf *raft) waitRpcResult(finishCh chan finishMsg) bool {
+func (rf *raft) waitRpcResult(finishCh <-chan finishMsg) bool {
 	count := 1
 	successCnt := 1
 	for msg := range finishCh {
@@ -657,6 +678,8 @@ func (rf *raft) handleConfiguration(msg rpc) {
 		return
 	}
 
+	// todo 刚通过成员变更加入集群的新节点，只有 C(old,new) 和 C(new) 两条日志，需要进行追赶
+
 	// 清理 followerReplication
 	peers := rf.peerState.peers()
 	// 如果当前节点被移除，退出程序
@@ -685,30 +708,28 @@ func (rf *raft) checkTransfer(id NodeId) {
 		}
 		if rf.leaderState.matchIndex(id) == rf.lastLogIndex() {
 			// 目标节点日志已是最新，发送 timeoutNow 消息
-			rf.sendTimeoutNow(rf.peerState.peers()[id])
+			args := AppendEntry{entryType: EntryTimeoutNow}
+			res := &AppendEntryReply{}
+			err := rf.transport.AppendEntries(rf.peerState.peers()[id], args, res)
+			reply := rf.leaderState.transfer.reply
+			if err != nil {
+				reply <- rpcReply{err: err}
+				return
+			}
+			term := rf.hardState.currentTerm()
+			if res.term > term {
+				term = res.term
+				reply <- rpcReply{err: fmt.Errorf("term 落后，角色降级")}
+			} else {
+				reply <- rpcReply{res: res}
+			}
+			rf.becomeFollower(Leader, term)
 			rf.leaderState.setTransferBusy(None)
 		} else {
 			// 目标节点不是最新，开始日志复制
 			rf.leaderState.followerState[id].triggerCh <- struct{}{}
 		}
 	}
-}
-
-func (rf *raft) sendTimeoutNow(addr NodeAddr) {
-	args := AppendEntry{entryType: EntryTimeoutNow}
-	res := &AppendEntryReply{}
-	err := rf.transport.AppendEntries(addr, args, res)
-	reply := rf.leaderState.transfer.reply
-	if err != nil {
-		reply <- rpcReply{err: err}
-		return
-	}
-	if res.term > rf.hardState.currentTerm() {
-		rf.becomeFollower(Leader, res.term)
-		reply <- rpcReply{err: fmt.Errorf("term 落后，角色降级")}
-		return
-	}
-	reply <- rpcReply{res: res}
 }
 
 func (rf *raft) sendConfiguration(oldNewPeers map[NodeId]NodeAddr, msg rpc) bool {
@@ -1050,13 +1071,6 @@ func (rf *raft) becomeLeader() bool {
 func (rf *raft) becomeCandidate() bool {
 	// 重置选举计时器
 	rf.timerState.setElectionTimer()
-
-	// 增加 term 数
-	err := rf.hardState.termAddAndVote(1, rf.peerState.myId())
-	if err != nil {
-		log.Println(err)
-		return false
-	}
 	// 角色置为候选者
 	rf.setRoleStage(Candidate)
 	return true
