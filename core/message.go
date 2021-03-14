@@ -35,6 +35,8 @@ type server struct {
 
 type NodeId string
 
+const None NodeId = ""
+
 type NodeAddr string
 
 // ==================== AppendEntry ====================
@@ -110,7 +112,7 @@ type ChangeConfigReply struct {
 // ==================== TransferLeadership ====================
 
 type TransferLeadership struct {
-	peer []server
+	transferee server
 }
 
 type TransferLeadershipReply struct {

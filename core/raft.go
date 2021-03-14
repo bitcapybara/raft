@@ -5,6 +5,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"log"
+	"time"
 )
 
 type finishMsgType uint8
@@ -31,8 +32,8 @@ type raft struct {
 	timerState    *timerState    // 计时器状态
 	snapshotState *snapshotState // 快照状态
 
-	rpcCh  chan rpc      // 主线程接收 rpc 消息
-	exitCh chan struct{} // 当前节点离开节点，退出程序
+	rpcCh          chan rpc      // 主线程接收 rpc 消息
+	exitCh         chan struct{} // 当前节点离开节点，退出程序
 }
 
 func newRaft(config Config) *raft {
@@ -102,17 +103,22 @@ func (rf *raft) runLeader() {
 	for rf.roleState.getRoleStage() == Leader {
 		select {
 		case msg := <-rf.rpcCh:
-			switch msg.rpcType {
-			case AppendEntryRpc:
-				rf.handleCommand(msg)
-			case RequestVoteRpc:
-				rf.handleVoteReq(msg)
-			case ApplyCommandRpc:
-				rf.handleClientCmd(msg)
-			case ChangeConfigRpc:
-				rf.handleConfiguration(msg)
-			case TransferLeadershipRpc:
-				rf.handleTransfer(msg)
+			if transfereeId, busy :=rf.leaderState.isTransferBusy(); busy {
+				// 如果正在进行
+				rf.checkTransfer(transfereeId)
+			} else {
+				switch msg.rpcType {
+				case AppendEntryRpc:
+					rf.handleCommand(msg)
+				case RequestVoteRpc:
+					rf.handleVoteReq(msg)
+				case ApplyCommandRpc:
+					rf.handleClientCmd(msg)
+				case ChangeConfigRpc:
+					rf.handleConfiguration(msg)
+				case TransferLeadershipRpc:
+					rf.handleTransfer(msg)
+				}
 			}
 		case <-rf.timerState.tick():
 			stopCh := make(chan struct{})
@@ -130,6 +136,10 @@ func (rf *raft) runLeader() {
 				}
 			}
 			close(stopCh)
+		case id := <-rf.leaderState.done:
+			if transfereeId, busy :=rf.leaderState.isTransferBusy(); busy && transfereeId == id {
+				rf.checkTransfer(transfereeId)
+			}
 		case msg := <-rf.leaderState.stepDownCh:
 			// 接收到降级消息
 			if rf.becomeFollower(Leader, msg) {
@@ -312,9 +322,11 @@ func (rf *raft) runReplication() {
 				case <-st.stopCh:
 					return
 				case <-st.triggerCh:
-					rf.leaderState.setRpcBusy(st.id, true)
-					rf.replicate(st)
-					rf.leaderState.setRpcBusy(st.id, false)
+					func() {
+						rf.leaderState.setRpcBusy(st.id, true)
+						defer rf.leaderState.setRpcBusy(st.id, false)
+						rf.replicate(st)
+					}()
 				}
 			}
 		}()
@@ -434,6 +446,11 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 			res.success = false
 		}
 		res.success = true
+		return
+	}
+
+	if args.entryType == EntryTimeoutNow {
+		rf.becomeCandidate()
 	}
 }
 
@@ -530,8 +547,18 @@ func (rf *raft) handleSnapshot(rpcMsg rpc) {
 	rf.hardState.clearEntries()
 }
 
-func (rf *raft) handleTransfer(msg rpc) {
+// 处理领导权转移请求
+// todo 超时设置，time.After(electionTimeout)
+func (rf *raft) handleTransfer(rpcMsg rpc) {
+	// 先发送一次心跳，刷新计时器，以及
+	args := rpcMsg.req.(TransferLeadership)
+	timer := time.NewTimer(rf.timerState.minElectionTimeout())
+	// 设置定时器和rpc应答通道
+	rf.leaderState.setTransferBusy(args.transferee.id)
+	rf.leaderState.setTransferState(timer, rpcMsg.res)
 
+	// 查看目标节点日志是否最新
+	rf.checkTransfer(args.transferee.id)
 }
 
 // 处理客户端请求
@@ -647,6 +674,43 @@ func (rf *raft) handleConfiguration(msg rpc) {
 	}
 }
 
+func (rf *raft) checkTransfer(id NodeId) {
+	select {
+	case <-rf.leaderState.transfer.timer.C:
+		rf.leaderState.setTransferBusy(None)
+	default:
+		if rf.leaderState.isRpcBusy(id) {
+			// 若目标节点正在复制日志，则继续等待
+			return
+		}
+		if rf.leaderState.matchIndex(id) == rf.lastLogIndex() {
+			// 目标节点日志已是最新，发送 timeoutNow 消息
+			rf.sendTimeoutNow(rf.peerState.peers()[id])
+			rf.leaderState.setTransferBusy(None)
+		} else {
+			// 目标节点不是最新，开始日志复制
+			rf.leaderState.followerState[id].triggerCh <- struct{}{}
+		}
+	}
+}
+
+func (rf *raft) sendTimeoutNow(addr NodeAddr) {
+	args := AppendEntry{entryType: EntryTimeoutNow}
+	res := &AppendEntryReply{}
+	err := rf.transport.AppendEntries(addr, args, res)
+	reply := rf.leaderState.transfer.reply
+	if err != nil {
+		reply <- rpcReply{err: err}
+		return
+	}
+	if res.term > rf.hardState.currentTerm() {
+		rf.becomeFollower(Leader, res.term)
+		reply <- rpcReply{err: fmt.Errorf("term 落后，角色降级")}
+		return
+	}
+	reply <- rpcReply{res: res}
+}
+
 func (rf *raft) sendConfiguration(oldNewPeers map[NodeId]NodeAddr, msg rpc) bool {
 	oldNewPeersData, enOldNewErr := encodePeersMap(oldNewPeers)
 	if enOldNewErr != nil {
@@ -676,6 +740,7 @@ func (rf *raft) sendConfiguration(oldNewPeers map[NodeId]NodeAddr, msg rpc) bool
 		go rf.replicationTo(id, finishCh, stopCh, EntryChangeConf)
 	}
 
+	// todo 处于 C(old,new) 状态时，必须收到 C(old) 的 majority 和 C(new) 的 majority 的同意才能提交或选出 leader。
 	count := 1
 	successCnt := 1
 	for result := range finishCh {

@@ -374,10 +374,23 @@ type followerReplication struct {
 	triggerCh  chan struct{} // 触发复制请求
 }
 
+type transfer struct {
+	leadTransferee NodeId          // 如果正在进行所有权转移，转移的目标id
+	timer          *time.Timer     // 领导权转移超时计时器
+	reply          chan<- rpcReply // 领导权转移 rpc 答复
+	mu             sync.Mutex
+}
+
 // 节点是 Leader 时，保存在内存中的状态
 type LeaderState struct {
-	stepDownCh    chan int
-	followerState map[NodeId]*followerReplication // todo 配置变更后，需要清空
+	stepDownCh    chan int                        // 接收降级通知
+	done          chan NodeId                     // 日志复制结束
+	followerState map[NodeId]*followerReplication // 代表了一个复制日志的 follower 节点
+	transfer      transfer                        // 领导权转移状态
+}
+
+func (st *LeaderState) followers() map[NodeId]*followerReplication {
+	return st.followerState
 }
 
 func (st *LeaderState) matchIndex(id NodeId) int {
@@ -417,18 +430,26 @@ func (st *LeaderState) isRpcBusy(id NodeId) bool {
 	return st.followerState[id].rpcBusy
 }
 
-func (st *LeaderState) followers() map[NodeId]*followerReplication {
-	return st.followerState
+func (st *LeaderState) setTransferBusy(id NodeId) {
+	st.transfer.mu.Lock()
+	defer st.transfer.mu.Unlock()
+	st.transfer.leadTransferee = id
+}
+
+func (st *LeaderState) isTransferBusy() (NodeId, bool) {
+	st.transfer.mu.Lock()
+	defer st.transfer.mu.Unlock()
+	return st.transfer.leadTransferee, st.transfer.leadTransferee != None
+}
+
+func (st *LeaderState) setTransferState(timer *time.Timer, reply chan<- rpcReply) {
+	st.transfer.mu.Lock()
+	defer st.transfer.mu.Unlock()
+	st.transfer.timer = timer
+	st.transfer.reply = reply
 }
 
 // ==================== timerState ====================
-
-type timerType uint8
-
-const (
-	Election timerType = iota
-	Heartbeat
-)
 
 type timerState struct {
 	timeoutTimer *time.Timer // 超时计时器
@@ -468,6 +489,10 @@ func (st *timerState) setHeartbeatTimer() {
 func (st *timerState) electionDuration() time.Duration {
 	randTimeout := rand.Intn(st.electionMaxTimeout-st.electionMinTimeout) + st.electionMinTimeout
 	return time.Millisecond * time.Duration(randTimeout)
+}
+
+func (st *timerState) minElectionTimeout() time.Duration {
+	return time.Millisecond * time.Duration(st.electionMinTimeout)
 }
 
 func (st *timerState) heartbeatDuration() time.Duration {
