@@ -362,7 +362,7 @@ func (st *PeerState) getLeader() server {
 
 // ==================== LeaderState ====================
 
-type followerReplication struct {
+type follower struct {
 	id         NodeId        // 节点标识
 	addr       NodeAddr      // 节点地址
 	nextIndex  int           // 下一次要发送给各节点的日志索引。由 Leader 维护，初始值为 Leader 最后一个日志的索引 + 1
@@ -381,15 +381,29 @@ type transfer struct {
 	mu             sync.Mutex
 }
 
-// 节点是 Leader 时，保存在内存中的状态
-type LeaderState struct {
-	stepDownCh    chan int                        // 接收降级通知
-	done          chan NodeId                     // 日志复制结束
-	followerState map[NodeId]*followerReplication // 代表了一个复制日志的 follower 节点
-	transfer      transfer                        // 领导权转移状态
+type configType uint8
+
+const (
+	OldNewConfig configType = iota
+	NewConfig
+)
+
+type configChange struct {
+	oldConfig map[NodeId]NodeAddr // 旧配置
+	newConfig map[NodeId]NodeAddr // 新配置
+	mu        sync.Mutex
 }
 
-func (st *LeaderState) followers() map[NodeId]*followerReplication {
+// 节点是 Leader 时，保存在内存中的状态
+type LeaderState struct {
+	stepDownCh    chan int             // 接收降级通知
+	done          chan NodeId          // 日志复制结束
+	followerState map[NodeId]*follower // 代表了一个复制日志的 follower 节点
+	transfer      transfer             // 领导权转移状态
+	configChange  configChange         // 配置变更状态
+}
+
+func (st *LeaderState) followers() map[NodeId]*follower {
 	return st.followerState
 }
 
@@ -447,6 +461,42 @@ func (st *LeaderState) setTransferState(timer *time.Timer, reply chan<- rpcReply
 	defer st.transfer.mu.Unlock()
 	st.transfer.timer = timer
 	st.transfer.reply = reply
+}
+
+func (st *LeaderState) setOldConfig(oldPeers map[NodeId]NodeAddr) {
+	st.configChange.mu.Lock()
+	defer st.configChange.mu.Unlock()
+	st.configChange.oldConfig = oldPeers
+}
+
+func (st *LeaderState) setNewConfig(newPeers map[NodeId]NodeAddr) {
+	st.configChange.mu.Lock()
+	defer st.configChange.mu.Unlock()
+	st.configChange.newConfig = newPeers
+}
+
+func (st *LeaderState) getOldConfig() map[NodeId]NodeAddr {
+	st.configChange.mu.Lock()
+	defer st.configChange.mu.Unlock()
+	return st.configChange.oldConfig
+}
+
+func (st *LeaderState) getNewConfig() map[NodeId]NodeAddr {
+	st.configChange.mu.Lock()
+	defer st.configChange.mu.Unlock()
+	return st.configChange.newConfig
+}
+
+func (st *LeaderState) oldMajority() int {
+	st.configChange.mu.Lock()
+	defer st.configChange.mu.Unlock()
+	return len(st.configChange.oldConfig) / 2 + 1
+}
+
+func (st *LeaderState) newMajority() int {
+	st.configChange.mu.Lock()
+	defer st.configChange.mu.Unlock()
+	return len(st.configChange.newConfig) / 2 + 1
 }
 
 // ==================== timerState ====================

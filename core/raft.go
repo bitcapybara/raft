@@ -32,8 +32,8 @@ type raft struct {
 	timerState    *timerState    // 计时器状态
 	snapshotState *snapshotState // 快照状态
 
-	rpcCh          chan rpc      // 主线程接收 rpc 消息
-	exitCh         chan struct{} // 当前节点离开节点，退出程序
+	rpcCh  chan rpc      // 主线程接收 rpc 消息
+	exitCh chan struct{} // 当前节点离开节点，退出程序
 }
 
 func newRaft(config Config) *raft {
@@ -103,7 +103,7 @@ func (rf *raft) runLeader() {
 	for rf.roleState.getRoleStage() == Leader {
 		select {
 		case msg := <-rf.rpcCh:
-			if transfereeId, busy :=rf.leaderState.isTransferBusy(); busy {
+			if transfereeId, busy := rf.leaderState.isTransferBusy(); busy {
 				// 如果正在进行
 				rf.checkTransfer(transfereeId)
 			} else {
@@ -137,7 +137,7 @@ func (rf *raft) runLeader() {
 			}
 			close(stopCh)
 		case id := <-rf.leaderState.done:
-			if transfereeId, busy :=rf.leaderState.isTransferBusy(); busy && transfereeId == id {
+			if transfereeId, busy := rf.leaderState.isTransferBusy(); busy && transfereeId == id {
 				rf.checkTransfer(transfereeId)
 			}
 		case msg := <-rf.leaderState.stepDownCh:
@@ -326,7 +326,7 @@ func (rf *raft) runReplication() {
 	for id, addr := range rf.peerState.peers() {
 		st, ok := rf.leaderState.followerState[id]
 		if !ok {
-			st = &followerReplication{
+			st = &follower{
 				id:         id,
 				addr:       addr,
 				nextIndex:  rf.lastLogIndex() + 1,
@@ -658,6 +658,8 @@ func (rf *raft) handleConfiguration(msg rpc) {
 
 	// C(new) 配置
 	newPeers := newConfig.peers
+	rf.leaderState.setNewConfig(newPeers)
+	rf.leaderState.setOldConfig(rf.peerState.peers())
 
 	// C(old,new) 配置
 	oldNewPeers := make(map[NodeId]NodeAddr)
@@ -669,7 +671,7 @@ func (rf *raft) handleConfiguration(msg rpc) {
 	}
 
 	// 分发 C(old,new) 配置
-	if !rf.sendConfiguration(oldNewPeers, msg) {
+	if !rf.sendOldNewConfig(oldNewPeers, msg) {
 		return
 	}
 
@@ -680,7 +682,7 @@ func (rf *raft) handleConfiguration(msg rpc) {
 
 	// todo 刚通过成员变更加入集群的新节点，只有 C(old,new) 和 C(new) 两条日志，需要进行追赶
 
-	// 清理 followerReplication
+	// 清理 follower
 	peers := rf.peerState.peers()
 	// 如果当前节点被移除，退出程序
 	if _, ok := peers[rf.peerState.myId()]; !ok {
@@ -689,9 +691,9 @@ func (rf *raft) handleConfiguration(msg rpc) {
 	}
 	// 查看follower有没有被移除的
 	followers := rf.leaderState.followers()
-	for id, follower := range followers {
+	for id, f := range followers {
 		if _, ok := peers[id]; !ok {
-			follower.stopCh <- struct{}{}
+			f.stopCh <- struct{}{}
 			delete(followers, id)
 		}
 	}
@@ -732,8 +734,8 @@ func (rf *raft) checkTransfer(id NodeId) {
 	}
 }
 
-func (rf *raft) sendConfiguration(oldNewPeers map[NodeId]NodeAddr, msg rpc) bool {
-	oldNewPeersData, enOldNewErr := encodePeersMap(oldNewPeers)
+func (rf *raft) sendOldNewConfig(peers map[NodeId]NodeAddr, msg rpc) bool {
+	oldNewPeersData, enOldNewErr := encodePeersMap(peers)
 	if enOldNewErr != nil {
 		msg.res <- rpcReply{err: enOldNewErr}
 		return false
@@ -745,7 +747,34 @@ func (rf *raft) sendConfiguration(oldNewPeers map[NodeId]NodeAddr, msg rpc) bool
 		msg.res <- rpcReply{err: addEntryErr}
 		return false
 	}
-	rf.peerState.replacePeers(oldNewPeers)
+	rf.peerState.replacePeers(peers)
+
+	// C(old,new)发送到各个节点
+	finishCh := make(chan finishMsg)
+	defer close(finishCh)
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	// 先给旧节点发，再给新节点发
+	return rf.waitForConfig(rf.leaderState.getOldConfig(), finishCh, stopCh, msg) &&
+		rf.waitForConfig(rf.leaderState.getNewConfig(), finishCh, stopCh, msg)
+}
+
+func (rf *raft) sendConfiguration(peers map[NodeId]NodeAddr, msg rpc) bool {
+
+	oldNewPeersData, enOldNewErr := encodePeersMap(peers)
+	if enOldNewErr != nil {
+		msg.res <- rpcReply{err: enOldNewErr}
+		return false
+	}
+
+	// C(old,new)配置添加到状态
+	addEntryErr := rf.addEntry(Entry{Type: EntryChangeConf, Data: oldNewPeersData})
+	if addEntryErr != nil {
+		msg.res <- rpcReply{err: addEntryErr}
+		return false
+	}
+	rf.peerState.replacePeers(peers)
 
 	// C(old,new)发送到各个节点
 	finishCh := make(chan finishMsg)
@@ -761,7 +790,42 @@ func (rf *raft) sendConfiguration(oldNewPeers map[NodeId]NodeAddr, msg rpc) bool
 		go rf.replicationTo(id, finishCh, stopCh, EntryChangeConf)
 	}
 
-	// todo 处于 C(old,new) 状态时，必须收到 C(old) 的 majority 和 C(new) 的 majority 的同意才能提交或选出 leader。
+	count := 1
+	successCnt := 1
+	for result := range finishCh {
+		if result.msgType == Degrade && rf.becomeFollower(Leader, result.term) {
+			return false
+		}
+		if result.msgType == Success {
+			successCnt += 1
+		}
+		count += 1
+		if successCnt >= rf.peerState.majority() {
+			break
+		}
+		if count >= rf.peerState.peersCnt() {
+			msg.res <- rpcReply{err: fmt.Errorf("日志未发送到多数节点")}
+			return false
+		}
+	}
+
+	// 提交日志
+	oldNewIndex := rf.lastLogIndex()
+	rf.softState.setCommitIndex(oldNewIndex)
+	return true
+}
+
+func (rf *raft) waitForConfig(peers map[NodeId]NodeAddr, finishCh chan finishMsg, stopCh chan struct{}, msg rpc) bool {
+
+	for id := range peers {
+		// 不用给自己发
+		if rf.peerState.isMe(id) {
+			continue
+		}
+		// 发送日志
+		go rf.replicationTo(id, finishCh, stopCh, EntryChangeConf)
+	}
+
 	count := 1
 	successCnt := 1
 	for result := range finishCh {
@@ -862,7 +926,7 @@ func (rf *raft) replicationTo(id NodeId, finishCh chan finishMsg, stopCh chan st
 // 若日志不同步，开始进行日志追赶操作
 // 1. Follower 节点标记为日志追赶状态，下一次心跳时跳过此节点
 // 2. 日志追赶完毕或 rpc 调用失败，Follower 节点标记为普通状态
-func (rf *raft) replicate(s *followerReplication) {
+func (rf *raft) replicate(s *follower) {
 	// 向前查找 nextIndex 值
 	if rf.findCorrectNextIndex(s) {
 		// 递增更新 matchIndex 值
@@ -870,7 +934,7 @@ func (rf *raft) replicate(s *followerReplication) {
 	}
 }
 
-func (rf *raft) findCorrectNextIndex(s *followerReplication) bool {
+func (rf *raft) findCorrectNextIndex(s *follower) bool {
 	rl := rf.leaderState
 	peerNextIndex := rl.nextIndex(s.id)
 
@@ -928,7 +992,7 @@ func (rf *raft) findCorrectNextIndex(s *followerReplication) bool {
 	return true
 }
 
-func (rf *raft) completeEntries(s *followerReplication) {
+func (rf *raft) completeEntries(s *follower) {
 
 	rl := rf.leaderState
 	for {
