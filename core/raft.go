@@ -118,6 +118,8 @@ func (rf *raft) runLeader() {
 					rf.handleConfiguration(msg)
 				case TransferLeadershipRpc:
 					rf.handleTransfer(msg)
+				case AddNewNodeRpc:
+					rf.handleNewNode(msg)
 				}
 			}
 		case <-rf.timerState.tick():
@@ -324,34 +326,38 @@ func (rf *raft) waitRpcResult(finishCh <-chan finishMsg) bool {
 
 func (rf *raft) runReplication() {
 	for id, addr := range rf.peerState.peers() {
-		st, ok := rf.leaderState.followerState[id]
-		if !ok {
-			st = &follower{
-				id:         id,
-				addr:       addr,
-				nextIndex:  rf.lastLogIndex() + 1,
-				matchIndex: 0,
-				stepDownCh: rf.leaderState.stepDownCh,
-				stopCh:     make(chan struct{}),
-				triggerCh:  make(chan struct{}),
-			}
-			rf.leaderState.followerState[id] = st
-		}
-		go func() {
-			for {
-				select {
-				case <-st.stopCh:
-					return
-				case <-st.triggerCh:
-					func() {
-						rf.leaderState.setRpcBusy(st.id, true)
-						defer rf.leaderState.setRpcBusy(st.id, false)
-						rf.replicate(st)
-					}()
-				}
-			}
-		}()
+		rf.addReplication(id, addr)
 	}
+}
+
+func (rf *raft) addReplication(id NodeId, addr NodeAddr) {
+	st, ok := rf.leaderState.followerState[id]
+	if !ok {
+		st = &Replications{
+			id:         id,
+			addr:       addr,
+			nextIndex:  rf.lastLogIndex() + 1,
+			matchIndex: 0,
+			stepDownCh: rf.leaderState.stepDownCh,
+			stopCh:     make(chan struct{}),
+			triggerCh:  make(chan struct{}),
+		}
+		rf.leaderState.followerState[id] = st
+	}
+	go func() {
+		for {
+			select {
+			case <-st.stopCh:
+				return
+			case <-st.triggerCh:
+				func() {
+					rf.leaderState.setRpcBusy(st.id, true)
+					defer rf.leaderState.setRpcBusy(st.id, false)
+					rf.replicate(st)
+				}()
+			}
+		}
+	}()
 }
 
 // Follower 和 Candidate 接收到来自 Leader 的 AppendEntries 调用
@@ -682,7 +688,7 @@ func (rf *raft) handleConfiguration(msg rpc) {
 
 	// todo 刚通过成员变更加入集群的新节点，只有 C(old,new) 和 C(new) 两条日志，需要进行追赶
 
-	// 清理 follower
+	// 清理 replications
 	peers := rf.peerState.peers()
 	// 如果当前节点被移除，退出程序
 	if _, ok := peers[rf.peerState.myId()]; !ok {
@@ -697,6 +703,17 @@ func (rf *raft) handleConfiguration(msg rpc) {
 			delete(followers, id)
 		}
 	}
+}
+
+// 处理添加新节点请求
+func (rf *raft) handleNewNode(msg rpc) {
+	req := msg.req.(AddNewNode)
+	newNode := req.newNode
+	// 开启复制循环
+	rf.addReplication(newNode.id, newNode.addr)
+	// 触发复制
+	rf.leaderState.followers()[newNode.id].triggerCh <- struct{}{}
+	// todo 复制完成后，将此新节点加入集群
 }
 
 func (rf *raft) checkTransfer(id NodeId) {
@@ -926,7 +943,7 @@ func (rf *raft) replicationTo(id NodeId, finishCh chan finishMsg, stopCh chan st
 // 若日志不同步，开始进行日志追赶操作
 // 1. Follower 节点标记为日志追赶状态，下一次心跳时跳过此节点
 // 2. 日志追赶完毕或 rpc 调用失败，Follower 节点标记为普通状态
-func (rf *raft) replicate(s *follower) {
+func (rf *raft) replicate(s *Replications) {
 	// 向前查找 nextIndex 值
 	if rf.findCorrectNextIndex(s) {
 		// 递增更新 matchIndex 值
@@ -934,7 +951,7 @@ func (rf *raft) replicate(s *follower) {
 	}
 }
 
-func (rf *raft) findCorrectNextIndex(s *follower) bool {
+func (rf *raft) findCorrectNextIndex(s *Replications) bool {
 	rl := rf.leaderState
 	peerNextIndex := rl.nextIndex(s.id)
 
@@ -992,7 +1009,7 @@ func (rf *raft) findCorrectNextIndex(s *follower) bool {
 	return true
 }
 
-func (rf *raft) completeEntries(s *follower) {
+func (rf *raft) completeEntries(s *Replications) {
 
 	rl := rf.leaderState
 	for {

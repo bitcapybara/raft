@@ -44,7 +44,7 @@ type NodeAddr string
 type AppendEntry struct {
 	entryType    EntryType // 载荷的条目类型
 	term         int       // 当前时刻所属任期
-	leaderId     NodeId    // 领导者的地址，方便 follower 重定向
+	leaderId     NodeId    // 领导者的地址，方便 Follower 重定向
 	prevLogIndex int       // 要发送的日志条目的前一个条目的索引
 	prevLogTerm  int       // prevLogIndex 条目所处任期
 	leaderCommit int       // Leader 提交的索引
@@ -116,5 +116,15 @@ type TransferLeadership struct {
 }
 
 type TransferLeadershipReply struct {
+	status status
+}
+
+// ==================== AddNewNode ====================
+
+type AddNewNode struct {
+	newNode server
+}
+
+type AddNewNodeReply struct {
 	status status
 }

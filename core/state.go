@@ -20,6 +20,7 @@ const (
 	Leader    RoleStage = iota // 领导者
 	Candidate                  // 候选者
 	Follower                   // 追随者
+	Learner                    // 日志同步者
 )
 
 // 角色类型
@@ -32,7 +33,7 @@ type RoleState struct {
 
 func newRoleState() *RoleState {
 	return &RoleState{
-		roleStage: Follower,
+		roleStage: Learner,
 	}
 }
 
@@ -362,9 +363,10 @@ func (st *PeerState) getLeader() server {
 
 // ==================== LeaderState ====================
 
-type follower struct {
+type Replications struct {
 	id         NodeId        // 节点标识
 	addr       NodeAddr      // 节点地址
+	role       RoleStage     // 复制对象的角色
 	nextIndex  int           // 下一次要发送给各节点的日志索引。由 Leader 维护，初始值为 Leader 最后一个日志的索引 + 1
 	matchIndex int           // 已经复制到各节点的最大的日志索引。由 Leader 维护，初始值为0
 	rpcBusy    bool          // 是否正在通信
@@ -381,13 +383,6 @@ type transfer struct {
 	mu             sync.Mutex
 }
 
-type configType uint8
-
-const (
-	OldNewConfig configType = iota
-	NewConfig
-)
-
 type configChange struct {
 	oldConfig map[NodeId]NodeAddr // 旧配置
 	newConfig map[NodeId]NodeAddr // 新配置
@@ -396,14 +391,14 @@ type configChange struct {
 
 // 节点是 Leader 时，保存在内存中的状态
 type LeaderState struct {
-	stepDownCh    chan int             // 接收降级通知
-	done          chan NodeId          // 日志复制结束
-	followerState map[NodeId]*follower // 代表了一个复制日志的 follower 节点
-	transfer      transfer             // 领导权转移状态
-	configChange  configChange         // 配置变更状态
+	stepDownCh    chan int                 // 接收降级通知
+	done          chan NodeId              // 日志复制结束
+	followerState map[NodeId]*Replications // 代表了一个复制日志的 Follower 节点
+	transfer      transfer                 // 领导权转移状态
+	configChange  configChange             // 配置变更状态
 }
 
-func (st *LeaderState) followers() map[NodeId]*follower {
+func (st *LeaderState) followers() map[NodeId]*Replications {
 	return st.followerState
 }
 
@@ -490,13 +485,13 @@ func (st *LeaderState) getNewConfig() map[NodeId]NodeAddr {
 func (st *LeaderState) oldMajority() int {
 	st.configChange.mu.Lock()
 	defer st.configChange.mu.Unlock()
-	return len(st.configChange.oldConfig) / 2 + 1
+	return len(st.configChange.oldConfig)/2 + 1
 }
 
 func (st *LeaderState) newMajority() int {
 	st.configChange.mu.Lock()
 	defer st.configChange.mu.Unlock()
-	return len(st.configChange.newConfig) / 2 + 1
+	return len(st.configChange.newConfig)/2 + 1
 }
 
 // ==================== timerState ====================
