@@ -363,7 +363,7 @@ func (st *PeerState) getLeader() server {
 
 // ==================== LeaderState ====================
 
-type Replications struct {
+type Replication struct {
 	id         NodeId        // 节点标识
 	addr       NodeAddr      // 节点地址
 	role       RoleStage     // 复制对象的角色
@@ -391,14 +391,14 @@ type configChange struct {
 
 // 节点是 Leader 时，保存在内存中的状态
 type LeaderState struct {
-	stepDownCh    chan int                 // 接收降级通知
-	done          chan NodeId              // 日志复制结束
-	followerState map[NodeId]*Replications // 代表了一个复制日志的 Follower 节点
-	transfer      transfer                 // 领导权转移状态
-	configChange  configChange             // 配置变更状态
+	stepDownCh    chan int                // 接收降级通知
+	done          chan NodeId             // 日志复制结束
+	followerState map[NodeId]*Replication // 代表了一个复制日志的 Follower 节点
+	transfer      transfer                // 领导权转移状态
+	configChange  configChange            // 配置变更状态
 }
 
-func (st *LeaderState) followers() map[NodeId]*Replications {
+func (st *LeaderState) followers() map[NodeId]*Replication {
 	return st.followerState
 }
 
@@ -427,10 +427,10 @@ func (st *LeaderState) setNextIndex(id NodeId, index int) {
 	st.followerState[id].nextIndex = index
 }
 
-func (st *LeaderState) setRpcBusy(id NodeId, enable bool) {
+func (st *LeaderState) setRpcBusy(id NodeId, busy bool) {
 	st.followerState[id].mu.Lock()
 	defer st.followerState[id].mu.Unlock()
-	st.followerState[id].rpcBusy = enable
+	st.followerState[id].rpcBusy = busy
 }
 
 func (st *LeaderState) isRpcBusy(id NodeId) bool {
@@ -492,6 +492,13 @@ func (st *LeaderState) newMajority() int {
 	st.configChange.mu.Lock()
 	defer st.configChange.mu.Unlock()
 	return len(st.configChange.newConfig)/2 + 1
+}
+
+func (st *LeaderState) roleUpgrade(id NodeId) {
+	state := st.followerState[id]
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.role = Follower
 }
 
 // ==================== timerState ====================

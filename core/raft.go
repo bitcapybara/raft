@@ -333,7 +333,7 @@ func (rf *raft) runReplication() {
 func (rf *raft) addReplication(id NodeId, addr NodeAddr) {
 	st, ok := rf.leaderState.followerState[id]
 	if !ok {
-		st = &Replications{
+		st = &Replication{
 			id:         id,
 			addr:       addr,
 			nextIndex:  rf.lastLogIndex() + 1,
@@ -351,9 +351,13 @@ func (rf *raft) addReplication(id NodeId, addr NodeAddr) {
 				return
 			case <-st.triggerCh:
 				func() {
+					// 设置状态
 					rf.leaderState.setRpcBusy(st.id, true)
 					defer rf.leaderState.setRpcBusy(st.id, false)
+					// 复制日志
 					rf.replicate(st)
+					// 将节点类型提升为 Follower
+					rf.leaderState.roleUpgrade(st.id)
 				}()
 			}
 		}
@@ -575,7 +579,6 @@ func (rf *raft) handleSnapshot(rpcMsg rpc) {
 }
 
 // 处理领导权转移请求
-// todo 超时设置，time.After(electionTimeout)
 func (rf *raft) handleTransfer(rpcMsg rpc) {
 	// 先发送一次心跳，刷新计时器，以及
 	args := rpcMsg.req.(TransferLeadership)
@@ -686,8 +689,6 @@ func (rf *raft) handleConfiguration(msg rpc) {
 		return
 	}
 
-	// todo 刚通过成员变更加入集群的新节点，只有 C(old,new) 和 C(new) 两条日志，需要进行追赶
-
 	// 清理 replications
 	peers := rf.peerState.peers()
 	// 如果当前节点被移除，退出程序
@@ -713,7 +714,6 @@ func (rf *raft) handleNewNode(msg rpc) {
 	rf.addReplication(newNode.id, newNode.addr)
 	// 触发复制
 	rf.leaderState.followers()[newNode.id].triggerCh <- struct{}{}
-	// todo 复制完成后，将此新节点加入集群
 }
 
 func (rf *raft) checkTransfer(id NodeId) {
@@ -943,7 +943,7 @@ func (rf *raft) replicationTo(id NodeId, finishCh chan finishMsg, stopCh chan st
 // 若日志不同步，开始进行日志追赶操作
 // 1. Follower 节点标记为日志追赶状态，下一次心跳时跳过此节点
 // 2. 日志追赶完毕或 rpc 调用失败，Follower 节点标记为普通状态
-func (rf *raft) replicate(s *Replications) {
+func (rf *raft) replicate(s *Replication) {
 	// 向前查找 nextIndex 值
 	if rf.findCorrectNextIndex(s) {
 		// 递增更新 matchIndex 值
@@ -951,7 +951,7 @@ func (rf *raft) replicate(s *Replications) {
 	}
 }
 
-func (rf *raft) findCorrectNextIndex(s *Replications) bool {
+func (rf *raft) findCorrectNextIndex(s *Replication) bool {
 	rl := rf.leaderState
 	peerNextIndex := rl.nextIndex(s.id)
 
@@ -1009,7 +1009,7 @@ func (rf *raft) findCorrectNextIndex(s *Replications) bool {
 	return true
 }
 
-func (rf *raft) completeEntries(s *Replications) {
+func (rf *raft) completeEntries(s *Replication) {
 
 	rl := rf.leaderState
 	for {
