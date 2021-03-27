@@ -1,6 +1,8 @@
 package core
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 )
 
@@ -35,34 +37,62 @@ func TestHandleCommand(t *testing.T) {
 		MaxLogLength: 2000,
 	}
 	rf := newRaft(config)
+	_ = rf.hardState.setTerm(1)
 
-	// 设置当前节点 Learner 状态
-	_ = rf.hardState.setTerm(0)
-
-	// 模拟初次启动服务的处理
 	reply := make(chan rpcReply)
-	msg := rpc{
-		rpcType: AppendEntryRpc,
-		req: AppendEntry{
-			entryType:    EntryHeartbeat,
-			term:         1,
-			leaderId:     "2",
-			prevLogIndex: 0,
-			prevLogTerm:  0,
-			entries:      nil,
-			leaderCommit: 0,
+	msgs := []rpc{
+		{
+			rpcType: AppendEntryRpc,
+			req: AppendEntry{
+				entryType:    EntryHeartbeat,
+				term:         1,
+				leaderId:     "2",
+				prevLogIndex: 0,
+				prevLogTerm:  0,
+				entries:      []Entry{{Index: 0, Term: 1, Type: EntryHeartbeat}},
+				leaderCommit: 0,
+			},
+			res: reply,
+		},{
+			rpcType: AppendEntryRpc,
+			req: AppendEntry{
+				entryType:    EntryReplicate,
+				term:         1,
+				leaderId:     "2",
+				prevLogIndex: 0,
+				prevLogTerm:  0,
+				entries:      []Entry{{Index: 0, Term: 1, Type: EntryReplicate, Data: []byte("a")}},
+				leaderCommit: 0,
+			},
+			res: reply,
 		},
-		res: reply,
 	}
 
-	go func() {
-		res := <-reply
-		entryReply := res.res.(AppendEntryReply)
-		if !entryReply.success {
-			t.Errorf("not success")
-		}
+	var wg sync.WaitGroup
+	getReply := func() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res := <-reply
+			entryReply := res.res.(AppendEntryReply)
+			if !entryReply.success {
+				t.Errorf("not success")
+			} else {
+				fmt.Printf("term=%d, leader=%s, entry_size=%d\n",
+					rf.hardState.currentTerm(),
+					rf.peerState.leaderId(),
+					rf.hardState.logLength())
+			}
+		}()
+	}
 
-	}()
+	// 模拟初次启动服务的处理
+	getReply()
+	rf.handleCommand(msgs[0])
+	wg.Wait()
 
-	rf.handleCommand(msg)
+	// 模拟第一次发送日志
+	getReply()
+	rf.handleCommand(msgs[1])
+	wg.Wait()
 }

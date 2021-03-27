@@ -393,16 +393,21 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 	rf.timerState.setElectionTimer()
 
 	args := rpcMsg.req.(AppendEntry)
-	reply := rpcReply{res: AppendEntryReply{}}
-	res := reply.res.(AppendEntryReply)
-	defer func() { rpcMsg.res <- reply }()
+	replyRes := AppendEntryReply{}
+	var replyErr error
+	defer func() {
+		rpcMsg.res <- rpcReply{
+			res: replyRes,
+			err: replyErr,
+		}
+	}()
 
 	// 判断 term
 	rfTerm := rf.hardState.currentTerm()
 	if args.term < rfTerm {
 		// 发送请求的 Leader 任期数落后
-		res.term = rfTerm
-		res.success = false
+		replyRes.term = rfTerm
+		replyRes.success = false
 		return
 	}
 
@@ -411,7 +416,7 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 	stage := rf.roleState.getRoleStage()
 	if args.term > rfTerm && stage != Follower && stage != Learner {
 		if !rf.becomeFollower(stage, args.term) {
-			reply.err = fmt.Errorf("节点降级失败")
+			replyErr = fmt.Errorf("节点降级失败")
 			return
 		}
 	}
@@ -423,30 +428,30 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 		// 返回最后一个日志条目的 term 及此 term 的首个条目的索引
 		logLength := rf.hardState.logLength()
 		if logLength <= 0 {
-			res.conflictStartIndex = rf.snapshotState.lastIndex()
-			res.conflictTerm = rf.snapshotState.lastTerm()
+			replyRes.conflictStartIndex = rf.snapshotState.lastIndex()
+			replyRes.conflictTerm = rf.snapshotState.lastTerm()
 		} else {
-			res.conflictTerm = rf.logTerm(logLength - 1)
-			res.conflictStartIndex = rf.hardState.lastEntryIndex()
-			for i := logLength - 1; i >= 0 && rf.logTerm(i) == res.conflictTerm; i-- {
-				res.conflictStartIndex = rf.hardState.logEntry(i).Index
+			replyRes.conflictTerm = rf.logTerm(logLength - 1)
+			replyRes.conflictStartIndex = rf.hardState.lastEntryIndex()
+			for i := logLength - 1; i >= 0 && rf.logTerm(i) == replyRes.conflictTerm; i-- {
+				replyRes.conflictStartIndex = rf.hardState.logEntry(i).Index
 			}
 		}
-		res.term = rfTerm
-		res.success = false
+		replyRes.term = rfTerm
+		replyRes.success = false
 		return
 	}
 	prevTerm := rf.logTerm(prevIndex)
 	if prevTerm != args.prevLogTerm {
 		// 节点包含索引为 prevIndex 的日志但是 term 数不同
 		// 返回 prevIndex 所在 term 及此 term 的首个条目的索引
-		res.conflictTerm = prevTerm
-		res.conflictStartIndex = prevIndex
-		for i := prevIndex - 1; i >= 0 && rf.logTerm(i) == res.conflictTerm; i-- {
-			res.conflictStartIndex = rf.hardState.logEntry(i).Index
+		replyRes.conflictTerm = prevTerm
+		replyRes.conflictStartIndex = prevIndex
+		for i := prevIndex - 1; i >= 0 && rf.logTerm(i) == replyRes.conflictTerm; i-- {
+			replyRes.conflictStartIndex = rf.hardState.logEntry(i).Index
 		}
-		res.term = rfTerm
-		res.success = false
+		replyRes.term = rfTerm
+		replyRes.success = false
 		return
 	}
 
@@ -462,6 +467,9 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 		err := rf.addEntry(args.entries[0])
 		if err != nil {
 			log.Println(err)
+			replyRes.success = false
+		} else {
+			replyRes.success = true
 		}
 		// 添加日志后不提交，下次心跳来了再提交
 		return
@@ -470,7 +478,7 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 	if args.entryType == EntryHeartbeat {
 		// ========== 接收心跳 ==========
 		rf.peerState.setLeader(args.leaderId)
-		res.term = rf.hardState.currentTerm()
+		replyRes.term = rf.hardState.currentTerm()
 
 		// 已接收到全部日志，从 Learner 角色升级为 Follower
 		if rf.roleState.getRoleStage() == Learner {
@@ -488,12 +496,13 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 			}
 			applyErr := rf.applyFsm()
 			if applyErr != nil {
-				reply.err = err
-				res.success = false
+				replyErr = err
+				replyRes.success = false
 			} else {
-				res.success = true
+				replyRes.success = true
 			}
 		}
+		replyRes.success = true
 		return
 	}
 
@@ -501,10 +510,10 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 		configData := args.entries[0].Data
 		peerErr := rf.peerState.replacePeersWithBytes(configData)
 		if peerErr != nil {
-			reply.err = peerErr
-			res.success = false
+			replyErr = peerErr
+			replyRes.success = false
 		}
-		res.success = true
+		replyRes.success = true
 		return
 	}
 
