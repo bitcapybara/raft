@@ -36,16 +36,33 @@ func TestHandleCommand(t *testing.T) {
 	}
 	rf := newRaft(config)
 
+	// 设置当前节点 Learner 状态
+	_ = rf.hardState.setTerm(0)
+
+	// 模拟初次启动服务的处理
 	reply := make(chan rpcReply)
 	msg := rpc{
 		rpcType: AppendEntryRpc,
 		req: AppendEntry{
-
+			entryType:    EntryHeartbeat,
+			term:         1,
+			leaderId:     "2",
+			prevLogIndex: 0,
+			prevLogTerm:  0,
+			entries:      nil,
+			leaderCommit: 0,
 		},
 		res: reply,
 	}
-	rf.handleCommand(msg)
 
-	res := <-reply
-	println("%s", res.res)
+	go func() {
+		res := <-reply
+		entryReply := res.res.(AppendEntryReply)
+		if !entryReply.success {
+			t.Errorf("not success")
+		}
+
+	}()
+
+	rf.handleCommand(msg)
 }

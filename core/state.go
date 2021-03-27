@@ -73,15 +73,6 @@ type HardState struct {
 	mu        sync.Mutex
 }
 
-func NewHardState(persister RaftStatePersister) HardState {
-	return HardState{
-		term:      1,
-		votedFor:  "",
-		entries:   make([]Entry, 0),
-		persister: persister,
-	}
-}
-
 func (st *HardState) lastEntryIndex() int {
 	st.mu.Lock()
 	defer st.mu.Unlock()

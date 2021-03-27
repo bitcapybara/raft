@@ -9,14 +9,6 @@ type RaftState struct {
 	Entries  []Entry
 }
 
-func newRaftState() RaftState {
-	return RaftState{
-		Term:     1,
-		VotedFor: "",
-		Entries:  make([]Entry, 0),
-	}
-}
-
 func (rs RaftState) toHardState(persister RaftStatePersister) HardState {
 	return HardState{
 		term:      rs.Term,
@@ -53,11 +45,17 @@ type SnapshotPersister interface {
 // RaftStatePersister 接口的内存实现，开发测试用
 type inMemRaftStatePersister struct {
 	raftState RaftState
-	mu sync.Mutex
+	mu        sync.Mutex
 }
 
 func newImMemRaftStatePersister() *inMemRaftStatePersister {
-	return &inMemRaftStatePersister{}
+	return &inMemRaftStatePersister{
+		raftState: RaftState{
+			Term:     0,
+			VotedFor: "",
+			Entries:  make([]Entry, 0),
+		},
+	}
 }
 
 func (ps *inMemRaftStatePersister) SaveRaftState(state RaftState) error {
@@ -76,7 +74,7 @@ func (ps *inMemRaftStatePersister) LoadRaftState() (RaftState, error) {
 // SnapshotPersister 接口的内存实现，开发测试用
 type inMemSnapshotPersister struct {
 	snapshot Snapshot
-	mu sync.Mutex
+	mu       sync.Mutex
 }
 
 func newInMemSnapshotPersister() *inMemSnapshotPersister {

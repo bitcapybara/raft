@@ -46,12 +46,12 @@ func newRaft(config Config) *raft {
 	if raftPst != nil {
 		rfState, err := raftPst.LoadRaftState()
 		if err != nil {
-			log.Println(err)
+			panic(fmt.Sprintf("持久化器加载 RaftState 失败：%s\n", err))
 		} else {
 			raftState = rfState
 		}
 	} else {
-		raftState = newRaftState()
+		panic("缺失 RaftStatePersister!")
 	}
 	hardState := raftState.toHardState(raftPst)
 
@@ -111,7 +111,7 @@ func (rf *raft) runLeader() {
 		select {
 		case msg := <-rf.rpcCh:
 			if transfereeId, busy := rf.leaderState.isTransferBusy(); busy {
-				// 如果正在进行
+				// 如果正在进行领导权转移
 				rf.checkTransfer(transfereeId)
 			} else {
 				switch msg.rpcType {
@@ -407,9 +407,9 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 	}
 
 	// 任期数落后或相等，如果是候选者，需要降级
-	// 后续操作都在 Follower 角色下完成
+	// 后续操作都在 Follower / Learner 角色下完成
 	stage := rf.roleState.getRoleStage()
-	if args.term > rfTerm || (stage != Follower && stage != Learner) {
+	if args.term > rfTerm && stage != Follower && stage != Learner {
 		if !rf.becomeFollower(stage, args.term) {
 			reply.err = fmt.Errorf("节点降级失败")
 			return
