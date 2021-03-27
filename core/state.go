@@ -361,6 +361,12 @@ func (st *PeerState) getLeader() server {
 	}
 }
 
+func (st *PeerState) addPeer(id NodeId, addr NodeAddr) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.peersMap[id] = addr
+}
+
 // ==================== LeaderState ====================
 
 type Replication struct {
@@ -383,6 +389,12 @@ type transfer struct {
 	mu             sync.Mutex
 }
 
+func newTransfer() *transfer {
+	return &transfer{
+		leadTransferee: None,
+	}
+}
+
 type configChange struct {
 	oldConfig map[NodeId]NodeAddr // 旧配置
 	newConfig map[NodeId]NodeAddr // 新配置
@@ -394,8 +406,18 @@ type LeaderState struct {
 	stepDownCh    chan int                // 接收降级通知
 	done          chan NodeId             // 日志复制结束
 	followerState map[NodeId]*Replication // 代表了一个复制日志的 Follower 节点
-	transfer      transfer                // 领导权转移状态
-	configChange  configChange            // 配置变更状态
+	transfer      *transfer                // 领导权转移状态
+	configChange  *configChange            // 配置变更状态
+}
+
+func newLeaderState() *LeaderState {
+	return &LeaderState{
+		stepDownCh: make(chan int),
+		done: make(chan NodeId),
+		followerState: make(map[NodeId]*Replication),
+		transfer: newTransfer(),
+		configChange: &configChange{},
+	}
 }
 
 func (st *LeaderState) followers() map[NodeId]*Replication {

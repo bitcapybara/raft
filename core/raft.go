@@ -37,6 +37,9 @@ type raft struct {
 }
 
 func newRaft(config Config) *raft {
+	if config.ElectionMinTimeout > config.ElectionMaxTimeout {
+		panic("ElectionMinTimeout cannot greater than ElectionMaxTimeout!")
+	}
 	raftPst := config.RaftStatePersister
 
 	var raftState RaftState
@@ -59,9 +62,11 @@ func newRaft(config Config) *raft {
 		hardState:     &hardState,
 		softState:     newSoftState(),
 		peerState:     newPeerState(config.Peers, config.Me),
-		leaderState:   nil,
+		leaderState:   newLeaderState(),
 		timerState:    newTimerState(config),
 		snapshotState: newSnapshotState(config),
+		rpcCh:         make(chan rpc),
+		exitCh:        make(chan struct{}),
 	}
 }
 
@@ -81,6 +86,8 @@ func (rf *raft) raftRun(rpcCh chan rpc) {
 				rf.runCandidate()
 			case Follower:
 				rf.runFollower()
+			case Learner:
+				rf.runLearner()
 			}
 		}
 	}()
@@ -208,6 +215,18 @@ func (rf *raft) runFollower() {
 				rf.handleVoteReq(msg)
 			case InstallSnapshotRpc:
 				rf.handleSnapshot(msg)
+			}
+		}
+	}
+}
+
+func (rf *raft) runLearner() {
+	for rf.roleState.getRoleStage() == Learner {
+		select {
+		case msg := <-rf.rpcCh:
+			switch msg.rpcType {
+			case AppendEntryRpc:
+				rf.handleCommand(msg)
 			}
 		}
 	}
@@ -357,7 +376,10 @@ func (rf *raft) addReplication(id NodeId, addr NodeAddr) {
 					// 复制日志
 					rf.replicate(st)
 					// 将节点类型提升为 Follower
-					rf.leaderState.roleUpgrade(st.id)
+					if rf.leaderState.followerState[id].role == Learner {
+						rf.leaderState.roleUpgrade(st.id)
+						rf.peerState.addPeer(st.id, st.addr)
+					}
 				}()
 			}
 		}
@@ -371,7 +393,7 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 	rf.timerState.setElectionTimer()
 
 	args := rpcMsg.req.(AppendEntry)
-	reply := rpcReply{}
+	reply := rpcReply{res: AppendEntryReply{}}
 	res := reply.res.(AppendEntryReply)
 	defer func() { rpcMsg.res <- reply }()
 
@@ -386,8 +408,9 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 
 	// 任期数落后或相等，如果是候选者，需要降级
 	// 后续操作都在 Follower 角色下完成
-	if args.term > rfTerm || rf.roleState.getRoleStage() != Follower {
-		if !rf.becomeFollower(rf.roleState.getRoleStage(), args.term) {
+	stage := rf.roleState.getRoleStage()
+	if args.term > rfTerm || (stage != Follower && stage != Learner) {
+		if !rf.becomeFollower(stage, args.term) {
 			reply.err = fmt.Errorf("节点降级失败")
 			return
 		}
@@ -448,6 +471,11 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 		// ========== 接收心跳 ==========
 		rf.peerState.setLeader(args.leaderId)
 		res.term = rf.hardState.currentTerm()
+
+		// 已接收到全部日志，从 Learner 角色升级为 Follower
+		if rf.roleState.getRoleStage() == Learner {
+			rf.roleState.setRoleStage(Follower)
+		}
 
 		// 更新提交索引
 		leaderCommit := args.leaderCommit
