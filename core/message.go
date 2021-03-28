@@ -26,7 +26,6 @@ type status uint8
 const (
 	OK status = iota
 	NotLeader
-	Timeout  // todo 请求超时
 )
 
 type server struct {
@@ -49,7 +48,7 @@ type AppendEntry struct {
 	prevLogIndex int       // 要发送的日志条目的前一个条目的索引
 	prevLogTerm  int       // prevLogIndex 条目所处任期
 	leaderCommit int       // Leader 提交的索引
-	entries      []Entry   // 日志条目（心跳为空；todo 为提高效率可能发送多个）
+	entries      []Entry   // 日志条目
 }
 
 type AppendEntryReply struct {
