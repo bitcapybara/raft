@@ -218,7 +218,7 @@ func newSoftState() *SoftState {
 	}
 }
 
-func (st *SoftState) softCommitIndex() int {
+func (st *SoftState) getCommitIndex() int {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	return st.commitIndex
@@ -243,7 +243,7 @@ func (st *SoftState) lastAppliedAdd() int {
 	return st.lastApplied
 }
 
-func (st *SoftState) softLastApplied() int {
+func (st *SoftState) getLastApplied() int {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	return st.lastApplied

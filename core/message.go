@@ -10,6 +10,7 @@ const (
 	EntryChangeConf
 	EntryHeartbeat
 	EntryTimeoutNow
+	EntryPromote
 )
 
 // 日志条目
@@ -25,7 +26,7 @@ type status uint8
 const (
 	OK status = iota
 	NotLeader
-	Timeout
+	Timeout  // todo 请求超时
 )
 
 type server struct {
