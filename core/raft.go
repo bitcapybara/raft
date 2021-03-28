@@ -530,11 +530,7 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 			}
 		}
 		// 当日志量超过阈值时，生成快照
-		go func() {
-			if !rf.snapshotState.needGenSnapshot(rf.softState.getCommitIndex()) {
-				// todo 生成快照
-			}
-		}()
+		rf.checkSnapshot()
 		replyRes.success = true
 		return
 	}
@@ -739,11 +735,7 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 	}
 
 	// 当日志量超过阈值时，生成快照
-	go func() {
-		if !rf.snapshotState.needGenSnapshot(rf.softState.getCommitIndex()) {
-			// todo 生成快照
-		}
-	}()
+	rf.checkSnapshot()
 
 	replyRes.status = OK
 }
@@ -801,6 +793,22 @@ func (rf *raft) handleNewNode(msg rpc) {
 	rf.addReplication(newNode.id, newNode.addr)
 	// 触发复制
 	rf.leaderState.followers()[newNode.id].triggerCh <- struct{}{}
+}
+
+func (rf *raft) checkSnapshot() {
+	go func() {
+		if !rf.snapshotState.needGenSnapshot(rf.softState.getCommitIndex()) {
+			data, serializeErr := rf.fsm.Serialize()
+			if serializeErr != nil {
+				log.Println(fmt.Errorf("状态机生成快照失败！%w", serializeErr))
+			}
+			newSnapshot := Snapshot{rf.softState.lastApplied, rf.hardState.currentTerm(), data}
+			saveErr := rf.snapshotState.save(newSnapshot)
+			if saveErr != nil {
+				log.Println(fmt.Errorf("保存快照失败！%w", serializeErr))
+			}
+		}
+	}()
 }
 
 func (rf *raft) checkTransfer(id NodeId) {

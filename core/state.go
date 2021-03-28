@@ -90,7 +90,6 @@ func (st *HardState) currentTerm() int {
 	return st.term
 }
 
-// todo 传入的必须是物理索引
 func (st *HardState) logEntryTerm(index int) int {
 	st.mu.Lock()
 	defer st.mu.Unlock()
