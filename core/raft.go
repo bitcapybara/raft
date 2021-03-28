@@ -21,6 +21,30 @@ type finishMsg struct {
 	term    int
 }
 
+// 配置参数
+type Config struct {
+	Fsm                Fsm
+	RaftStatePersister RaftStatePersister
+	SnapshotPersister  SnapshotPersister
+	Transport          Transport
+	Peers              map[NodeId]NodeAddr
+	Me                 NodeId
+	ElectionMinTimeout int
+	ElectionMaxTimeout int
+	HeartbeatTimeout   int
+	MaxLogLength       int
+}
+
+// 客户端状态机接口
+type Fsm interface {
+	// 参数实际上是 Entry 的 Data 字段
+	// 返回值是应用状态机后的结果
+	Apply([]byte) error
+
+	// 生成快照二进制数据
+	Serialize() ([]byte, error)
+}
+
 type raft struct {
 	roleState     *RoleState     // 当前节点的角色
 	fsm           Fsm            // 客户端状态机
@@ -373,9 +397,7 @@ func (rf *raft) addReplication(id NodeId, addr NodeAddr) {
 					// 设置状态
 					rf.leaderState.setRpcBusy(st.id, true)
 					defer rf.leaderState.setRpcBusy(st.id, false)
-					// 复制日志
-
-					// 将节点类型提升为 Follower
+					// 复制日志，成功后将节点角色提升为 Follower
 					if rf.replicate(st) && rf.leaderState.followerState[id].role == Learner {
 						func() {
 							finishCh := make(chan finishMsg)
@@ -507,6 +529,12 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 				replyRes.success = true
 			}
 		}
+		// 当日志量超过阈值时，生成快照
+		go func() {
+			if !rf.snapshotState.needGenSnapshot(rf.softState.getCommitIndex()) {
+				// todo 生成快照
+			}
+		}()
 		replyRes.success = true
 		return
 	}
@@ -593,7 +621,8 @@ func (rf *raft) handleVoteReq(rpcMsg rpc) {
 	}
 }
 
-// Follower 接收来自 Leader 的 InstallSnapshot 调用
+// 慢 Follower 接收来自 Leader 的 InstallSnapshot 调用
+// 目的是加快日志追赶速度
 func (rf *raft) handleSnapshot(rpcMsg rpc) {
 
 	args := rpcMsg.req.(InstallSnapshot)
@@ -710,18 +739,12 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 	}
 
 	// 当日志量超过阈值时，生成快照
-	if !rf.snapshotState.needGenSnapshot(rf.softState.getCommitIndex()) {
-		replyRes.status = OK
-		return
-	}
-	data, serializeErr := rf.fsm.Serialize()
-	if serializeErr != nil {
-		replyErr = fmt.Errorf("从状态机序列化快照失败：%w", serializeErr)
-		return
-	}
+	go func() {
+		if !rf.snapshotState.needGenSnapshot(rf.softState.getCommitIndex()) {
+			// todo 生成快照
+		}
+	}()
 
-	// 快照数据发送给所有 Follower 节点
-	rf.sendSnapshot(data)
 	replyRes.status = OK
 }
 
@@ -942,18 +965,6 @@ func encodePeersMap(peers map[NodeId]NodeAddr) ([]byte, error) {
 	return data.Bytes(), nil
 }
 
-func (rf *raft) sendSnapshot(bytes []byte) {
-	finishCh := make(chan finishMsg)
-	defer close(finishCh)
-
-	stopCh := make(chan struct{})
-	defer close(stopCh)
-	for id, addr := range rf.peerState.peers() {
-		go rf.snapshotTo(id, addr, bytes, finishCh, stopCh)
-	}
-	rf.waitRpcResult(finishCh)
-}
-
 // Leader 给某个节点发送心跳/日志
 func (rf *raft) replicationTo(id NodeId, finishCh chan finishMsg, stopCh chan struct{}, entryType EntryType) {
 	var msg finishMsg
@@ -1141,17 +1152,6 @@ func (rf *raft) snapshotTo(id NodeId, addr NodeAddr, data []byte, finishCh chan 
 			finishCh <- msg
 		}
 	}()
-	if rf.peerState.isMe(id) {
-		// 自己保存快照
-		newSnapshot := Snapshot{
-			LastIndex: rf.softState.getCommitIndex(),
-			LastTerm:  rf.hardState.currentTerm(),
-			Data:      data,
-		}
-		if saveErr := rf.snapshotState.save(newSnapshot); saveErr != nil {
-			log.Println(fmt.Errorf("本地保存快照失败：%w", saveErr))
-		}
-	}
 	args := InstallSnapshot{
 		term:              rf.hardState.currentTerm(),
 		leaderId:          rf.peerState.myId(),
