@@ -1,4 +1,4 @@
-package core
+package raft
 
 type rpcType uint8
 

@@ -1,4 +1,4 @@
-package core
+package raft
 
 import (
 	"bytes"
@@ -396,17 +396,17 @@ type LeaderState struct {
 	stepDownCh    chan int                // 接收降级通知
 	done          chan NodeId             // 日志复制结束
 	followerState map[NodeId]*Replication // 代表了一个复制日志的 Follower 节点
-	transfer      *transfer                // 领导权转移状态
-	configChange  *configChange            // 配置变更状态
+	transfer      *transfer               // 领导权转移状态
+	configChange  *configChange           // 配置变更状态
 }
 
 func newLeaderState() *LeaderState {
 	return &LeaderState{
-		stepDownCh: make(chan int),
-		done: make(chan NodeId),
+		stepDownCh:    make(chan int),
+		done:          make(chan NodeId),
 		followerState: make(map[NodeId]*Replication),
-		transfer: newTransfer(),
-		configChange: &configChange{},
+		transfer:      newTransfer(),
+		configChange:  &configChange{},
 	}
 }
 

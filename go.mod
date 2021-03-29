@@ -1,3 +1,3 @@
-module github.com/bitcapybara/go-raft
+module github.com/bitcapybara/raft
 
 go 1.15

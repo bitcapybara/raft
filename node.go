@@ -1,4 +1,4 @@
-package core
+package raft
 
 const (
 	// 来自 Leader 的日志复制请求
@@ -32,14 +32,14 @@ type rpcReply struct {
 type Node struct {
 	raft   *raft
 	config Config // 节点配置对象
-	rpcCh chan rpc
+	rpcCh  chan rpc
 }
 
 func NewNode(config Config) *Node {
 	return &Node{
 		raft:   newRaft(config),
 		config: config,
-		rpcCh: make(chan rpc),
+		rpcCh:  make(chan rpc),
 	}
 }
 

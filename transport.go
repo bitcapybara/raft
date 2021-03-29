@@ -1,4 +1,4 @@
-package core
+package raft
 
 // 网络通信接口，由客户端实现
 type Transport interface {
