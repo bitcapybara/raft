@@ -1,7 +1,5 @@
 package raft
 
-import "io"
-
 type LogLevel uint8
 
 const (
@@ -14,12 +12,6 @@ const (
 )
 
 type Logger interface {
-	Output() io.Writer
-	SetOutput(w io.Writer)
-	Prefix() string
-	SetPrefix(p string)
-	Level() LogLevel
-	SetLevel(v LogLevel)
 	Trace(msg string)
 	Debug(msg string)
 	Info(msg string)
