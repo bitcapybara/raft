@@ -31,9 +31,9 @@ type RoleState struct {
 	mu        sync.Mutex // 角色并发访问锁
 }
 
-func newRoleState() *RoleState {
+func newRoleState(stage RoleStage) *RoleState {
 	return &RoleState{
-		roleStage: Learner,
+		roleStage: stage,
 	}
 }
 

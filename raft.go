@@ -13,6 +13,7 @@ const (
 	Success finishMsgType = iota
 	RpcFailed
 	Degrade
+	Timeout
 )
 
 type finishMsg struct {
@@ -26,8 +27,10 @@ type Config struct {
 	RaftStatePersister RaftStatePersister
 	SnapshotPersister  SnapshotPersister
 	Transport          Transport
+	Logger             Logger
 	Peers              map[NodeId]NodeAddr
 	Me                 NodeId
+	Role               RoleStage
 	ElectionMinTimeout int
 	ElectionMaxTimeout int
 	HeartbeatTimeout   int
@@ -80,9 +83,10 @@ func newRaft(config Config) *raft {
 	hardState := raftState.toHardState(raftPst)
 
 	return &raft{
-		roleState:     newRoleState(),
 		fsm:           config.Fsm,
 		transport:     config.Transport,
+		logger:        config.Logger,
+		roleState:     newRoleState(config.Role),
 		hardState:     &hardState,
 		softState:     newSoftState(),
 		peerState:     newPeerState(config.Peers, config.Me),
@@ -105,12 +109,16 @@ func (rf *raft) raftRun(rpcCh chan rpc) {
 			}
 			switch rf.roleState.getRoleStage() {
 			case Leader:
+				rf.logger.Trace("开启runLeader()循环")
 				rf.runLeader()
 			case Candidate:
+				rf.logger.Trace("开启runCandidate()循环")
 				rf.runCandidate()
 			case Follower:
+				rf.logger.Trace("开启runFollower()循环")
 				rf.runFollower()
 			case Learner:
+				rf.logger.Trace("开启runLearner()循环")
 				rf.runLearner()
 			}
 		}
@@ -118,17 +126,21 @@ func (rf *raft) raftRun(rpcCh chan rpc) {
 }
 
 func (rf *raft) runLeader() {
+	rf.logger.Trace("进入 runLeader()")
 	// 初始化心跳定时器
 	rf.timerState.setHeartbeatTimer()
+	rf.logger.Trace("初始化心跳定时器成功")
 
 	// 开启日志复制循环
 	rf.runReplication()
+	rf.logger.Trace("开启日志复制循环")
 
 	// 节点退出 Leader 状态，收尾工作
 	defer func() {
 		for _, st := range rf.leaderState.followerState {
 			close(st.stopCh)
 		}
+		rf.logger.Trace("退出 runLeader()，关闭各个 replication 的 stopCh")
 	}()
 
 	for rf.roleState.getRoleStage() == Leader {
@@ -136,46 +148,69 @@ func (rf *raft) runLeader() {
 		case msg := <-rf.rpcCh:
 			if transfereeId, busy := rf.leaderState.isTransferBusy(); busy {
 				// 如果正在进行领导权转移
+				rf.logger.Trace("节点正在进行领导权转移，请求失败！")
+				msg.res <- rpcReply{err: fmt.Errorf("正在进行领导权转移，请求失败！")}
 				rf.checkTransfer(transfereeId)
 			} else {
 				switch msg.rpcType {
 				case AppendEntryRpc:
+					rf.logger.Trace("接收到 AppendEntryRpc 请求")
 					rf.handleCommand(msg)
 				case RequestVoteRpc:
+					rf.logger.Trace("接收到 RequestVoteRpc 请求")
 					rf.handleVoteReq(msg)
 				case ApplyCommandRpc:
+					rf.logger.Trace("接收到 ApplyCommandRpc 请求")
 					rf.handleClientCmd(msg)
 				case ChangeConfigRpc:
+					rf.logger.Trace("接收到 ChangeConfigRpc 请求")
 					rf.handleConfiguration(msg)
 				case TransferLeadershipRpc:
+					rf.logger.Trace("接收到 TransferLeadershipRpc 请求")
 					rf.handleTransfer(msg)
 				case AddNewNodeRpc:
+					rf.logger.Trace("接收到 AddNewNodeRpc 请求")
 					rf.handleNewNode(msg)
 				}
 			}
 		case <-rf.timerState.tick():
+			rf.logger.Trace("心跳计时器到期，开始发送心跳")
 			stopCh := make(chan struct{})
 			finishCh := rf.heartbeat(stopCh)
 			successCnt := 1
-			for msg := range finishCh {
-				if msg.msgType == Degrade && rf.becomeFollower(Leader, msg.term) {
-					return
-				}
-				if msg.msgType == Success {
-					successCnt += 1
-				}
-				if successCnt >= rf.peerState.majority() {
-					break
+			end := false
+			for end {
+				select {
+				case <-time.After(rf.timerState.heartbeatDuration()):
+					end = true
+				case msg := <-finishCh:
+					if msg.msgType == Degrade && rf.becomeFollower(Leader, msg.term) {
+						rf.logger.Trace("降级为 Follower")
+						end = true
+					}
+					if msg.msgType == Success {
+						rf.logger.Trace("成功获取到一个心跳结果")
+						successCnt += 1
+					}
+					if successCnt >= rf.peerState.majority() {
+						rf.logger.Trace("心跳已发送给多数节点")
+						end = true
+					}
 				}
 			}
+			close(finishCh)
 			close(stopCh)
 		case id := <-rf.leaderState.done:
 			if transfereeId, busy := rf.leaderState.isTransferBusy(); busy && transfereeId == id {
+				rf.logger.Trace("领导权转移的目标节点日志复制结束，开始领导权转移")
 				rf.checkTransfer(transfereeId)
+				rf.logger.Trace("领导权转移结束")
 			}
 		case msg := <-rf.leaderState.stepDownCh:
 			// 接收到降级消息
+			rf.logger.Trace("接收到降级消息")
 			if rf.becomeFollower(Leader, msg) {
+				rf.logger.Trace("Leader降级成功")
 				return
 			}
 		}
@@ -185,9 +220,11 @@ func (rf *raft) runLeader() {
 func (rf *raft) runCandidate() {
 	// 初始化选举计时器
 	rf.timerState.setElectionTimer()
+	rf.logger.Trace("初始化选举计时器成功")
 	// 开始选举
 	stopCh := make(chan struct{})
 	defer close(stopCh)
+	rf.logger.Trace("开始选举")
 	finishCh := rf.election(stopCh)
 
 	successCnt := 1
@@ -195,27 +232,30 @@ func (rf *raft) runCandidate() {
 		select {
 		case <-rf.timerState.tick():
 			// 开启下一轮选举
+			rf.logger.Trace("选举计时器到期，开始下一轮选举")
 			return
 		case msg := <-rf.rpcCh:
 			switch msg.rpcType {
 			case AppendEntryRpc:
+				rf.logger.Trace("接收到 AppendEntryRpc 请求")
 				rf.handleCommand(msg)
 			case RequestVoteRpc:
+				rf.logger.Trace("接收到 RequestVoteRpc 请求")
 				rf.handleVoteReq(msg)
 			}
-		case msg, ok := <-finishCh:
-			if !ok {
-				return
-			}
+		case msg := <-finishCh:
 			// 降级
 			if msg.msgType == Degrade && rf.becomeFollower(Candidate, msg.term) {
+				rf.logger.Trace("降级为 Follower")
 				return
 			}
 			if msg.msgType == Success {
+				rf.logger.Trace("成功获取到一个投票")
 				successCnt += 1
 			}
 			// 升级
 			if successCnt >= rf.peerState.majority() && rf.becomeLeader() {
+				rf.logger.Trace("获取到多数节点投票，升级为 Leader")
 				return
 			}
 		}
@@ -225,19 +265,24 @@ func (rf *raft) runCandidate() {
 func (rf *raft) runFollower() {
 	// 初始化选举计时器
 	rf.timerState.setElectionTimer()
+	rf.logger.Trace("初始化选举计时器成功")
 	for rf.roleState.getRoleStage() == Follower {
 		select {
 		case <-rf.timerState.tick():
 			// 成为候选者
+			rf.logger.Trace("选举计时器到期，开启新一轮选举")
 			rf.becomeCandidate()
 			return
 		case msg := <-rf.rpcCh:
 			switch msg.rpcType {
 			case AppendEntryRpc:
+				rf.logger.Trace("接收到 AppendEntryRpc 请求")
 				rf.handleCommand(msg)
 			case RequestVoteRpc:
+				rf.logger.Trace("接收到 RequestVoteRpc 请求")
 				rf.handleVoteReq(msg)
 			case InstallSnapshotRpc:
+				rf.logger.Trace("接收到 InstallSnapshotRpc 请求")
 				rf.handleSnapshot(msg)
 			}
 		}
@@ -250,6 +295,7 @@ func (rf *raft) runLearner() {
 		case msg := <-rf.rpcCh:
 			switch msg.rpcType {
 			case AppendEntryRpc:
+				rf.logger.Trace("接收到 AppendEntryRpc 请求")
 				rf.handleCommand(msg)
 			}
 		}
@@ -258,7 +304,7 @@ func (rf *raft) runLearner() {
 
 // ==================== logic process ====================
 
-func (rf *raft) heartbeat(stopCh chan struct{}) <-chan finishMsg {
+func (rf *raft) heartbeat(stopCh chan struct{}) chan finishMsg {
 
 	// 重置心跳计时器
 	rf.timerState.setHeartbeatTimer()
@@ -1019,6 +1065,7 @@ func (rf *raft) replicationTo(id NodeId, finishCh chan finishMsg, stopCh chan st
 	} else if entryType != EntryChangeConf {
 		// Follower 和 Leader 的日志不匹配，进行日志追赶
 		rf.leaderState.followerState[id].triggerCh <- struct{}{}
+		msg = finishMsg{msgType: Success}
 	}
 }
 
