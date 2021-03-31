@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/gob"
 	"fmt"
-	"log"
 	"time"
 )
 
@@ -46,9 +45,10 @@ type Fsm interface {
 }
 
 type raft struct {
-	roleState     *RoleState     // 当前节点的角色
 	fsm           Fsm            // 客户端状态机
 	transport     Transport      // 发送请求的接口
+	logger        Logger         // 日志打印
+	roleState     *RoleState     // 当前节点的角色
 	hardState     *HardState     // 需要持久化存储的状态
 	softState     *SoftState     // 保存在内存中的实时状态
 	peerState     *PeerState     // 对等节点状态和路由表
@@ -62,7 +62,7 @@ type raft struct {
 
 func newRaft(config Config) *raft {
 	if config.ElectionMinTimeout > config.ElectionMaxTimeout {
-		panic("ElectionMinTimeout cannot greater than ElectionMaxTimeout!")
+		panic("ElectionMinTimeout 不能大于 ElectionMaxTimeout！")
 	}
 	raftPst := config.RaftStatePersister
 
@@ -289,7 +289,7 @@ func (rf *raft) election(stopCh chan struct{}) <-chan finishMsg {
 	// 增加 term 数
 	err := rf.hardState.termAddAndVote(1, rf.peerState.myId())
 	if err != nil {
-		log.Println(err)
+		rf.logger.Error(fmt.Errorf("增加term，设置votedFor失败%w", err).Error())
 	}
 
 	return rf.sendRequestVote(stopCh)
@@ -323,7 +323,7 @@ func (rf *raft) sendRequestVote(stopCh <-chan struct{}) chan finishMsg {
 			rpcErr := rf.transport.RequestVote(addr, args, res)
 
 			if rpcErr != nil {
-				log.Println(fmt.Errorf("调用rpc服务失败：%s%w\n", addr, rpcErr))
+				rf.logger.Error(fmt.Errorf("调用rpc服务失败：%s%w\n", addr, rpcErr).Error())
 				msg = finishMsg{msgType: RpcFailed}
 				return
 			}
@@ -405,7 +405,7 @@ func (rf *raft) addReplication(id NodeId, addr NodeAddr) {
 							stopCh := make(chan struct{})
 							defer close(stopCh)
 							rf.replicationTo(id, finishCh, stopCh, EntryPromote)
-							msg := <- finishCh
+							msg := <-finishCh
 							if msg.msgType == Success {
 								rf.leaderState.roleUpgrade(st.id)
 								rf.peerState.addPeer(st.id, st.addr)
@@ -498,7 +498,7 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 		// 将新条目添加到日志中
 		err := rf.addEntry(args.entries[0])
 		if err != nil {
-			log.Println(err)
+			rf.logger.Error(fmt.Errorf("日志添加新条目失败！%w", err).Error())
 			replyRes.success = false
 		} else {
 			replyRes.success = true
@@ -605,7 +605,7 @@ func (rf *raft) handleVoteReq(rpcMsg rpc) {
 		if args.lastLogTerm > lastTerm || (args.lastLogTerm == lastTerm && args.lastLogIndex >= lastIndex) {
 			voteErr := rf.hardState.vote(args.candidateId)
 			if voteErr != nil {
-				log.Println(fmt.Errorf("投票失败：%w", voteErr))
+				rf.logger.Error(fmt.Errorf("投票失败：%s", voteErr).Error())
 			} else {
 				replyRes.voteGranted = true
 			}
@@ -800,12 +800,12 @@ func (rf *raft) checkSnapshot() {
 		if !rf.snapshotState.needGenSnapshot(rf.softState.getCommitIndex()) {
 			data, serializeErr := rf.fsm.Serialize()
 			if serializeErr != nil {
-				log.Println(fmt.Errorf("状态机生成快照失败！%w", serializeErr))
+				rf.logger.Error(fmt.Errorf("状态机生成快照失败！%w", serializeErr).Error())
 			}
 			newSnapshot := Snapshot{rf.softState.lastApplied, rf.hardState.currentTerm(), data}
 			saveErr := rf.snapshotState.save(newSnapshot)
 			if saveErr != nil {
-				log.Println(fmt.Errorf("保存快照失败！%w", serializeErr))
+				rf.logger.Error(fmt.Errorf("保存快照失败！%w", serializeErr).Error())
 			}
 		}
 	}()
@@ -1003,7 +1003,7 @@ func (rf *raft) replicationTo(id NodeId, finishCh chan finishMsg, stopCh chan st
 
 	// 处理 RPC 调用结果
 	if err != nil {
-		log.Println(fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err))
+		rf.logger.Error(fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err).Error())
 		msg = finishMsg{msgType: RpcFailed}
 		return
 	}
@@ -1066,7 +1066,7 @@ func (rf *raft) findCorrectNextIndex(s *Replication) bool {
 		}
 
 		if err != nil {
-			log.Println(fmt.Errorf("调用rpc服务失败：%s%w\n", s.addr, err))
+			rf.logger.Error(fmt.Errorf("调用rpc服务失败：%s%w\n", s.addr, err).Error())
 			return false
 		}
 		if res.term > rf.hardState.currentTerm() && !rf.becomeFollower(Leader, res.term) {
@@ -1137,7 +1137,7 @@ func (rf *raft) completeEntries(s *Replication) bool {
 		}
 
 		if rpcErr != nil {
-			log.Println(fmt.Errorf("调用rpc服务失败：%s%w\n", s.addr, rpcErr))
+			rf.logger.Error(fmt.Errorf("调用rpc服务失败：%s%w\n", s.addr, rpcErr).Error())
 			return false
 		}
 		if res.term > rf.hardState.currentTerm() && rf.becomeFollower(Leader, res.term) {
@@ -1172,7 +1172,7 @@ func (rf *raft) snapshotTo(id NodeId, addr NodeAddr, data []byte, finishCh chan 
 	res := &InstallSnapshotReply{}
 	err := rf.transport.InstallSnapshot(addr, args, res)
 	if err != nil {
-		log.Println(fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err))
+		rf.logger.Error(fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err).Error())
 		msg = finishMsg{msgType: RpcFailed}
 		return
 	}
@@ -1237,7 +1237,7 @@ func (rf *raft) becomeFollower(stage RoleStage, term int) bool {
 
 	err := rf.hardState.setTerm(term)
 	if err != nil {
-		log.Println(fmt.Errorf("降级失败%w", err))
+		rf.logger.Error(fmt.Errorf("降级失败%w", err).Error())
 		return false
 	}
 	rf.setRoleStage(Follower)

@@ -111,7 +111,7 @@ func (nd *Node) TransferLeadership(args TransferLeadership, res *TransferLeaders
 	}
 }
 
-// Leader 开放的 rpc 接口，由客户端调用，添加新节点
+// Leader 开放的 rpc 接口，由客户端调用，添加新的空白节点
 func (nd *Node) AddNewNode(args AddNewNode, res *AddNewNodeReply) error {
 	if msg := nd.sendRpc(AddNewNodeRpc, args); msg.err != nil {
 		return msg.err
