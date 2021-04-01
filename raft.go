@@ -148,8 +148,8 @@ func (rf *raft) runLeader() {
 		case msg := <-rf.rpcCh:
 			if transfereeId, busy := rf.leaderState.isTransferBusy(); busy {
 				// 如果正在进行领导权转移
-				rf.logger.Trace("节点正在进行领导权转移，请求失败！")
-				msg.res <- rpcReply{err: fmt.Errorf("正在进行领导权转移，请求失败！")}
+				rf.logger.Trace("节点正在进行领导权转移，请求驳回！")
+				msg.res <- rpcReply{err: fmt.Errorf("正在进行领导权转移，请求驳回！")}
 				rf.checkTransfer(transfereeId)
 			} else {
 				switch msg.rpcType {
@@ -660,8 +660,12 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 
 	if args.entryType == EntryTimeoutNow {
 		rf.logger.Trace("接收到 timeoutNow 请求")
-		rf.becomeCandidate()
-		rf.logger.Trace("角色成功变为 Candidate")
+		replyRes.success = rf.becomeCandidate()
+		if replyRes.success {
+			rf.logger.Trace("角色成功变为 Candidate")
+		} else {
+			rf.logger.Trace("角色变为候选者失败")
+		}
 	}
 
 	// 已接收到全部日志，从 Learner 角色升级为 Follower
@@ -831,7 +835,7 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 	rf.logger.Trace("重置心跳计时器成功")
 
 	args := rpcMsg.req.(ApplyCommand)
-	replyRes := ApplyCommandReply{}
+	var replyRes ApplyCommandReply
 	var replyErr error
 	defer func() {
 		rpcMsg.res <- rpcReply{
@@ -988,33 +992,51 @@ func (rf *raft) checkSnapshot() {
 func (rf *raft) checkTransfer(id NodeId) {
 	select {
 	case <-rf.leaderState.transfer.timer.C:
+		rf.logger.Trace("领导权转移超时")
 		rf.leaderState.setTransferBusy(None)
 	default:
 		if rf.leaderState.isRpcBusy(id) {
 			// 若目标节点正在复制日志，则继续等待
+			rf.logger.Trace("目标节点正在进行日志复制，继续等待")
 			return
 		}
 		if rf.leaderState.matchIndex(id) == rf.lastLogIndex() {
 			// 目标节点日志已是最新，发送 timeoutNow 消息
-			args := AppendEntry{entryType: EntryTimeoutNow}
-			res := &AppendEntryReply{}
-			err := rf.transport.AppendEntries(rf.peerState.peers()[id], args, res)
-			reply := rf.leaderState.transfer.reply
-			if err != nil {
-				reply <- rpcReply{err: err}
-				return
-			}
-			term := rf.hardState.currentTerm()
-			if res.term > term {
-				term = res.term
-				reply <- rpcReply{err: fmt.Errorf("term 落后，角色降级")}
-			} else {
-				reply <- rpcReply{res: res}
-			}
-			rf.becomeFollower(term)
-			rf.leaderState.setTransferBusy(None)
+			func() {
+				var replyRes AppendEntryReply
+				var replyErr error
+				defer func() {
+					rf.leaderState.transfer.reply <- rpcReply{
+						res: replyRes,
+						err: replyErr,
+					}
+				}()
+				rf.logger.Trace(fmt.Sprintf("目标节点 id=%s 日志已是最新，发送 timeoutNow 消息", id))
+				args := AppendEntry{entryType: EntryTimeoutNow}
+				res := &AppendEntryReply{}
+				rpcErr := rf.transport.AppendEntries(rf.peerState.peers()[id], args, res)
+				if rpcErr != nil {
+					replyErr = fmt.Errorf("rpc 调用失败。%w", rpcErr)
+					rf.logger.Trace(replyErr.Error())
+					return
+				}
+				term := rf.hardState.currentTerm()
+				if res.term > term {
+					term = res.term
+					replyErr = fmt.Errorf("term 落后，角色降级")
+					rf.logger.Trace(replyErr.Error())
+				} else {
+					rf.logger.Trace(fmt.Sprintf("领导权转移结果：%t", res.success))
+					if res.success {
+						rf.becomeFollower(term)
+						rf.leaderState.setTransferBusy(None)
+					}
+					replyRes = *res
+				}
+			}()
 		} else {
 			// 目标节点不是最新，开始日志复制
+			rf.logger.Trace("目标节点不是最新，开始日志复制")
 			rf.leaderState.followerState[id].triggerCh <- struct{}{}
 		}
 	}
