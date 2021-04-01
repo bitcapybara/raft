@@ -49,19 +49,6 @@ func (st *RoleState) getRoleStage() RoleStage {
 	return st.roleStage
 }
 
-func (st *RoleState) lock(stage RoleStage) bool {
-	st.mu.Lock()
-	if st.roleStage != stage {
-		st.mu.Unlock()
-		return false
-	}
-	return true
-}
-
-func (st *RoleState) unlock() {
-	st.mu.Unlock()
-}
-
 // ==================== HardState ====================
 
 // 需要持久化存储的状态
