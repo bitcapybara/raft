@@ -904,6 +904,14 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 // 处理成员变更请求
 func (rf *raft) handleConfiguration(msg rpc) {
 	newConfig := msg.req.(ChangeConfig)
+	replyRes := AppendEntryReply{}
+	var replyErr error
+	defer func() {
+		msg.res <- rpcReply{
+			res: replyRes,
+			err: replyErr,
+		}
+	}()
 
 	// C(new) 配置
 	newPeers := newConfig.peers
@@ -924,14 +932,16 @@ func (rf *raft) handleConfiguration(msg rpc) {
 
 	// 分发 C(old,new) 配置
 	rf.logger.Trace("分发 C(old,new) 配置")
-	if !rf.sendOldNewConfig(oldNewPeers, msg) {
+	if oldNewConfigErr := rf.sendOldNewConfig(oldNewPeers); oldNewConfigErr != nil {
+		replyErr = oldNewConfigErr
 		rf.logger.Trace("C(old,new) 配置分发失败")
 		return
 	}
 
 	// 分发 C(new) 配置
 	rf.logger.Trace("分发 C(new) 配置")
-	if !rf.sendConfiguration(newPeers, msg) {
+	if newConfigErr := rf.sendNewConfig(newPeers); newConfigErr != nil {
+		replyErr = newConfigErr
 		rf.logger.Trace("C(new) 配置分发失败")
 		return
 	}
@@ -953,6 +963,7 @@ func (rf *raft) handleConfiguration(msg rpc) {
 			delete(followers, id)
 		}
 	}
+	replyRes.success = true
 }
 
 // 处理添加新节点请求
@@ -1042,53 +1053,58 @@ func (rf *raft) checkTransfer(id NodeId) {
 	}
 }
 
-func (rf *raft) sendOldNewConfig(peers map[NodeId]NodeAddr, msg rpc) bool {
+func (rf *raft) sendOldNewConfig(peers map[NodeId]NodeAddr) error {
+
 	oldNewPeersData, enOldNewErr := encodePeersMap(peers)
 	if enOldNewErr != nil {
-		msg.res <- rpcReply{err: enOldNewErr}
-		return false
+		return fmt.Errorf("序列化peers字典失败！%w", enOldNewErr)
 	}
 
 	// C(old,new)配置添加到状态
 	addEntryErr := rf.addEntry(Entry{Type: EntryChangeConf, Data: oldNewPeersData})
 	if addEntryErr != nil {
-		msg.res <- rpcReply{err: addEntryErr}
-		return false
+		return fmt.Errorf("将配置添加到日志失败！%w", addEntryErr)
 	}
 	rf.peerState.replacePeers(peers)
 
 	// C(old,new)发送到各个节点
-	finishCh := make(chan finishMsg)
-	defer close(finishCh)
-	stopCh := make(chan struct{})
-	defer close(stopCh)
-
 	// 先给旧节点发，再给新节点发
-	return rf.waitForConfig(rf.leaderState.getOldConfig(), finishCh, stopCh, msg) &&
-		rf.waitForConfig(rf.leaderState.getNewConfig(), finishCh, stopCh, msg)
+	if rf.waitForConfig(rf.leaderState.getOldConfig()) {
+		rf.logger.Trace("配置成功发送到旧节点的多数")
+		if rf.waitForConfig(rf.leaderState.getNewConfig()) {
+			rf.logger.Trace("配置成功发送到新节点的多数")
+			return nil
+		} else {
+			rf.logger.Trace("配置复制到新配置多数节点失败")
+			return fmt.Errorf("配置未复制到新配置多数节点")
+		}
+	} else {
+		rf.logger.Trace("配置复制到旧配置多数节点失败")
+		return fmt.Errorf("配置未复制到旧配置多数节点")
+	}
 }
 
-func (rf *raft) sendConfiguration(peers map[NodeId]NodeAddr, msg rpc) bool {
+func (rf *raft) sendNewConfig(peers map[NodeId]NodeAddr) error {
 
 	oldNewPeersData, enOldNewErr := encodePeersMap(peers)
 	if enOldNewErr != nil {
-		msg.res <- rpcReply{err: enOldNewErr}
-		return false
+		return fmt.Errorf("新配置序列化失败！%w", enOldNewErr)
 	}
 
 	// C(old,new)配置添加到状态
 	addEntryErr := rf.addEntry(Entry{Type: EntryChangeConf, Data: oldNewPeersData})
 	if addEntryErr != nil {
-		msg.res <- rpcReply{err: addEntryErr}
-		return false
+		return fmt.Errorf("将配置添加到日志失败！%w", addEntryErr)
 	}
 	rf.peerState.replacePeers(peers)
+	rf.logger.Trace("替换掉当前节点的 peers 配置")
 
 	// C(old,new)发送到各个节点
 	finishCh := make(chan finishMsg)
 	defer close(finishCh)
 	stopCh := make(chan struct{})
 	defer close(stopCh)
+	rf.logger.Trace("给各节点发送新配置")
 	for id := range rf.peerState.peers() {
 		// 不用给自己发
 		if rf.peerState.isMe(id) {
@@ -1100,30 +1116,45 @@ func (rf *raft) sendConfiguration(peers map[NodeId]NodeAddr, msg rpc) bool {
 
 	count := 1
 	successCnt := 1
-	for result := range finishCh {
-		if result.msgType == Degrade && rf.becomeFollower(result.term) {
-			return false
-		}
-		if result.msgType == Success {
-			successCnt += 1
-		}
-		count += 1
-		if successCnt >= rf.peerState.majority() {
-			break
-		}
-		if count >= rf.peerState.peersCnt() {
-			msg.res <- rpcReply{err: fmt.Errorf("日志未发送到多数节点")}
-			return false
+	end := false
+	for !end {
+		select {
+		case <- time.After(rf.timerState.heartbeatDuration()):
+			return fmt.Errorf("请求超时")
+		case msg := <- finishCh:
+			if msg.msgType == Degrade {
+				rf.logger.Trace("接收到降级请求")
+				if rf.becomeFollower(msg.term) {
+					rf.logger.Trace("降级成功")
+					return fmt.Errorf("降级为 Follower")
+				}
+			}
+			if msg.msgType == Success {
+				successCnt += 1
+			}
+			count += 1
+			if successCnt >= rf.peerState.majority() {
+				rf.logger.Trace("已发送到大多数节点")
+				end = true
+				break
+			}
+			if count >= rf.peerState.peersCnt() {
+				return fmt.Errorf("各节点已响应，但成功数不占多数")
+			}
 		}
 	}
 
 	// 提交日志
-	oldNewIndex := rf.lastLogIndex()
-	rf.softState.setCommitIndex(oldNewIndex)
-	return true
+	rf.logger.Trace("提交新配置日志")
+	rf.softState.setCommitIndex(rf.lastLogIndex())
+	return nil
 }
 
-func (rf *raft) waitForConfig(peers map[NodeId]NodeAddr, finishCh chan finishMsg, stopCh chan struct{}, msg rpc) bool {
+func (rf *raft) waitForConfig(peers map[NodeId]NodeAddr) bool {
+	finishCh := make(chan finishMsg)
+	defer close(finishCh)
+	stopCh := make(chan struct{})
+	defer close(stopCh)
 
 	for id := range peers {
 		// 不用给自己发
@@ -1148,7 +1179,6 @@ func (rf *raft) waitForConfig(peers map[NodeId]NodeAddr, finishCh chan finishMsg
 			break
 		}
 		if count >= rf.peerState.peersCnt() {
-			msg.res <- rpcReply{err: fmt.Errorf("日志未发送到多数节点")}
 			return false
 		}
 	}
