@@ -772,18 +772,25 @@ func (rf *raft) handleSnapshot(rpcMsg rpc) {
 	rfTerm := rf.hardState.currentTerm()
 	if args.term < rfTerm {
 		// Leader 的 term 过期，直接返回
+		rf.logger.Trace("发送快照的 Leader 任期落后，直接返回")
 		replyRes.term = rfTerm
 		return
 	}
 
 	// 持久化
 	replyRes.term = rfTerm
-	snapshot := Snapshot{args.lastIncludedIndex, args.lastIncludedTerm, args.data}
+	snapshot := Snapshot{
+		LastIndex: args.lastIncludedIndex,
+		LastTerm: args.lastIncludedTerm,
+		Data: args.data,
+	}
+
 	saveErr := rf.snapshotState.save(snapshot)
 	if saveErr != nil {
-		replyErr = saveErr
+		replyErr = fmt.Errorf("持久化快照失败：%w", saveErr)
 		return
 	}
+	rf.logger.Trace("持久化快照成功！")
 
 	if !args.done {
 		// 若传送没有完成，则继续接收数据
@@ -792,10 +799,12 @@ func (rf *raft) handleSnapshot(rpcMsg rpc) {
 
 	// 保存快照成功，删除多余日志
 	if args.lastIncludedIndex <= rf.hardState.logLength() && rf.logTerm(args.lastIncludedIndex) == args.lastIncludedTerm {
+		rf.logger.Trace("删除快照之前的旧日志")
 		rf.hardState.truncateEntries(args.lastIncludedIndex)
 		return
 	}
 
+	rf.logger.Trace("清空日志")
 	rf.hardState.clearEntries()
 }
 
@@ -807,8 +816,10 @@ func (rf *raft) handleTransfer(rpcMsg rpc) {
 	// 设置定时器和rpc应答通道
 	rf.leaderState.setTransferBusy(args.transferee.id)
 	rf.leaderState.setTransferState(timer, rpcMsg.res)
+	rf.logger.Trace("成功设置定时器和rpc应答通道")
 
 	// 查看目标节点日志是否最新
+	rf.logger.Trace("查看目标节点日志是否最新")
 	rf.checkTransfer(args.transferee.id)
 }
 
@@ -817,6 +828,7 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 
 	// 重置心跳计时器
 	rf.timerState.setHeartbeatTimer()
+	rf.logger.Trace("重置心跳计时器成功")
 
 	args := rpcMsg.req.(ApplyCommand)
 	replyRes := ApplyCommandReply{}
@@ -829,6 +841,7 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 	}()
 
 	if !rf.isLeader() {
+		rf.logger.Trace("当前节点不是 Leader，请求驳回")
 		replyRes = ApplyCommandReply{
 			status: NotLeader,
 			leader: rf.peerState.getLeader(),
@@ -837,9 +850,11 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 	}
 
 	// Leader 先将日志添加到内存
+	rf.logger.Trace("将日志添加到内存")
 	addEntryErr := rf.addEntry(Entry{Term: rf.hardState.currentTerm(), Type: EntryReplicate, Data: args.data})
 	if addEntryErr != nil {
 		replyErr = fmt.Errorf("leader 添加客户端日志失败：%w", addEntryErr)
+		rf.logger.Trace(replyErr.Error())
 		return
 	}
 
@@ -847,6 +862,7 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 	finishCh := make(chan finishMsg)
 	defer close(finishCh)
 	stopCh := make(chan struct{})
+	rf.logger.Trace("给各节点发送日志条目")
 	for id := range rf.peerState.peers() {
 		// 不用给自己发，正在复制日志的不发
 		if rf.peerState.isMe(id) || rf.leaderState.isRpcBusy(id) {
@@ -861,6 +877,7 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 	close(stopCh)
 	if !success {
 		replyErr = fmt.Errorf("rpc 完成，但日志未复制到多数节点")
+		rf.logger.Trace(replyErr.Error())
 		return
 	}
 
@@ -869,10 +886,12 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 	updateCmtErr := rf.updateLeaderCommit()
 	if updateCmtErr != nil {
 		replyErr = fmt.Errorf("leader 更新 commitIndex 失败：%w", updateCmtErr)
+		rf.logger.Trace(replyErr.Error())
 		return
 	}
 
 	// 当日志量超过阈值时，生成快照
+	rf.logger.Trace("检查是否需要生成快照")
 	rf.checkSnapshot()
 
 	replyRes.status = OK
@@ -885,24 +904,31 @@ func (rf *raft) handleConfiguration(msg rpc) {
 	// C(new) 配置
 	newPeers := newConfig.peers
 	rf.leaderState.setNewConfig(newPeers)
-	rf.leaderState.setOldConfig(rf.peerState.peers())
+	oldPeers := rf.peerState.peers()
+	rf.leaderState.setOldConfig(oldPeers)
+	rf.logger.Trace(fmt.Sprintf("旧配置：%s，新配置%s", oldPeers, newPeers))
 
 	// C(old,new) 配置
 	oldNewPeers := make(map[NodeId]NodeAddr)
-	for id, addr := range rf.peerState.peers() {
+	for id, addr := range oldPeers {
 		oldNewPeers[id] = addr
 	}
 	for id, addr := range newPeers {
 		oldNewPeers[id] = addr
 	}
+	rf.logger.Trace(fmt.Sprintf("C(old,new)=%s", oldNewPeers))
 
 	// 分发 C(old,new) 配置
+	rf.logger.Trace("分发 C(old,new) 配置")
 	if !rf.sendOldNewConfig(oldNewPeers, msg) {
+		rf.logger.Trace("C(old,new) 配置分发失败")
 		return
 	}
 
 	// 分发 C(new) 配置
+	rf.logger.Trace("分发 C(new) 配置")
 	if !rf.sendConfiguration(newPeers, msg) {
+		rf.logger.Trace("C(new) 配置分发失败")
 		return
 	}
 
@@ -910,10 +936,12 @@ func (rf *raft) handleConfiguration(msg rpc) {
 	peers := rf.peerState.peers()
 	// 如果当前节点被移除，退出程序
 	if _, ok := peers[rf.peerState.myId()]; !ok {
+		rf.logger.Trace("新配置中不包含当前节点，程序退出")
 		rf.exitCh <- struct{}{}
 		return
 	}
 	// 查看follower有没有被移除的
+	rf.logger.Trace("删除新配置中不包含的 replication")
 	followers := rf.leaderState.followers()
 	for id, f := range followers {
 		if _, ok := peers[id]; !ok {
@@ -928,6 +956,7 @@ func (rf *raft) handleNewNode(msg rpc) {
 	req := msg.req.(AddNewNode)
 	newNode := req.newNode
 	// 开启复制循环
+	rf.logger.Trace("新空白节点添加到 replication，并触发复制循环")
 	rf.addReplication(newNode.id, newNode.addr)
 	// 触发复制
 	rf.leaderState.followers()[newNode.id].triggerCh <- struct{}{}
@@ -935,16 +964,23 @@ func (rf *raft) handleNewNode(msg rpc) {
 
 func (rf *raft) checkSnapshot() {
 	go func() {
-		if !rf.snapshotState.needGenSnapshot(rf.softState.getCommitIndex()) {
+		if rf.needGenSnapshot() {
+			rf.logger.Trace("达成生成快照的条件")
 			data, serializeErr := rf.fsm.Serialize()
 			if serializeErr != nil {
 				rf.logger.Error(fmt.Errorf("状态机生成快照失败！%w", serializeErr).Error())
 			}
-			newSnapshot := Snapshot{rf.softState.lastApplied, rf.hardState.currentTerm(), data}
+			rf.logger.Trace("状态机生成快照成功")
+			newSnapshot := Snapshot{
+				LastIndex: rf.softState.lastApplied,
+				LastTerm: rf.hardState.currentTerm(),
+				Data: data,
+			}
 			saveErr := rf.snapshotState.save(newSnapshot)
 			if saveErr != nil {
 				rf.logger.Error(fmt.Errorf("保存快照失败！%w", serializeErr).Error())
 			}
+			rf.logger.Trace("持久化快照成功")
 		}
 	}()
 }
@@ -1471,4 +1507,8 @@ func (rf *raft) logTerm(index int) int {
 	} else {
 		return rf.logTerm(realIndex)
 	}
+}
+
+func (rf *raft) needGenSnapshot() bool {
+	return rf.softState.getCommitIndex()-rf.snapshotState.lastIndex() >= rf.snapshotState.logThreshold()
 }

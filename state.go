@@ -587,11 +587,8 @@ func (st *snapshotState) save(snapshot Snapshot) error {
 	return nil
 }
 
-func (st *snapshotState) needGenSnapshot(commitIndex int) bool {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	need := commitIndex-st.snapshot.LastIndex >= st.maxLogLength
-	return need
+func (st *snapshotState) logThreshold() int {
+	return st.maxLogLength
 }
 
 func (st *snapshotState) lastIndex() int {
