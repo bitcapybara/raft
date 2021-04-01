@@ -645,24 +645,31 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 	}
 
 	if args.entryType == EntryChangeConf {
+		rf.logger.Trace("接收到成员变更请求")
 		configData := args.entries[0].Data
 		peerErr := rf.peerState.replacePeersWithBytes(configData)
 		if peerErr != nil {
 			replyErr = peerErr
 			replyRes.success = false
+			rf.logger.Trace("新配置应用失败")
 		}
+		rf.logger.Trace(fmt.Sprintf("新配置应用成功，peers=%v", rf.peerState.peers()))
 		replyRes.success = true
 		return
 	}
 
 	if args.entryType == EntryTimeoutNow {
+		rf.logger.Trace("接收到 timeoutNow 请求")
 		rf.becomeCandidate()
+		rf.logger.Trace("角色成功变为 Candidate")
 	}
 
 	// 已接收到全部日志，从 Learner 角色升级为 Follower
 	if rf.roleState.getRoleStage() == Learner && args.entryType == EntryPromote {
+		rf.logger.Trace(fmt.Sprintf("Learner 接收到升级请求，term=%d", args.term))
+		rf.becomeFollower(args.term)
 		replyRes.success = true
-		rf.roleState.setRoleStage(Follower)
+		rf.logger.Trace("成功升级到Follower")
 	}
 }
 
@@ -679,10 +686,18 @@ func (rf *raft) handleVoteReq(rpcMsg rpc) {
 		}
 	}()
 
-	argsTerm := args.term
 	rfTerm := rf.hardState.currentTerm()
+
+	if rf.roleState.getRoleStage() == Learner {
+		rf.logger.Trace("当前节点是 Learner，不投票")
+		replyRes.term = rfTerm
+		replyRes.voteGranted = false
+	}
+
+	argsTerm := args.term
 	if argsTerm < rfTerm {
 		// 拉票的候选者任期落后，不投票
+		rf.logger.Trace(fmt.Sprintf("拉票的候选者任期落后，不投票。term=%d, args.term=%d", rfTerm, argsTerm))
 		replyRes.term = rfTerm
 		replyRes.voteGranted = false
 		return
@@ -690,15 +705,19 @@ func (rf *raft) handleVoteReq(rpcMsg rpc) {
 
 	if argsTerm > rfTerm {
 		// 角色降级
-		stage := rf.roleState.getRoleStage()
-		if stage != Follower && !rf.becomeFollower(argsTerm) {
-			replyErr = fmt.Errorf("角色降级失失败")
+		needDegrade := rf.roleState.getRoleStage() != Follower
+		if needDegrade && !rf.becomeFollower(argsTerm) {
+			replyErr = fmt.Errorf("角色降级失败")
+			rf.logger.Trace(replyErr.Error())
 			return
 		}
-		setTermErr := rf.hardState.setTerm(argsTerm)
-		if setTermErr != nil {
-			replyErr = fmt.Errorf("设置 term 值失败：%w", setTermErr)
-			return
+		rf.logger.Trace(fmt.Sprintf("角色降级成功，argsTerm=%d, currentTerm=%d", argsTerm, rfTerm))
+		if !needDegrade  {
+			if setTermErr := rf.hardState.setTerm(argsTerm); setTermErr != nil {
+				replyErr = fmt.Errorf("设置 term=%d 值失败：%w", argsTerm, setTermErr)
+				rf.logger.Trace(replyErr.Error())
+				return
+			}
 		}
 	}
 
@@ -707,22 +726,32 @@ func (rf *raft) handleVoteReq(rpcMsg rpc) {
 	votedFor := rf.hardState.voted()
 	if votedFor == "" || votedFor == args.candidateId {
 		// 当前节点是追随者且没有投过票
+		rf.logger.Trace("当前节点是追随者且没有投过票，开始比较日志的新旧程度")
 		lastIndex := rf.lastLogIndex()
 		lastTerm := rf.logTerm(lastIndex)
 		// 候选者的日志比当前节点的日志要新，则投票
 		// 先比较 term，term 相同则比较日志长度
 		if args.lastLogTerm > lastTerm || (args.lastLogTerm == lastTerm && args.lastLogIndex >= lastIndex) {
+			rf.logger.Trace(fmt.Sprintf("候选者日志较新，args.lastTerm=%d, lastTerm=%d, args.lastIndex=%d, lastIndex=%d",
+				args.lastLogTerm, lastTerm, args.lastLogIndex, lastIndex))
 			voteErr := rf.hardState.vote(args.candidateId)
 			if voteErr != nil {
-				rf.logger.Error(fmt.Errorf("投票失败：%s", voteErr).Error())
+				replyErr = fmt.Errorf("更新 votedFor 出错，投票失败：%w", voteErr)
+				rf.logger.Error(replyErr.Error())
+				replyRes.voteGranted = false
 			} else {
+				rf.logger.Trace("成功投出一张选票")
 				replyRes.voteGranted = true
 			}
+		} else {
+			rf.logger.Trace(fmt.Sprintf("候选者日志不够新，不投票，args.lastTerm=%d, lastTerm=%d, args.lastIndex=%d, lastIndex=%d",
+				args.lastLogTerm, lastTerm, args.lastLogIndex, lastIndex))
 		}
 	}
 
 	if replyRes.voteGranted {
 		rf.timerState.setElectionTimer()
+		rf.logger.Trace("设置选举计时器成功")
 	}
 }
 
