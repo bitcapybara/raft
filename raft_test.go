@@ -68,7 +68,7 @@ func TestHandleCommand(t *testing.T) {
 			roleStage := rf.roleState.getRoleStage()
 			currentTerm := rf.hardState.currentTerm()
 			leaderId := rf.peerState.leaderId()
-			logLength := rf.hardState.logLength()
+			logLength := rf.logLength()
 			commitIndex := rf.softState.getCommitIndex()
 			lastApplied := rf.softState.getLastApplied()
 
