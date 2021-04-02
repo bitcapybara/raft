@@ -1111,6 +1111,7 @@ func (rf *raft) sendNewConfig(peers map[NodeId]NodeAddr) error {
 			continue
 		}
 		// 发送日志
+		rf.logger.Trace(fmt.Sprintf("给 id=%s 的节点发送配置", id))
 		go rf.replicationTo(id, finishCh, stopCh, EntryChangeConf)
 	}
 
@@ -1162,28 +1163,46 @@ func (rf *raft) waitForConfig(peers map[NodeId]NodeAddr) bool {
 			continue
 		}
 		// 发送日志
+		rf.logger.Trace(fmt.Sprintf("给节点 id=%s 发送最新条目", id))
 		go rf.replicationTo(id, finishCh, stopCh, EntryChangeConf)
 	}
 
 	count := 1
 	successCnt := 1
-	for result := range finishCh {
-		if result.msgType == Degrade && rf.becomeFollower(result.term) {
-			return false
-		}
-		if result.msgType == Success {
-			successCnt += 1
-		}
-		count += 1
-		if successCnt >= rf.peerState.majority() {
-			break
-		}
-		if count >= rf.peerState.peersCnt() {
-			return false
+	end := false
+	for !end {
+		select {
+		case <-time.After(rf.timerState.heartbeatDuration()):
+			end = true
+			rf.logger.Trace("超时退出")
+		case result := <- finishCh:
+			if result.msgType == Degrade {
+				rf.logger.Trace("接收到降级消息")
+				if rf.becomeFollower(result.term) {
+					rf.logger.Trace("降级为 Follower")
+					return false
+				}
+				rf.logger.Trace("降级失败")
+			}
+			if result.msgType == Success {
+				rf.logger.Trace("接收到一个成功响应")
+				successCnt += 1
+			}
+			count += 1
+			if successCnt >= rf.peerState.majority() {
+				rf.logger.Trace("多数节点已成功响应")
+				end = true
+				break
+			}
+			if count >= rf.peerState.peersCnt() {
+				rf.logger.Trace("接收到所有响应，但成功不占多数")
+				return false
+			}
 		}
 	}
 
 	// 提交日志
+	rf.logger.Trace("提交日志")
 	oldNewIndex := rf.lastLogIndex()
 	rf.softState.setCommitIndex(oldNewIndex)
 	return true
@@ -1203,10 +1222,14 @@ func encodePeersMap(peers map[NodeId]NodeAddr) ([]byte, error) {
 func (rf *raft) replicationTo(id NodeId, finishCh chan finishMsg, stopCh chan struct{}, entryType EntryType) {
 	var msg finishMsg
 	defer func() {
-		if _, ok := <-stopCh; !ok {
+		select {
+		case <-stopCh:
+		default:
 			finishCh <- msg
 		}
 	}()
+
+	rf.logger.Trace(fmt.Sprintf("给节点 %s 发送 %v 类型的 entry", id, entryType))
 
 	// 发起 RPC 调用
 	addr := rf.peerState.peers()[id]
@@ -1225,6 +1248,7 @@ func (rf *raft) replicationTo(id NodeId, finishCh chan finishMsg, stopCh chan st
 		leaderCommit: rf.softState.getCommitIndex(),
 	}
 	res := &AppendEntryReply{}
+	rf.logger.Trace(fmt.Sprintf("发送的内容：%+v", args))
 	err := rf.transport.AppendEntries(addr, args, res)
 
 	// 处理 RPC 调用结果
@@ -1236,29 +1260,32 @@ func (rf *raft) replicationTo(id NodeId, finishCh chan finishMsg, stopCh chan st
 
 	if res.success {
 		msg = finishMsg{msgType: Success}
+		rf.logger.Trace("成功获取到响应")
 		return
 	}
 
 	if res.term > rf.hardState.currentTerm() {
 		// 当前任期数落后，降级为 Follower
+		rf.logger.Trace("任期落后，发送降级通知")
 		msg = finishMsg{msgType: Degrade, term: res.term}
 	} else if entryType != EntryChangeConf {
 		// Follower 和 Leader 的日志不匹配，进行日志追赶
+		rf.logger.Trace("日志进度落后，触发追赶")
 		rf.leaderState.followerState[id].triggerCh <- struct{}{}
 		msg = finishMsg{msgType: Success}
 	}
 }
 
-// 给指定节点发送最新日志
-// 若日志不同步，开始进行日志追赶操作
-// 1. Follower 节点标记为日志追赶状态，下一次心跳时跳过此节点
-// 2. 日志追赶完毕或 rpc 调用失败，Follower 节点标记为普通状态
+// 日志追赶
 func (rf *raft) replicate(s *Replication) bool {
 	// 向前查找 nextIndex 值
+	rf.logger.Trace("向前查找 nextIndex 值")
 	if rf.findCorrectNextIndex(s) {
 		// 递增更新 matchIndex 值
+		rf.logger.Trace("递增更新 matchIndex 值")
 		return rf.completeEntries(s)
 	}
+	rf.logger.Trace("日志追赶失败")
 	return false
 }
 
