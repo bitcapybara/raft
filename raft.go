@@ -258,7 +258,7 @@ func (rf *raft) runCandidate() {
 		case msg := <-finishCh:
 			// 降级
 			if msg.msgType == Error {
-				return
+				break
 			}
 			if msg.msgType == Degrade && rf.becomeFollower(msg.term) {
 				rf.logger.Trace("降级为 Follower")
