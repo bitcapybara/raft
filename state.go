@@ -27,6 +27,22 @@ const (
 // 角色类型
 type RoleStage uint8
 
+func RoleFromString(role string) (roleStage RoleStage) {
+	switch role {
+	case "Learner":
+		roleStage = Learner
+	case "Follower":
+		roleStage = Follower
+	case "Candidate":
+		roleStage = Candidate
+	case "Leader":
+		roleStage = Leader
+	default:
+		roleStage = Learner
+	}
+	return
+}
+
 type RoleState struct {
 	roleStage RoleStage  // 节点当前角色
 	mu        sync.Mutex // 角色并发访问锁
