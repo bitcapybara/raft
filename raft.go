@@ -265,7 +265,6 @@ func (rf *raft) runCandidate() {
 				return
 			}
 			if msg.msgType == Success {
-				rf.logger.Trace("成功获取到一个投票")
 				successCnt += 1
 			}
 			// 升级
@@ -1567,8 +1566,8 @@ func (rf *raft) isLeader() bool {
 }
 
 func (rf *raft) becomeLeader() bool {
-	// 重置心跳计时器
-	rf.timerState.setHeartbeatTimer()
+	rf.setRoleStage(Leader)
+	rf.peerState.setLeader(rf.peerState.myId())
 
 	// 给各个节点发送心跳，建立权柄
 	finishCh := make(chan finishMsg)
@@ -1582,15 +1581,7 @@ func (rf *raft) becomeLeader() bool {
 		rf.logger.Trace(fmt.Sprintf("给 Id=%s 发送心跳", id))
 		go rf.replicationTo(id, finishCh, stopCh, EntryHeartbeat)
 	}
-
-	// 权柄建立成功，将自己置为 Leader
-	if rf.waitRpcResult(finishCh) {
-		rf.logger.Trace("权柄建立成功，将自己置为 Leader")
-		rf.setRoleStage(Leader)
-		rf.peerState.setLeader(rf.peerState.myId())
-		return true
-	}
-	return false
+	return true
 }
 
 func (rf *raft) becomeCandidate() bool {
@@ -1724,7 +1715,7 @@ func (rf *raft) lastEntryTerm() (term int) {
 func (rf *raft) logEntry(index int) (entry Entry, err error) {
 	if snapshot := rf.snapshotState.getSnapshot(); snapshot != nil {
 		if index <= snapshot.LastIndex {
-			err = errors.New("索引小于快照索引，不合法操作")
+			err = errors.New(fmt.Sprintf("索引 %d 小于快照索引 %d，不合法操作", index, snapshot.LastIndex))
 		} else {
 			if iEntry, iEntryErr := rf.hardState.logEntry(index - snapshot.LastIndex - 1); iEntryErr != nil {
 				err = fmt.Errorf(iEntryErr.Error())
@@ -1746,7 +1737,7 @@ func (rf *raft) logEntry(index int) (entry Entry, err error) {
 func (rf *raft) truncateAfter(index int) (err error) {
 	if snapshot := rf.snapshotState.getSnapshot(); snapshot != nil {
 		if index <= snapshot.LastIndex {
-			err = errors.New("索引小于快照索引，不合法操作")
+			err = errors.New(fmt.Sprintf("索引 %d 小于快照索引 %d，不合法操作", index, snapshot.LastIndex))
 		} else {
 			rf.hardState.truncateAfter(index - snapshot.LastIndex - 1)
 		}
@@ -1760,7 +1751,7 @@ func (rf *raft) truncateAfter(index int) (err error) {
 func (rf *raft) truncateBefore(index int) (err error) {
 	if snapshot := rf.snapshotState.getSnapshot(); snapshot != nil {
 		if index <= snapshot.LastIndex {
-			err = errors.New("索引小于快照索引，不合法操作")
+			err = errors.New(fmt.Sprintf("索引 %d 小于快照索引 %d，不合法操作", index, snapshot.LastIndex))
 		} else {
 			rf.hardState.truncateBefore(index - snapshot.LastIndex - 1)
 		}
