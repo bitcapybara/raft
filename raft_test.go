@@ -44,13 +44,13 @@ func TestHandleCommand(t *testing.T) {
 		{ // 模拟初次启动服务的处理
 			rpcType: AppendEntryRpc,
 			req: AppendEntry{
-				entryType:    EntryHeartbeat,
-				term:         1,
-				leaderId:     "2",
-				prevLogIndex: 0,
-				prevLogTerm:  0,
-				entries:      []Entry{{Index: 0, Term: 1, Type: EntryHeartbeat}},
-				leaderCommit: 0,
+				EntryType:    EntryHeartbeat,
+				Term:         1,
+				LeaderId:     "2",
+				PrevLogIndex: 0,
+				PrevLogTerm:  0,
+				Entries:      []Entry{{Index: 0, Term: 1, Type: EntryHeartbeat}},
+				LeaderCommit: 0,
 			},
 			res: reply,
 		},
@@ -64,15 +64,15 @@ func TestHandleCommand(t *testing.T) {
 			res := <-reply
 			entryReply := res.res.(AppendEntryReply)
 
-			replySuccess := entryReply.success
+			replySuccess := entryReply.Success
 			roleStage := rf.roleState.getRoleStage()
 			currentTerm := rf.hardState.currentTerm()
 			leaderId := rf.peerState.leaderId()
-			logLength := rf.logLength()
+			logLength := rf.hardState.logLength()
 			commitIndex := rf.softState.getCommitIndex()
 			lastApplied := rf.softState.getLastApplied()
 
-			sprintf := fmt.Sprintf("success=%v(%v), role=%d(%d), term=%d(%d), leader=%s(%s), " +
+			sprintf := fmt.Sprintf("success=%v(%v), role=%d(%d), Term=%d(%d), Leader=%s(%s), " +
 				"entry_size=%d(%d), commit=%d(%d), applied=%d(%d)\n",
 				replySuccess, success, roleStage, role, currentTerm, term, leaderId, leader,
 				logLength, entrySize, commitIndex, commit, lastApplied, applied)

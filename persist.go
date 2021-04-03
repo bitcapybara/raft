@@ -21,7 +21,7 @@ func (rs RaftState) toHardState(persister RaftStatePersister) HardState {
 // ========== 状态持久化器接口，由用户实现 ==========
 type RaftStatePersister interface {
 	// 每次 raft 的状态改变，都会调用此方法
-	// entries 字段在变化之后进行持久化即可
+	// Entries 字段在变化之后进行持久化即可
 	SaveRaftState(RaftState) error
 	// 没有时返回空对象
 	LoadRaftState() (RaftState, error)

@@ -92,7 +92,7 @@ func (st *HardState) setTerm(term int) error {
 	}
 	err := st.persist(term, "", st.entries)
 	if err != nil {
-		return fmt.Errorf("持久化出错，设置 term 属性值失败。%w", err)
+		return fmt.Errorf("持久化出错，设置 Term 属性值失败。%w", err)
 	}
 	st.term = term
 	st.votedFor = ""
@@ -105,7 +105,7 @@ func (st *HardState) termAddAndVote(delta int, voteTo NodeId) error {
 	newTerm := st.term + delta
 	err := st.persist(newTerm, voteTo, st.entries)
 	if err != nil {
-		return fmt.Errorf("持久化出错，设置 term 属性值失败。%w", err)
+		return fmt.Errorf("持久化出错，设置 Term 属性值失败。%w", err)
 	}
 	st.term = newTerm
 	st.votedFor = voteTo
@@ -144,7 +144,7 @@ func (st *HardState) appendEntry(entry Entry) error {
 	defer st.mu.Unlock()
 	err := st.persist(st.term, st.votedFor, append(st.entries[:], entry))
 	if err != nil {
-		return fmt.Errorf("持久化出错，设置 entries 属性值失败。%w", err)
+		return fmt.Errorf("持久化出错，设置 Entries 属性值失败。%w", err)
 	}
 	st.entries = append(st.entries, entry)
 	return nil
@@ -331,12 +331,12 @@ func (st *PeerState) leaderId() NodeId {
 	return st.leader
 }
 
-func (st *PeerState) getLeader() server {
+func (st *PeerState) getLeader() Server {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	return server{
-		id:   st.leader,
-		addr: st.peersMap[st.leader],
+	return Server{
+		Id:   st.leader,
+		Addr: st.peersMap[st.leader],
 	}
 }
 
