@@ -1305,18 +1305,25 @@ func (rf *raft) replicationTo(id NodeId, finishCh chan finishMsg, stopCh chan st
 		}
 		entries = []Entry{entry}
 	}
-	prevEntry, prevEntryErr := rf.logEntry(prevIndex)
-	if prevEntryErr != nil {
-		msg = finishMsg{msgType: Error}
-		rf.logger.Error(fmt.Errorf("获取 index=%d 日志失败 %w", prevIndex, prevEntryErr).Error())
-		return
+	var prevTerm int
+	if prevIndex <= 0 {
+		prevTerm = 0
+	} else {
+		prevEntry, prevEntryErr := rf.logEntry(prevIndex)
+		if prevEntryErr != nil {
+			msg = finishMsg{msgType: Error}
+			rf.logger.Error(fmt.Errorf("获取 index=%d 日志失败 %w", prevIndex, prevEntryErr).Error())
+			return
+		}
+		prevTerm = prevEntry.Term
 	}
+
 	args := AppendEntry{
 		EntryType:    entryType,
 		Term:         rf.hardState.currentTerm(),
 		LeaderId:     rf.peerState.myId(),
 		PrevLogIndex: prevIndex,
-		PrevLogTerm:  prevEntry.Term,
+		PrevLogTerm:  prevTerm,
 		Entries:      entries,
 		LeaderCommit: rf.softState.getCommitIndex(),
 	}
