@@ -210,7 +210,6 @@ func (rf *raft) runLeader() {
 					}
 				}
 			}
-			close(finishCh)
 			close(stopCh)
 		case id := <-rf.leaderState.done:
 			if transfereeId, busy := rf.leaderState.isTransferBusy(); busy && transfereeId == id {
@@ -489,7 +488,6 @@ func (rf *raft) addReplication(id NodeId, addr NodeAddr) {
 					if replicate && rf.leaderState.replications[id].role == Learner {
 						func() {
 							finishCh := make(chan finishMsg)
-							defer close(finishCh)
 							stopCh := make(chan struct{})
 							defer close(stopCh)
 							rf.logger.Trace("日志追赶成功，且目标节点是 Learner 角色，发送 EntryPromote 请求")
@@ -923,8 +921,8 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 
 	// 给各节点发送日志条目
 	finishCh := make(chan finishMsg)
-	defer close(finishCh)
 	stopCh := make(chan struct{})
+	defer close(stopCh)
 	rf.logger.Trace("给各节点发送日志条目")
 	for id := range rf.peerState.peers() {
 		// 不用给自己发，正在复制日志的不发
@@ -937,7 +935,6 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 
 	// 新日志成功发送到过半 Follower 节点，提交本地的日志
 	success := rf.waitRpcResult(finishCh)
-	close(stopCh)
 	if !success {
 		replyErr = fmt.Errorf("rpc 完成，但日志未复制到多数节点")
 		rf.logger.Trace(replyErr.Error())
@@ -1161,7 +1158,6 @@ func (rf *raft) sendNewConfig(peers map[NodeId]NodeAddr) error {
 
 	// C(old,new)发送到各个节点
 	finishCh := make(chan finishMsg)
-	defer close(finishCh)
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 	rf.logger.Trace("给各节点发送新配置")
@@ -1213,7 +1209,6 @@ func (rf *raft) sendNewConfig(peers map[NodeId]NodeAddr) error {
 
 func (rf *raft) waitForConfig(peers map[NodeId]NodeAddr) bool {
 	finishCh := make(chan finishMsg)
-	defer close(finishCh)
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 
@@ -1578,7 +1573,6 @@ func (rf *raft) becomeLeader() bool {
 
 	// 给各个节点发送心跳，建立权柄
 	finishCh := make(chan finishMsg)
-	defer close(finishCh)
 	stopCh := make(chan struct{})
 	rf.logger.Trace("给各个节点发送心跳，建立权柄")
 	for id := range rf.peerState.peers() {
