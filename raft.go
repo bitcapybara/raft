@@ -92,7 +92,7 @@ func newRaft(config Config) *raft {
 		hardState:     &hardState,
 		softState:     newSoftState(),
 		peerState:     newPeerState(config.Peers, config.Me),
-		leaderState:   newLeaderState(),
+		leaderState:   newLeaderState(config.Peers),
 		timerState:    newTimerState(config),
 		snapshotState: newSnapshotState(config),
 		rpcCh:         make(chan rpc),
@@ -139,7 +139,7 @@ func (rf *raft) runLeader() {
 
 	// 节点退出 Leader 状态，收尾工作
 	defer func() {
-		for _, st := range rf.leaderState.followerState {
+		for _, st := range rf.leaderState.replications {
 			close(st.stopCh)
 		}
 		rf.logger.Trace("退出 runLeader()，关闭各个 replication 的 stopCh")
@@ -290,7 +290,6 @@ func (rf *raft) runFollower() {
 			// 成为候选者
 			rf.logger.Trace("选举计时器到期，开启新一轮选举")
 			rf.becomeCandidate()
-			rf.logger.Trace("角色变为 Candidate")
 			return
 		case msg := <-rf.rpcCh:
 			switch msg.rpcType {
@@ -460,7 +459,7 @@ func (rf *raft) runReplication() {
 }
 
 func (rf *raft) addReplication(id NodeId, addr NodeAddr) {
-	st, ok := rf.leaderState.followerState[id]
+	st, ok := rf.leaderState.replications[id]
 	if !ok {
 		rf.logger.Trace(fmt.Sprintf("生成节点 Id=%s 的 Replication 对象", id))
 		st = &Replication{
@@ -472,7 +471,7 @@ func (rf *raft) addReplication(id NodeId, addr NodeAddr) {
 			stopCh:     make(chan struct{}),
 			triggerCh:  make(chan struct{}),
 		}
-		rf.leaderState.followerState[id] = st
+		rf.leaderState.replications[id] = st
 	}
 	go func() {
 		for {
@@ -488,7 +487,7 @@ func (rf *raft) addReplication(id NodeId, addr NodeAddr) {
 					// 复制日志，成功后将节点角色提升为 Follower
 					replicate := rf.replicate(st)
 					rf.logger.Trace(fmt.Sprintf("日志追赶结束，返回值=%t", replicate))
-					if replicate && rf.leaderState.followerState[id].role == Learner {
+					if replicate && rf.leaderState.replications[id].role == Learner {
 						func() {
 							finishCh := make(chan finishMsg)
 							defer close(finishCh)
@@ -1110,7 +1109,7 @@ func (rf *raft) checkTransfer(id NodeId) {
 		} else {
 			// 目标节点不是最新，开始日志复制
 			rf.logger.Trace("目标节点不是最新，开始日志复制")
-			rf.leaderState.followerState[id].triggerCh <- struct{}{}
+			rf.leaderState.replications[id].triggerCh <- struct{}{}
 		}
 	}
 }
@@ -1291,7 +1290,7 @@ func (rf *raft) replicationTo(id NodeId, finishCh chan finishMsg, stopCh chan st
 		}
 	}()
 
-	rf.logger.Trace(fmt.Sprintf("给节点 %s 发送 %v 类型的 entry", id, entryType))
+	rf.logger.Trace(fmt.Sprintf("给节点 %s 发送 %s 类型的 entry", id, EntryTypeToString(entryType)))
 
 	// 发起 RPC 调用
 	addr := rf.peerState.peers()[id]
@@ -1346,7 +1345,7 @@ func (rf *raft) replicationTo(id NodeId, finishCh chan finishMsg, stopCh chan st
 	} else if entryType != EntryChangeConf {
 		// Follower 和 Leader 的日志不匹配，进行日志追赶
 		rf.logger.Trace("日志进度落后，触发追赶")
-		rf.leaderState.followerState[id].triggerCh <- struct{}{}
+		rf.leaderState.replications[id].triggerCh <- struct{}{}
 		msg = finishMsg{msgType: Success}
 	}
 }
@@ -1615,7 +1614,7 @@ func (rf *raft) becomeFollower(term int) bool {
 
 func (rf *raft) setRoleStage(stage RoleStage) {
 	rf.roleState.setRoleStage(stage)
-	rf.logger.Trace(fmt.Sprintf("角色设置为 %d", stage))
+	rf.logger.Trace(fmt.Sprintf("角色设置为 %s", RoleToString(stage)))
 	if stage == Leader {
 		rf.peerState.setLeader(rf.peerState.myId())
 	}

@@ -13,6 +13,22 @@ const (
 	EntryPromote
 )
 
+func EntryTypeToString(entryType EntryType) (typeString string) {
+	switch entryType {
+	case EntryReplicate:
+		typeString = "EntryReplicate"
+	case EntryChangeConf:
+		typeString = "EntryChangeConf"
+	case EntryHeartbeat:
+		typeString = "EntryHeartbeat"
+	case EntryTimeoutNow:
+		typeString = "EntryTimeoutNow"
+	case EntryPromote:
+		typeString = "EntryPromote"
+	}
+	return
+}
+
 // 日志条目
 type Entry struct {
 	Index int       // 此条目的逻辑索引， 从 1 开始

@@ -37,8 +37,20 @@ func RoleFromString(role string) (roleStage RoleStage) {
 		roleStage = Candidate
 	case "Leader":
 		roleStage = Leader
-	default:
-		roleStage = Learner
+	}
+	return
+}
+
+func RoleToString(roleStage RoleStage) (role string) {
+	switch roleStage {
+	case Learner:
+		role = "Learner"
+	case Follower:
+		role = "Follower"
+	case Candidate:
+		role = "Candidate"
+	case Leader:
+		role = "Leader"
 	}
 	return
 }
@@ -398,62 +410,75 @@ type configChange struct {
 
 // 节点是 Leader 时，保存在内存中的状态
 type LeaderState struct {
-	stepDownCh    chan int                // 接收降级通知
-	done          chan NodeId             // 日志复制结束
-	followerState map[NodeId]*Replication // 代表了一个复制日志的 Follower 节点
-	transfer      *transfer               // 领导权转移状态
-	configChange  *configChange           // 配置变更状态
+	stepDownCh   chan int                // 接收降级通知
+	done         chan NodeId             // 日志复制结束
+	replications map[NodeId]*Replication // 代表了一个复制日志的 Follower 节点
+	transfer     *transfer               // 领导权转移状态
+	configChange *configChange           // 配置变更状态
 }
 
-func newLeaderState() *LeaderState {
+func newLeaderState(peers map[NodeId]NodeAddr) *LeaderState {
+	stepDownCh := make(chan int)
+	replications := make(map[NodeId]*Replication)
+	for id, addr := range peers {
+		replications[id] = &Replication{
+			id:         id,
+			addr:       addr,
+			nextIndex:  1,
+			matchIndex: 0,
+			stepDownCh: stepDownCh,
+			stopCh:     make(chan struct{}),
+			triggerCh:  make(chan struct{}),
+		}
+	}
 	return &LeaderState{
-		stepDownCh:    make(chan int),
-		done:          make(chan NodeId),
-		followerState: make(map[NodeId]*Replication),
-		transfer:      newTransfer(),
-		configChange:  &configChange{},
+		stepDownCh:   stepDownCh,
+		done:         make(chan NodeId),
+		replications: replications,
+		transfer:     newTransfer(),
+		configChange: &configChange{},
 	}
 }
 
 func (st *LeaderState) followers() map[NodeId]*Replication {
-	return st.followerState
+	return st.replications
 }
 
 func (st *LeaderState) matchIndex(id NodeId) int {
-	st.followerState[id].mu.Lock()
-	defer st.followerState[id].mu.Unlock()
-	return st.followerState[id].matchIndex
+	st.replications[id].mu.Lock()
+	defer st.replications[id].mu.Unlock()
+	return st.replications[id].matchIndex
 }
 
 func (st *LeaderState) setMatchAndNextIndex(id NodeId, matchIndex, nextIndex int) {
-	st.followerState[id].mu.Lock()
-	defer st.followerState[id].mu.Unlock()
-	st.followerState[id].matchIndex = matchIndex
-	st.followerState[id].nextIndex = nextIndex
+	st.replications[id].mu.Lock()
+	defer st.replications[id].mu.Unlock()
+	st.replications[id].matchIndex = matchIndex
+	st.replications[id].nextIndex = nextIndex
 }
 
 func (st *LeaderState) nextIndex(id NodeId) int {
-	st.followerState[id].mu.Lock()
-	defer st.followerState[id].mu.Unlock()
-	return st.followerState[id].nextIndex
+	st.replications[id].mu.Lock()
+	defer st.replications[id].mu.Unlock()
+	return st.replications[id].nextIndex
 }
 
 func (st *LeaderState) setNextIndex(id NodeId, index int) {
-	st.followerState[id].mu.Lock()
-	defer st.followerState[id].mu.Unlock()
-	st.followerState[id].nextIndex = index
+	st.replications[id].mu.Lock()
+	defer st.replications[id].mu.Unlock()
+	st.replications[id].nextIndex = index
 }
 
 func (st *LeaderState) setRpcBusy(id NodeId, busy bool) {
-	st.followerState[id].mu.Lock()
-	defer st.followerState[id].mu.Unlock()
-	st.followerState[id].rpcBusy = busy
+	st.replications[id].mu.Lock()
+	defer st.replications[id].mu.Unlock()
+	st.replications[id].rpcBusy = busy
 }
 
 func (st *LeaderState) isRpcBusy(id NodeId) bool {
-	st.followerState[id].mu.Lock()
-	defer st.followerState[id].mu.Unlock()
-	return st.followerState[id].rpcBusy
+	st.replications[id].mu.Lock()
+	defer st.replications[id].mu.Unlock()
+	return st.replications[id].rpcBusy
 }
 
 func (st *LeaderState) setTransferBusy(id NodeId) {
@@ -512,7 +537,7 @@ func (st *LeaderState) newMajority() int {
 }
 
 func (st *LeaderState) roleUpgrade(id NodeId) {
-	state := st.followerState[id]
+	state := st.replications[id]
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	state.role = Follower
