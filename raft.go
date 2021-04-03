@@ -258,7 +258,7 @@ func (rf *raft) runCandidate() {
 		case msg, ok := <-finishCh:
 			if !ok {
 				rf.logger.Trace("接收到 preVote 失败消息")
-				break
+				return
 			}
 			// 降级
 			if msg.msgType == Degrade && rf.becomeFollower(msg.term) {
