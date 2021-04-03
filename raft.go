@@ -350,7 +350,7 @@ func (rf *raft) election(stopCh chan struct{}) <-chan finishMsg {
 
 	if !rf.waitRpcResult(preVoteFinishCh) {
 		rf.logger.Trace("preVote 失败，退出选举")
-		preVoteFinishCh <- finishMsg{msgType: Error}
+		go func() {preVoteFinishCh <- finishMsg{msgType: Error}}()
 		return preVoteFinishCh
 	}
 
