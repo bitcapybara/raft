@@ -257,6 +257,9 @@ func (rf *raft) runCandidate() {
 			}
 		case msg := <-finishCh:
 			// 降级
+			if msg.msgType == Error {
+				return
+			}
 			if msg.msgType == Degrade && rf.becomeFollower(msg.term) {
 				rf.logger.Trace("降级为 Follower")
 				return
@@ -1592,9 +1595,6 @@ func (rf *raft) becomeLeader() bool {
 }
 
 func (rf *raft) becomeCandidate() bool {
-	// 重置选举计时器
-	rf.timerState.setElectionTimer()
-	rf.logger.Trace("重置选举计时器成功")
 	// 角色置为候选者
 	rf.setRoleStage(Candidate)
 	return true
@@ -1606,7 +1606,7 @@ func (rf *raft) becomeFollower(term int) bool {
 	rf.logger.Trace("设置节点 Term 值")
 	err := rf.hardState.setTerm(term)
 	if err != nil {
-		rf.logger.Error(fmt.Errorf("Term 值设置失败，降级失败%w", err).Error())
+		rf.logger.Error(fmt.Errorf("term 值设置失败，降级失败%w", err).Error())
 		return false
 	}
 	rf.setRoleStage(Follower)
@@ -1618,11 +1618,6 @@ func (rf *raft) setRoleStage(stage RoleStage) {
 	rf.logger.Trace(fmt.Sprintf("角色设置为 %d", stage))
 	if stage == Leader {
 		rf.peerState.setLeader(rf.peerState.myId())
-		rf.timerState.setHeartbeatTimer()
-		rf.logger.Trace("重置心跳计时器成功！")
-	} else {
-		rf.timerState.setElectionTimer()
-		rf.logger.Trace("重置选举计时器成功！")
 	}
 }
 
