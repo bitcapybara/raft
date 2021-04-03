@@ -3,6 +3,7 @@ package raft
 import (
 	"bytes"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -77,15 +78,6 @@ func (st *HardState) currentTerm() int {
 	return st.term
 }
 
-func (st *HardState) logEntryTerm(index int) int {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if len(st.entries)-1 < index {
-		return 0
-	}
-	return st.entries[index].Term
-}
-
 func (st *HardState) logLength() int {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -158,22 +150,20 @@ func (st *HardState) appendEntry(entry Entry) error {
 	return nil
 }
 
-func (st *HardState) logEntry(index int) Entry {
+func (st *HardState) logEntry(index int) (entry Entry, err error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	return st.entries[index]
+	if index >= len(st.entries) {
+		err = errors.New("索引超出范围！")
+	}
+	entry = st.entries[index]
+	return
 }
 
 func (st *HardState) voted() NodeId {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	return st.votedFor
-}
-
-func (st *HardState) truncateEntries(index int) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.entries = st.entries[:index]
 }
 
 func (st *HardState) clearEntries() {
@@ -186,6 +176,18 @@ func (st *HardState) logEntries(start, end int) []Entry {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	return st.entries[start:end]
+}
+
+func (st *HardState) truncateAfter(index int) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.entries = st.entries[:index]
+}
+
+func (st *HardState) truncateBefore(index int) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.entries = st.entries[index:]
 }
 
 // ==================== SoftState ====================
