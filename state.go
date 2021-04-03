@@ -18,10 +18,10 @@ func init() {
 // ==================== RoleState ====================
 
 const (
-	Leader    RoleStage = iota // 领导者
-	Candidate                  // 候选者
+	Learner   RoleStage = iota // 日志同步者
 	Follower                   // 追随者
-	Learner                    // 日志同步者
+	Candidate                  // 候选者
+	Leader                     // 领导者
 )
 
 // 角色类型
