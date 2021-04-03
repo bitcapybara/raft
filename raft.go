@@ -255,11 +255,7 @@ func (rf *raft) runCandidate() {
 				rf.logger.Trace("接收到 RequestVoteRpc 请求")
 				rf.handleVoteReq(msg)
 			}
-		case msg, ok := <-finishCh:
-			if !ok {
-				rf.logger.Trace("接收到 preVote 失败消息")
-				return
-			}
+		case msg := <-finishCh:
 			// 降级
 			if msg.msgType == Degrade && rf.becomeFollower(msg.term) {
 				rf.logger.Trace("降级为 Follower")
@@ -348,10 +344,10 @@ func (rf *raft) heartbeat(stopCh chan struct{}) chan finishMsg {
 func (rf *raft) election(stopCh chan struct{}) <-chan finishMsg {
 	// pre-vote
 	preVoteFinishCh := rf.sendRequestVote(stopCh)
-	defer close(preVoteFinishCh)
 
 	if !rf.waitRpcResult(preVoteFinishCh) {
 		rf.logger.Trace("preVote 失败，退出选举")
+		preVoteFinishCh <- finishMsg{msgType: Error}
 		return preVoteFinishCh
 	}
 
