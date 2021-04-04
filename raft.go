@@ -343,11 +343,11 @@ func (rf *raft) heartbeat(stopCh chan struct{}) chan finishMsg {
 // Candidate / Follower 开启新一轮选举
 func (rf *raft) election(stopCh chan struct{}) <-chan finishMsg {
 	// pre-vote
-	preVoteFinishCh := rf.sendRequestVote(stopCh)
+	preVoteFinishCh := rf.sendRequestVote(stopCh, true)
 
 	if !rf.waitRpcResult(preVoteFinishCh) {
 		rf.logger.Trace("preVote 失败，退出选举")
-		go func() {preVoteFinishCh <- finishMsg{msgType: Error}}()
+		go func() { preVoteFinishCh <- finishMsg{msgType: Error} }()
 		return preVoteFinishCh
 	}
 
@@ -358,14 +358,15 @@ func (rf *raft) election(stopCh chan struct{}) <-chan finishMsg {
 	}
 	rf.logger.Trace(fmt.Sprintf("增加 Term 数，开始发送 RequestVote 请求。Term=%d", rf.hardState.currentTerm()))
 
-	return rf.sendRequestVote(stopCh)
+	return rf.sendRequestVote(stopCh, false)
 }
 
-func (rf *raft) sendRequestVote(stopCh <-chan struct{}) chan finishMsg {
+func (rf *raft) sendRequestVote(stopCh <-chan struct{}, isPreVote bool) chan finishMsg {
 	// 发送 RV 请求
 	finishCh := make(chan finishMsg)
 
 	args := RequestVote{
+		IsPreVote:   isPreVote,
 		Term:        rf.hardState.currentTerm(),
 		CandidateId: rf.peerState.myId(),
 	}
@@ -549,6 +550,7 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 	rf.logger.Trace("开始日志一致性检查")
 	prevIndex := args.PrevLogIndex
 	if prevIndex > rf.lastEntryIndex() {
+		rf.logger.Trace("当前节点不包含 prevLog ")
 		func() {
 			defer func() {
 				rf.logger.Trace(fmt.Sprintf("返回最后一个日志条目的 Term=%d 及此 Term 的首个条目的索引 index=%d",
@@ -588,38 +590,41 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 			}
 		}()
 		return
-	}
-	if prevEntry, prevEntryErr := rf.logEntry(prevIndex); prevEntryErr != nil {
-		rf.logger.Error(fmt.Errorf("获取 index=%d 的日志失败！%w", prevIndex, prevEntryErr).Error())
-		return
-	} else if prevTerm := prevEntry.Term; prevTerm != args.PrevLogTerm {
-		func() {
-			defer func() {
-				rf.logger.Trace(fmt.Sprintf("返回最后一个日志条目的 Term=%d 及此 Term 的首个条目的索引 index=%d",
-					replyRes.ConflictTerm, replyRes.ConflictStartIndex))
-				replyRes.Term = rfTerm
-				replyRes.Success = false
-			}()
-			// 节点包含索引为 prevIndex 的日志但是 Term 数不同
-			rf.logger.Trace(fmt.Sprintf("节点包含索引为 prevIndex=%d 的日志但是 args.PrevLogTerm=%d, PrevLogTerm=%d",
-				prevIndex, args.PrevLogTerm, prevTerm))
-			// 返回 prevIndex 所在 Term 及此 Term 的首个条目的索引
-			replyRes.ConflictTerm = prevTerm
-			replyRes.ConflictStartIndex = prevIndex
-			for i := prevIndex - 1; i >= 0; i-- {
-				if iEntry, iEntryErr := rf.logEntry(i); iEntryErr != nil {
-					rf.logger.Error(iEntryErr.Error())
-					replyRes.ConflictStartIndex = 0
-					break
-				} else if iEntry.Term == replyRes.ConflictTerm {
-					replyRes.ConflictStartIndex = iEntry.Index
-				} else {
-					rf.logger.Trace(fmt.Sprintf("第 %d 日志term %d != conflictTerm", i, iEntry.Term))
-					break
+	} else if prevIndex > 0 {
+		if prevEntry, prevEntryErr := rf.logEntry(prevIndex); prevEntryErr != nil {
+			rf.logger.Error(fmt.Errorf("获取 index=%d 的日志失败！%w", prevIndex, prevEntryErr).Error())
+			return
+		} else if prevTerm := prevEntry.Term; prevTerm != args.PrevLogTerm {
+			func() {
+				defer func() {
+					rf.logger.Trace(fmt.Sprintf("返回最后一个日志条目的 Term=%d 及此 Term 的首个条目的索引 index=%d",
+						replyRes.ConflictTerm, replyRes.ConflictStartIndex))
+					replyRes.Term = rfTerm
+					replyRes.Success = false
+				}()
+				// 节点包含索引为 prevIndex 的日志但是 Term 数不同
+				rf.logger.Trace(fmt.Sprintf("节点包含索引为 prevIndex=%d 的日志但是 args.PrevLogTerm=%d, PrevLogTerm=%d",
+					prevIndex, args.PrevLogTerm, prevTerm))
+				// 返回 prevIndex 所在 Term 及此 Term 的首个条目的索引
+				replyRes.ConflictTerm = prevTerm
+				replyRes.ConflictStartIndex = prevIndex
+				for i := prevIndex - 1; i >= 0; i-- {
+					if iEntry, iEntryErr := rf.logEntry(i); iEntryErr != nil {
+						rf.logger.Error(iEntryErr.Error())
+						replyRes.ConflictStartIndex = 0
+						break
+					} else if iEntry.Term == replyRes.ConflictTerm {
+						replyRes.ConflictStartIndex = iEntry.Index
+					} else {
+						rf.logger.Trace(fmt.Sprintf("第 %d 日志term %d != conflictTerm", i, iEntry.Term))
+						break
+					}
 				}
-			}
-		}()
-		return
+			}()
+			return
+		}
+	} else {
+		rf.logger.Trace("prevIndex 为 0，Leader 第一次发送的日志")
 	}
 
 	newEntryIndex := prevIndex + 1
@@ -736,6 +741,7 @@ func (rf *raft) handleVoteReq(rpcMsg rpc) {
 		}
 	}()
 
+	rf.logger.Trace(fmt.Sprintf("接收到的参数：%+v", args))
 	rfTerm := rf.hardState.currentTerm()
 
 	if rf.roleState.getRoleStage() == Learner {
@@ -774,7 +780,7 @@ func (rf *raft) handleVoteReq(rpcMsg rpc) {
 	replyRes.Term = argsTerm
 	replyRes.VoteGranted = false
 	votedFor := rf.hardState.voted()
-	if votedFor == "" || votedFor == args.CandidateId {
+	if args.IsPreVote || votedFor == "" || votedFor == args.CandidateId {
 		// 当前节点是追随者且没有投过票
 		rf.logger.Trace("当前节点是追随者且没有投过票，开始比较日志的新旧程度")
 		lastIndex := rf.lastEntryIndex()
@@ -1716,7 +1722,7 @@ func (rf *raft) lastEntryTerm() (term int) {
 func (rf *raft) logEntry(index int) (entry Entry, err error) {
 	if snapshot := rf.snapshotState.getSnapshot(); snapshot != nil {
 		if index <= snapshot.LastIndex {
-			err = errors.New(fmt.Sprintf("索引 %d 小于快照索引 %d，不合法操作", index, snapshot.LastIndex))
+			err = errors.New(fmt.Sprintf("索引 %d 小于等于快照索引 %d，不合法操作", index, snapshot.LastIndex))
 		} else {
 			if iEntry, iEntryErr := rf.hardState.logEntry(index - snapshot.LastIndex - 1); iEntryErr != nil {
 				err = fmt.Errorf(iEntryErr.Error())

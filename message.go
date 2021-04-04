@@ -77,6 +77,7 @@ type AppendEntryReply struct {
 // ==================== RequestVote ====================
 
 type RequestVote struct {
+	IsPreVote    bool   // 是否是 preVote 请求
 	Term         int    // 当前时刻所属任期
 	CandidateId  NodeId // 候选人id
 	LastLogIndex int    // 发送此请求的 Candidate 最后一个日志条目的索引
