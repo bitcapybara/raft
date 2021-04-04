@@ -5,7 +5,6 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
-	"log"
 	"math/rand"
 	"sync"
 	"time"
@@ -457,6 +456,13 @@ func (st *LeaderState) setMatchAndNextIndex(id NodeId, matchIndex, nextIndex int
 	st.replications[id].nextIndex = nextIndex
 }
 
+func (st *LeaderState) matchAndNextIndexAdd(id NodeId) {
+	st.replications[id].mu.Lock()
+	defer st.replications[id].mu.Unlock()
+	st.replications[id].matchIndex++
+	st.replications[id].nextIndex++
+}
+
 func (st *LeaderState) nextIndex(id NodeId) int {
 	st.replications[id].mu.Lock()
 	defer st.replications[id].mu.Unlock()
@@ -604,19 +610,6 @@ type snapshotState struct {
 	persister    SnapshotPersister
 	maxLogLength int
 	mu           sync.Mutex
-}
-
-func newSnapshotState(config Config) *snapshotState {
-	persister := config.SnapshotPersister
-	snapshot, err := persister.LoadSnapshot()
-	if err != nil {
-		log.Fatalln(fmt.Errorf("加载快照失败：%w", err))
-	}
-	return &snapshotState{
-		snapshot:     &snapshot,
-		persister:    persister,
-		maxLogLength: config.MaxLogLength,
-	}
 }
 
 func (st *snapshotState) save(snapshot Snapshot) error {

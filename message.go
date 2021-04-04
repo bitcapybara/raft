@@ -40,8 +40,8 @@ type Entry struct {
 type Status uint8
 
 const (
-	OK Status = iota
-	NotLeader
+	NotLeader Status = iota
+	OK
 )
 
 type Server struct {

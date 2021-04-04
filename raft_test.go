@@ -90,3 +90,20 @@ func TestHandleCommand(t *testing.T) {
 	rf.handleCommand(msgs[0])
 	wg.Wait()
 }
+
+func TestStopCh(t *testing.T) {
+	stopCh := make(chan struct{})
+	close(stopCh)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		wg.Done()
+		select {
+		case <- stopCh:
+			fmt.Println("msg")
+		default:
+			fmt.Println("default")
+		}
+	}()
+	wg.Wait()
+}

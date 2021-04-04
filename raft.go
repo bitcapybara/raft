@@ -5,6 +5,8 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"log"
+	"sort"
 	"time"
 )
 
@@ -69,20 +71,43 @@ func newRaft(config Config) *raft {
 	if config.ElectionMinTimeout > config.ElectionMaxTimeout {
 		panic("ElectionMinTimeout 不能大于 ElectionMaxTimeout！")
 	}
-	raftPst := config.RaftStatePersister
+	// 加载快照
+	var snpshtState snapshotState
+	snpshtPersister := config.SnapshotPersister
+	if snpshtPersister != nil {
+		snapshot, snapshotErr := snpshtPersister.LoadSnapshot()
+		if snapshotErr != nil {
+			log.Fatalln(fmt.Errorf("加载快照失败：%w", snapshotErr))
+		}
+		snpshtState = snapshotState{
+			snapshot:     &snapshot,
+			persister:    snpshtPersister,
+			maxLogLength: config.MaxLogLength,
+		}
+	} else {
+		log.Fatalln("缺失 SnapshotPersister!")
+	}
 
+	// 加载 hardState
+	raftPst := config.RaftStatePersister
 	var raftState RaftState
 	if raftPst != nil {
-		rfState, err := raftPst.LoadRaftState()
-		if err != nil {
-			panic(fmt.Sprintf("持久化器加载 RaftState 失败：%s\n", err))
+		rfState, raftStateErr := raftPst.LoadRaftState()
+		if raftStateErr != nil {
+			panic(fmt.Sprintf("持久化器加载 RaftState 失败：%s\n", raftStateErr))
 		} else {
+
 			raftState = rfState
 		}
 	} else {
-		panic("缺失 RaftStatePersister!")
+		log.Fatalln("缺失 RaftStatePersister!")
 	}
 	hardState := raftState.toHardState(raftPst)
+
+	// 如果是初次加载
+	if snpshtState.snapshot.LastIndex <= 0 && len(hardState.entries) <= 0 {
+		hardState.entries = make([]Entry, 1)
+	}
 
 	return &raft{
 		fsm:           config.Fsm,
@@ -94,7 +119,7 @@ func newRaft(config Config) *raft {
 		peerState:     newPeerState(config.Peers, config.Me),
 		leaderState:   newLeaderState(config.Peers),
 		timerState:    newTimerState(config),
-		snapshotState: newSnapshotState(config),
+		snapshotState: &snpshtState,
 		rpcCh:         make(chan rpc),
 		exitCh:        make(chan struct{}),
 	}
@@ -182,9 +207,10 @@ func (rf *raft) runLeader() {
 			successCnt := 1
 			count := 1
 			end := false
+			after := time.After(rf.timerState.heartbeatDuration())
 			for !end {
 				select {
-				case <-time.After(rf.timerState.heartbeatDuration()):
+				case <-after:
 					rf.logger.Trace("操作超时退出")
 					end = true
 				case msg := <-finishCh:
@@ -247,6 +273,9 @@ func (rf *raft) runCandidate() {
 			return
 		case msg := <-rf.rpcCh:
 			switch msg.rpcType {
+			case ApplyCommandRpc:
+				rf.logger.Trace("接收到 ApplyCommandRpc 请求")
+				rf.handleClientCmd(msg)
 			case AppendEntryRpc:
 				rf.logger.Trace("接收到 AppendEntryRpc 请求")
 				rf.handleCommand(msg)
@@ -291,6 +320,9 @@ func (rf *raft) runFollower() {
 			return
 		case msg := <-rf.rpcCh:
 			switch msg.rpcType {
+			case ApplyCommandRpc:
+				rf.logger.Trace("接收到 ApplyCommandRpc 请求")
+				rf.handleClientCmd(msg)
 			case AppendEntryRpc:
 				rf.logger.Trace("接收到 AppendEntryRpc 请求")
 				rf.handleCommand(msg)
@@ -421,14 +453,18 @@ func (rf *raft) waitRpcResult(finishCh <-chan finishMsg) bool {
 	count := 1
 	successCnt := 1
 	end := false
+	after := time.After(rf.timerState.heartbeatDuration())
 	for !end {
 		select {
-		case <-time.After(rf.timerState.heartbeatDuration()):
+		case <-after:
 			rf.logger.Trace("操作超时退出")
 			end = true
 		case msg := <-finishCh:
-			if msg.msgType == Degrade && rf.becomeFollower(msg.term) {
-				rf.logger.Trace("接收到降级请求并降级成功")
+			if msg.msgType == Degrade {
+				rf.logger.Trace("接收到降级请求")
+				if rf.becomeFollower(msg.term) {
+					rf.logger.Trace("降级成功")
+				}
 				end = true
 				break
 			}
@@ -501,6 +537,8 @@ func (rf *raft) addReplication(id NodeId, addr NodeAddr) {
 							}
 						}()
 					}
+					rf.updateLeaderCommit()
+					rf.logger.Trace(fmt.Sprintf("将 Leader 的 commitIndex 日志更新为 %d", rf.softState.getCommitIndex()))
 				}()
 			}
 		}
@@ -628,21 +666,26 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 	}
 
 	newEntryIndex := prevIndex + 1
+	replyRes.Term = rfTerm
 	if args.EntryType == EntryReplicate {
 		// ========== 接收日志条目 ==========
 		rf.logger.Trace("接收到日志条目")
-		// 如果当前节点已经有此条目但冲突
+		// 如果当前节点已经有此条目
 		if rf.lastEntryIndex() >= newEntryIndex {
+			rf.logger.Trace(fmt.Sprintf("当前节点已经含有 index=%d 的日志", newEntryIndex))
 			if entry, entryErr := rf.logEntry(newEntryIndex); entryErr != nil {
-				rf.logger.Error(entryErr.Error())
+				rf.logger.Error(fmt.Errorf("获取 index=%d 的日志失败！%w", newEntryIndex, entryErr).Error())
+				replyRes.Success = false
 			} else if entry.Term != args.Term {
+				rf.logger.Trace(fmt.Sprintf("当前节点 index=%d 的日志与新条目冲突。term=%d, args.term=%d，截断之后的日志",
+					newEntryIndex, entry.Term, args.Term))
 				truncateErr := rf.truncateAfter(newEntryIndex)
 				if truncateErr != nil {
 					rf.logger.Error(fmt.Errorf("截断日志失败！%w", truncateErr).Error())
+					replyRes.Success = false
 					return
 				}
-				rf.logger.Trace(fmt.Sprintf("当前节点已经有此条目但冲突，直接覆盖, index=%d, Term=%d, entryTerm=%d",
-					newEntryIndex, entry.Term, args.Term))
+				rf.logger.Trace("日志截断成功！")
 				// 将新条目添加到日志中
 				err := rf.addEntry(args.Entries[0])
 				if err != nil {
@@ -653,8 +696,20 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 				}
 				rf.logger.Trace("成功将新条目添加到日志中")
 			} else {
+				replyRes.Success = true
 				rf.logger.Trace("当前节点已包含新日志")
 			}
+		} else {
+			// 将新条目添加到日志中
+			err := rf.addEntry(args.Entries[0])
+			if err != nil {
+				rf.logger.Error(fmt.Errorf("日志添加新条目失败！%w", err).Error())
+				replyRes.Success = false
+			} else {
+				replyRes.Success = true
+
+			}
+			rf.logger.Trace("成功将新条目添加到日志中")
 		}
 
 		// 添加日志后不提交，下次心跳来了再提交
@@ -681,7 +736,7 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 			if applyErr != nil {
 				replyErr = err
 				replyRes.Success = false
-				rf.logger.Trace("日志应用到状态机失败")
+				rf.logger.Error(fmt.Errorf("日志应用到状态机失败！%w", applyErr).Error())
 			} else {
 				replyRes.Success = true
 				rf.logger.Trace("日志成功应用到状态机")
@@ -894,8 +949,10 @@ func (rf *raft) handleTransfer(rpcMsg rpc) {
 func (rf *raft) handleClientCmd(rpcMsg rpc) {
 
 	// 重置心跳计时器
-	rf.timerState.setHeartbeatTimer()
-	rf.logger.Trace("重置心跳计时器成功")
+	if rf.isLeader() {
+		rf.timerState.setHeartbeatTimer()
+		rf.logger.Trace("重置心跳计时器成功")
+	}
 
 	args := rpcMsg.req.(ApplyCommand)
 	var replyRes ApplyCommandReply
@@ -920,10 +977,11 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 	rf.logger.Trace("将日志添加到内存")
 	addEntryErr := rf.addEntry(Entry{Term: rf.hardState.currentTerm(), Type: EntryReplicate, Data: args.Data})
 	if addEntryErr != nil {
-		replyErr = fmt.Errorf("Leader 添加客户端日志失败：%w", addEntryErr)
+		replyErr = fmt.Errorf("给 Leader 添加客户端日志失败：%w", addEntryErr)
 		rf.logger.Trace(replyErr.Error())
 		return
 	}
+	rf.leaderState.matchAndNextIndexAdd(rf.peerState.myId())
 
 	// 给各节点发送日志条目
 	finishCh := make(chan finishMsg)
@@ -940,21 +998,79 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 	}
 
 	// 新日志成功发送到过半 Follower 节点，提交本地的日志
-	success := rf.waitRpcResult(finishCh)
+	majorityFinishCh := make(chan bool)
+	go func() {
+		count := 1
+		successCnt := 1
+		sent := false
+		after := time.After(rf.timerState.heartbeatDuration())
+		for {
+			select {
+			case <-after:
+				replyErr = fmt.Errorf("等待响应结果超时")
+				rf.logger.Error(replyErr.Error())
+				if !sent {
+					majorityFinishCh <- false
+					sent = true
+				}
+				return
+			case msg := <-finishCh:
+				if msg.msgType == Degrade {
+					rf.logger.Trace("接收到降级请求")
+					if rf.becomeFollower(msg.term) {
+						rf.logger.Trace("降级成功")
+					}
+					replyErr = fmt.Errorf("节点降级")
+					if !sent {
+						majorityFinishCh <- false
+						sent = true
+					}
+					return
+				}
+				if msg.msgType == Success {
+					rf.logger.Trace("接收到成功响应")
+					successCnt += 1
+					rf.leaderState.matchAndNextIndexAdd(msg.id)
+				}
+				if successCnt >= rf.peerState.majority() {
+					rf.logger.Trace("请求已成功发送给多数节点")
+					if !sent {
+						majorityFinishCh <- true
+						sent = true
+					}
+				}
+				count += 1
+				if count >= rf.peerState.peersCnt() {
+					rf.logger.Trace("rpc 完成，所有节点都已返回响应")
+					if !sent {
+						replyErr = fmt.Errorf("日志未送达多数节点")
+						majorityFinishCh <- false
+						sent = true
+					}
+					return
+				}
+			}
+		}
+	}()
+
+	success := <-majorityFinishCh
 	if !success {
-		replyErr = fmt.Errorf("rpc 完成，但日志未复制到多数节点")
-		rf.logger.Trace(replyErr.Error())
+		replyErr = fmt.Errorf("日志发送未成功！")
+		rf.logger.Error(replyErr.Error())
 		return
 	}
 
 	// 将 commitIndex 设置为新条目的索引
 	// 此操作会连带提交 Leader 先前未提交的日志条目并应用到状态季节
 	rf.logger.Trace("Leader 更新 commitIndex")
-	updateCmtErr := rf.updateLeaderCommit()
-	if updateCmtErr != nil {
-		replyErr = fmt.Errorf("Leader 更新 commitIndex 失败：%w", updateCmtErr)
-		rf.logger.Trace(replyErr.Error())
-		return
+	rf.updateLeaderCommit()
+	rf.logger.Trace(fmt.Sprintf("将 Leader 的 commitIndex 日志更新为 %d", rf.softState.getCommitIndex()))
+
+	// 应用状态机
+	applyErr := rf.applyFsm()
+	if applyErr != nil {
+		replyErr = fmt.Errorf("日志应用状态机失败！%w", applyErr)
+		rf.logger.Error(replyErr.Error())
 	}
 
 	// 当日志量超过阈值时，生成快照
@@ -1180,9 +1296,10 @@ func (rf *raft) sendNewConfig(peers map[NodeId]NodeAddr) error {
 	count := 1
 	successCnt := 1
 	end := false
+	after := time.After(rf.timerState.heartbeatDuration())
 	for !end {
 		select {
-		case <-time.After(rf.timerState.heartbeatDuration()):
+		case <-after:
 			return fmt.Errorf("请求超时")
 		case msg := <-finishCh:
 			if msg.msgType == Degrade {
@@ -1231,9 +1348,10 @@ func (rf *raft) waitForConfig(peers map[NodeId]NodeAddr) bool {
 	count := 1
 	successCnt := 1
 	end := false
+	after := time.After(rf.timerState.heartbeatDuration())
 	for !end {
 		select {
-		case <-time.After(rf.timerState.heartbeatDuration()):
+		case <-after:
 			end = true
 			rf.logger.Trace("超时退出")
 		case result := <-finishCh:
@@ -1340,7 +1458,7 @@ func (rf *raft) replicationTo(id NodeId, finishCh chan finishMsg, stopCh chan st
 	}
 
 	if res.Success {
-		msg = finishMsg{msgType: Success}
+		msg = finishMsg{msgType: Success, id: id}
 		rf.logger.Trace("成功获取到响应")
 		return
 	}
@@ -1351,7 +1469,7 @@ func (rf *raft) replicationTo(id NodeId, finishCh chan finishMsg, stopCh chan st
 		msg = finishMsg{msgType: Degrade, term: res.Term}
 	} else if entryType != EntryChangeConf {
 		// Follower 和 Leader 的日志不匹配，进行日志追赶
-		rf.logger.Trace("日志进度落后，触发追赶")
+		rf.logger.Trace(fmt.Sprintf("节点 id=%s 日志进度落后，触发追赶", id))
 		rf.leaderState.replications[id].triggerCh <- struct{}{}
 		msg = finishMsg{msgType: Success}
 	}
@@ -1620,18 +1738,7 @@ func (rf *raft) setRoleStage(stage RoleStage) {
 
 // 添加新日志
 func (rf *raft) addEntry(entry Entry) error {
-	index := 1
-	lastLogIndex := rf.lastEntryIndex()
-	lastSnapshotIndex := rf.snapshotState.lastIndex()
-	if lastLogIndex <= 0 {
-		if lastSnapshotIndex <= 0 {
-			entry.Index = index
-		} else {
-			entry.Index = lastSnapshotIndex
-		}
-	} else {
-		entry.Index = lastLogIndex
-	}
+	entry.Index = rf.lastEntryIndex() + 1
 	rf.logger.Trace(fmt.Sprintf("日志条目索引 index=%d", entry.Index))
 	return rf.hardState.appendEntry(entry)
 }
@@ -1659,37 +1766,13 @@ func (rf *raft) applyFsm() error {
 }
 
 // 更新 Leader 的提交索引
-func (rf *raft) updateLeaderCommit() error {
-	indexCnt := make(map[int]int)
-	peers := rf.peerState.peers()
-	//
-	for id := range peers {
-		indexCnt[rf.leaderState.matchIndex(id)] = 1
+func (rf *raft) updateLeaderCommit() {
+	commitIndexes := make([]int, 0)
+	for id := range rf.peerState.peers() {
+		commitIndexes = append(commitIndexes, rf.leaderState.matchIndex(id))
 	}
-
-	// 计算出多少个节点有相同的 matchIndex 值
-	for index := range indexCnt {
-		for index2, cnt2 := range indexCnt {
-			if index > index2 {
-				indexCnt[index2] = cnt2 + 1
-			}
-		}
-	}
-
-	// 找出超过半数的 matchIndex 值
-	maxMajorityMatch := 0
-	for index, cnt := range indexCnt {
-		if cnt >= rf.peerState.majority() && index > maxMajorityMatch {
-			maxMajorityMatch = index
-		}
-	}
-
-	if rf.softState.getCommitIndex() < maxMajorityMatch {
-		rf.softState.setCommitIndex(maxMajorityMatch)
-		return rf.applyFsm()
-	}
-
-	return nil
+	sort.Ints(commitIndexes)
+	rf.softState.setCommitIndex(commitIndexes[rf.peerState.majority()-1])
 }
 
 func (rf *raft) needGenSnapshot() bool {
@@ -1724,7 +1807,7 @@ func (rf *raft) logEntry(index int) (entry Entry, err error) {
 		if index <= snapshot.LastIndex {
 			err = errors.New(fmt.Sprintf("索引 %d 小于等于快照索引 %d，不合法操作", index, snapshot.LastIndex))
 		} else {
-			if iEntry, iEntryErr := rf.hardState.logEntry(index - snapshot.LastIndex - 1); iEntryErr != nil {
+			if iEntry, iEntryErr := rf.hardState.logEntry(index - snapshot.LastIndex); iEntryErr != nil {
 				err = fmt.Errorf(iEntryErr.Error())
 			} else {
 				entry = iEntry
@@ -1746,7 +1829,7 @@ func (rf *raft) truncateAfter(index int) (err error) {
 		if index <= snapshot.LastIndex {
 			err = errors.New(fmt.Sprintf("索引 %d 小于快照索引 %d，不合法操作", index, snapshot.LastIndex))
 		} else {
-			rf.hardState.truncateAfter(index - snapshot.LastIndex - 1)
+			rf.hardState.truncateAfter(index - snapshot.LastIndex)
 		}
 	} else {
 		rf.hardState.truncateAfter(index)
@@ -1760,7 +1843,7 @@ func (rf *raft) truncateBefore(index int) (err error) {
 		if index <= snapshot.LastIndex {
 			err = errors.New(fmt.Sprintf("索引 %d 小于快照索引 %d，不合法操作", index, snapshot.LastIndex))
 		} else {
-			rf.hardState.truncateBefore(index - snapshot.LastIndex - 1)
+			rf.hardState.truncateBefore(index - snapshot.LastIndex)
 		}
 	} else {
 		rf.hardState.truncateBefore(index)
