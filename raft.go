@@ -16,6 +16,8 @@ const (
 	Error finishMsgType = iota
 	RpcFailed
 	Degrade
+	Sync
+	NotSync
 	Success
 )
 
@@ -219,13 +221,21 @@ func (rf *raft) runLeader() {
 						end = true
 						break
 					}
-					if msg.msgType == Success {
-						nodeId := msg.id
+					nodeId := msg.id
+					if msg.msgType == Sync {
 						rf.logger.Trace(fmt.Sprintf("获取到 id=%s 的心跳结果：Success", nodeId))
 						successCnt += 1
-						if rf.leaderState.matchIndex(nodeId) < rf.softState.getCommitIndex() {
+						if rf.leaderState.matchIndex(nodeId) < rf.softState.getCommitIndex() &&
+							!rf.leaderState.isRpcBusy(nodeId) {
 							rf.logger.Trace(fmt.Sprintf("节点 id=%s 日志落后，开启日志追赶", nodeId))
-							rf.leaderState.replications[nodeId].triggerCh <- struct{}{}
+							rf.leaderState.replications[nodeId].triggerCh <-FindMatchIndex
+						}
+					}
+					if msg.msgType == NotSync {
+						if rf.leaderState.matchIndex(nodeId) < rf.softState.getCommitIndex() &&
+							!rf.leaderState.isRpcBusy(nodeId) {
+							rf.logger.Trace(fmt.Sprintf("节点 id=%s 日志落后，开启日志追赶", nodeId))
+							rf.leaderState.replications[nodeId].triggerCh <-FindMatchIndex
 						}
 					}
 					if successCnt >= rf.peerState.majority() {
@@ -382,7 +392,43 @@ func (rf *raft) election(stopCh chan struct{}) <-chan finishMsg {
 	// pre-vote
 	preVoteFinishCh := rf.sendRequestVote(stopCh, true)
 
-	if !rf.waitRpcResult(preVoteFinishCh) {
+	finish := false
+	count := 1
+	successCnt := 1
+	end := false
+	after := time.After(rf.timerState.heartbeatDuration())
+	for !end {
+		select {
+		case <-after:
+			rf.logger.Trace("操作超时退出")
+			end = true
+		case msg := <-preVoteFinishCh:
+			if msg.msgType == Degrade {
+				rf.logger.Trace("接收到降级请求")
+				if rf.becomeFollower(msg.term) {
+					rf.logger.Trace("降级成功")
+				}
+				end = true
+				break
+			}
+			if msg.msgType == Success {
+				rf.logger.Trace("接收到成功响应")
+				successCnt += 1
+			}
+			if successCnt >= rf.peerState.majority() {
+				rf.logger.Trace("请求已成功发送给多数节点")
+				end = true
+				finish = true
+			}
+			count += 1
+			if count >= rf.peerState.peersCnt() {
+				rf.logger.Trace("已接收所有响应，成功节点数未达到多数")
+				end = true
+			}
+		}
+	}
+
+	if !finish {
 		rf.logger.Trace("preVote 失败，退出选举")
 		go func() { preVoteFinishCh <- finishMsg{msgType: Error} }()
 		return preVoteFinishCh
@@ -453,45 +499,6 @@ func (rf *raft) sendRequestVote(stopCh <-chan struct{}, isPreVote bool) chan fin
 	return finishCh
 }
 
-// msgCh 日志复制协程 -> 主协程，通知协程的任务完成
-func (rf *raft) waitRpcResult(finishCh <-chan finishMsg) bool {
-	count := 1
-	successCnt := 1
-	end := false
-	after := time.After(rf.timerState.heartbeatDuration())
-	for !end {
-		select {
-		case <-after:
-			rf.logger.Trace("操作超时退出")
-			end = true
-		case msg := <-finishCh:
-			if msg.msgType == Degrade {
-				rf.logger.Trace("接收到降级请求")
-				if rf.becomeFollower(msg.term) {
-					rf.logger.Trace("降级成功")
-				}
-				end = true
-				break
-			}
-			if msg.msgType == Success {
-				rf.logger.Trace("接收到成功响应")
-				successCnt += 1
-			}
-			if successCnt >= rf.peerState.majority() {
-				rf.logger.Trace("请求已成功发送给多数节点")
-				return true
-			}
-			count += 1
-			if count >= rf.peerState.peersCnt() {
-				rf.logger.Trace("已接收所有响应，成功节点数未达到多数")
-				return false
-			}
-		}
-	}
-
-	return false
-}
-
 func (rf *raft) runReplication() {
 	for id, addr := range rf.peerState.peers() {
 		rf.addReplication(id, addr)
@@ -505,11 +512,12 @@ func (rf *raft) addReplication(id NodeId, addr NodeAddr) {
 		st = &Replication{
 			id:         id,
 			addr:       addr,
+			role:       Learner,
 			nextIndex:  rf.lastEntryIndex() + 1,
 			matchIndex: 0,
 			stepDownCh: rf.leaderState.stepDownCh,
 			stopCh:     make(chan struct{}),
-			triggerCh:  make(chan struct{}),
+			triggerCh:  make(chan trigger),
 		}
 		rf.leaderState.replications[id] = st
 	}
@@ -518,14 +526,19 @@ func (rf *raft) addReplication(id NodeId, addr NodeAddr) {
 			select {
 			case <-st.stopCh:
 				return
-			case <-st.triggerCh:
+			case triggerMsg := <-st.triggerCh:
 				func() {
 					rf.logger.Trace(fmt.Sprintf("Id=%s 开始日志追赶", id))
 					// 设置状态
 					rf.leaderState.setRpcBusy(st.id, true)
 					defer rf.leaderState.setRpcBusy(st.id, false)
 					// 复制日志，成功后将节点角色提升为 Follower
-					replicate := rf.replicate(st)
+					var replicate bool
+					if triggerMsg == FindNextIndex {
+						replicate = rf.replicate(st)
+					} else {
+						replicate = rf.findCorrectMatchIndex(st)
+					}
 					rf.logger.Trace(fmt.Sprintf("日志追赶结束，返回值=%t", replicate))
 					if replicate && rf.leaderState.replications[id].role == Learner {
 						func() {
@@ -572,7 +585,7 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 	rfTerm := rf.hardState.currentTerm()
 	if args.Term < rfTerm {
 		// 发送请求的 Leader 任期数落后
-		rf.logger.Trace("发送请求的 Leader 任期数落后与本节点")
+		rf.logger.Trace("发送请求的 Leader 任期数落后于本节点")
 		replyRes.Term = rfTerm
 		replyRes.Success = false
 		return
@@ -613,6 +626,7 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 			}
 
 			if entry, entryErr := rf.logEntry(logLength - 1); entryErr != nil {
+				replyErr = entryErr
 				rf.logger.Error(entryErr.Error())
 				return
 			} else {
@@ -635,7 +649,8 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 		return
 	} else if prevIndex > 0 {
 		if prevEntry, prevEntryErr := rf.logEntry(prevIndex); prevEntryErr != nil {
-			rf.logger.Error(fmt.Errorf("获取 index=%d 的日志失败！%w", prevIndex, prevEntryErr).Error())
+			replyErr = fmt.Errorf("获取 index=%d 的日志失败！%w", prevIndex, prevEntryErr)
+			rf.logger.Error(replyErr.Error())
 			return
 		} else if prevTerm := prevEntry.Term; prevTerm != args.PrevLogTerm {
 			func() {
@@ -667,11 +682,12 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 			return
 		}
 	} else {
-		rf.logger.Trace("prevIndex 为 0，Leader 第一次发送的日志")
+		rf.logger.Trace("prevIndex 为 0，Leader 还没有接收日志")
 	}
 
 	newEntryIndex := prevIndex + 1
 	replyRes.Term = rfTerm
+	replyRes.Success = true
 	if args.EntryType == EntryReplicate {
 		// ========== 接收日志条目 ==========
 		rf.logger.Trace("接收到日志条目")
@@ -679,40 +695,37 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 		if rf.lastEntryIndex() >= newEntryIndex {
 			rf.logger.Trace(fmt.Sprintf("当前节点已经含有 index=%d 的日志", newEntryIndex))
 			if entry, entryErr := rf.logEntry(newEntryIndex); entryErr != nil {
-				rf.logger.Error(fmt.Errorf("获取 index=%d 的日志失败！%w", newEntryIndex, entryErr).Error())
-				replyRes.Success = false
+				replyErr = fmt.Errorf("获取 index=%d 的日志失败！%w", newEntryIndex, entryErr)
+				rf.logger.Error(replyErr.Error())
+				return
 			} else if entry.Term != args.Term {
 				rf.logger.Trace(fmt.Sprintf("当前节点 index=%d 的日志与新条目冲突。term=%d, args.term=%d，截断之后的日志",
 					newEntryIndex, entry.Term, args.Term))
 				truncateErr := rf.truncateAfter(newEntryIndex)
 				if truncateErr != nil {
-					rf.logger.Error(fmt.Errorf("截断日志失败！%w", truncateErr).Error())
-					replyRes.Success = false
+					replyErr = fmt.Errorf("截断日志失败！%w", truncateErr)
+					rf.logger.Error(replyErr.Error())
 					return
 				}
 				rf.logger.Trace("日志截断成功！")
 				// 将新条目添加到日志中
 				err := rf.addEntry(args.Entries[0])
 				if err != nil {
-					rf.logger.Error(fmt.Errorf("日志添加新条目失败！%w", err).Error())
-					replyRes.Success = false
-				} else {
-					replyRes.Success = true
+					replyErr = fmt.Errorf("日志添加新条目失败！%w", err)
+					rf.logger.Error(replyErr.Error())
+					return
 				}
 				rf.logger.Trace("成功将新条目添加到日志中")
 			} else {
-				replyRes.Success = true
 				rf.logger.Trace("当前节点已包含新日志")
 			}
 		} else {
 			// 将新条目添加到日志中
 			err := rf.addEntry(args.Entries[0])
 			if err != nil {
-				rf.logger.Error(fmt.Errorf("日志添加新条目失败！%w", err).Error())
-				replyRes.Success = false
-			} else {
-				replyRes.Success = true
-
+				replyErr = fmt.Errorf("日志添加新条目失败！%w", err)
+				rf.logger.Error(replyErr.Error())
+				return
 			}
 			rf.logger.Trace("成功将新条目添加到日志中")
 		}
@@ -729,11 +742,8 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 			rf.logger.Trace(fmt.Sprintf("成功更新提交索引，commitIndex=%d", rf.softState.getCommitIndex()))
 			applyErr := rf.applyFsm()
 			if applyErr != nil {
-				replyErr = applyErr
-				replyRes.Success = false
 				rf.logger.Error(fmt.Errorf("日志应用到状态机失败！%w", applyErr).Error())
 			} else {
-				replyRes.Success = true
 				rf.logger.Trace("日志成功应用到状态机")
 			}
 		}
@@ -757,15 +767,10 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 			rf.logger.Trace(fmt.Sprintf("成功更新提交索引，commitIndex=%d", rf.softState.getCommitIndex()))
 			applyErr := rf.applyFsm()
 			if applyErr != nil {
-				replyErr = applyErr
-				replyRes.Success = false
 				rf.logger.Error(fmt.Errorf("日志应用到状态机失败！%w", applyErr).Error())
 			} else {
-				replyRes.Success = true
 				rf.logger.Trace("日志成功应用到状态机")
 			}
-		} else {
-			replyRes.Success = true
 		}
 
 		// 当日志量超过阈值时，生成快照
@@ -1177,7 +1182,7 @@ func (rf *raft) handleNewNode(msg rpc) {
 	rf.logger.Trace("新空白节点添加到 replication，并触发复制循环")
 	rf.addReplication(newNode.Id, newNode.Addr)
 	// 触发复制
-	rf.leaderState.followers()[newNode.Id].triggerCh <- struct{}{}
+	rf.leaderState.followers()[newNode.Id].triggerCh <- FindNextIndex
 }
 
 func (rf *raft) checkSnapshot() {
@@ -1251,7 +1256,7 @@ func (rf *raft) checkTransfer(id NodeId) {
 		} else {
 			// 目标节点不是最新，开始日志复制
 			rf.logger.Trace("目标节点不是最新，开始日志复制")
-			rf.leaderState.replications[id].triggerCh <- struct{}{}
+			rf.leaderState.replications[id].triggerCh <- FindNextIndex
 		}
 	}
 }
@@ -1472,18 +1477,12 @@ func (rf *raft) replicationTo(id NodeId, finishCh chan finishMsg, stopCh chan st
 	}
 	res := &AppendEntryReply{}
 	rf.logger.Trace(fmt.Sprintf("发送的内容：%+v", args))
-	err := rf.transport.AppendEntries(addr, args, res)
+	rpcErr := rf.transport.AppendEntries(addr, args, res)
 
 	// 处理 RPC 调用结果
-	if err != nil {
-		rf.logger.Error(fmt.Errorf("调用rpc服务失败：%s%w\n", addr, err).Error())
+	if rpcErr != nil {
+		rf.logger.Error(fmt.Errorf("调用rpc服务失败：%s%w\n", addr, rpcErr).Error())
 		msg = finishMsg{msgType: RpcFailed}
-		return
-	}
-
-	if res.Success {
-		msg = finishMsg{msgType: Success, id: id}
-		rf.logger.Trace("成功获取到响应")
 		return
 	}
 
@@ -1491,11 +1490,25 @@ func (rf *raft) replicationTo(id NodeId, finishCh chan finishMsg, stopCh chan st
 		// 当前任期数落后，降级为 Follower
 		rf.logger.Trace("任期落后，发送降级通知")
 		msg = finishMsg{msgType: Degrade, term: res.Term}
-	} else if entryType != EntryChangeConf {
-		// Follower 和 Leader 的日志不匹配，进行日志追赶
-		rf.logger.Trace(fmt.Sprintf("节点 id=%s 日志进度落后，触发追赶", id))
-		rf.leaderState.replications[id].triggerCh <- struct{}{}
-		msg = finishMsg{msgType: Success}
+		return
+	}
+
+	msg = finishMsg{msgType: Success, id: id}
+	rf.logger.Trace(fmt.Sprintf("成功获取到节点 id=%s 的响应", id))
+
+	checkEntryType := entryType == EntryReplicate || entryType == EntryHeartbeat
+	checkProgress := rf.softState.getCommitIndex() > rf.leaderState.matchIndex(id)
+	if res.Success {
+		if checkEntryType && checkProgress && !rf.leaderState.isRpcBusy(id) {
+			rf.logger.Trace(fmt.Sprintf("节点 id=%s 日志落后，开始追赶", id))
+			rf.leaderState.replications[id].triggerCh <- FindMatchIndex
+		}
+		return
+	}
+
+	if checkEntryType && checkProgress && !rf.leaderState.isRpcBusy(id) {
+		rf.logger.Trace(fmt.Sprintf("节点 id=%s 日志落后，开始追赶", id))
+		rf.leaderState.replications[id].triggerCh <- FindNextIndex
 	}
 }
 
@@ -1506,7 +1519,7 @@ func (rf *raft) replicate(s *Replication) bool {
 	if rf.findCorrectNextIndex(s) {
 		// 递增更新 matchIndex 值
 		rf.logger.Trace("递增更新 matchIndex 值")
-		return rf.completeEntries(s)
+		return rf.findCorrectMatchIndex(s)
 	}
 	rf.logger.Trace("日志追赶失败")
 	return false
@@ -1521,29 +1534,21 @@ func (rf *raft) findCorrectNextIndex(s *Replication) bool {
 			return false
 		default:
 		}
-		prevIndex := rl.nextIndex(s.id) - 1
-		// 找到匹配点之前，发送空日志节省带宽
-		var entries []Entry
-		if rl.matchIndex(s.id) == prevIndex {
-			if entry, entryErr := rf.logEntry(prevIndex); entryErr != nil {
-				rf.logger.Error(fmt.Errorf("获取 index=%d 日志失败 %w", prevIndex, entryErr).Error())
-				return false
-			} else {
-				entries = []Entry{entry}
-			}
-		}
+		nextIndex := rl.nextIndex(s.id)
+		prevIndex := nextIndex - 1
 		prevEntry, prevEntryErr := rf.logEntry(prevIndex)
 		if prevEntryErr != nil {
 			rf.logger.Error(fmt.Errorf("获取 index=%d 日志失败 %w", prevIndex, prevEntryErr).Error())
 			return false
 		}
 		args := AppendEntry{
+			EntryType:    EntryHeartbeat,
 			Term:         rf.hardState.currentTerm(),
 			LeaderId:     rf.peerState.myId(),
 			PrevLogIndex: prevIndex,
 			PrevLogTerm:  prevEntry.Term,
 			LeaderCommit: rf.softState.getCommitIndex(),
-			Entries:      entries,
+			Entries:      []Entry{},
 		}
 		res := &AppendEntryReply{}
 		rf.logger.Trace(fmt.Sprintf("给节点 Id=%s 发送日志：%+v", s.id, args))
@@ -1587,62 +1592,61 @@ func (rf *raft) findCorrectNextIndex(s *Replication) bool {
 	return true
 }
 
-func (rf *raft) completeEntries(s *Replication) bool {
+func (rf *raft) findCorrectMatchIndex(s *Replication) bool {
 
 	rl := rf.leaderState
+
+	// 缺失的日志太多时，直接发送快照
+	snapshot := rf.snapshotState.getSnapshot()
+	finishCh := make(chan finishMsg)
+	if rl.nextIndex(s.id) <= snapshot.LastIndex {
+		rf.logger.Trace(fmt.Sprintf("节点 Id=%s 缺失的日志太多，直接发送快照", s.id))
+		rf.snapshotTo(s.addr, snapshot.Data, finishCh, make(chan struct{}))
+		msg := <-finishCh
+		if msg.msgType != Success {
+			if msg.msgType == Degrade {
+				rf.logger.Trace("接收到降级通知")
+				if rf.becomeFollower(msg.term) {
+					rf.logger.Trace("降级为 Follower 成功！")
+				}
+				return false
+			}
+		}
+		rf.logger.Trace("快照发送成功！")
+		rf.leaderState.setMatchAndNextIndex(s.id, snapshot.LastIndex, snapshot.LastIndex+1)
+		if snapshot.LastIndex == rf.lastEntryIndex() {
+			rf.logger.Trace("快照后面没有新日志，日志追赶结束")
+			return true
+		}
+	}
+	// 发送单个日志
 	for rl.nextIndex(s.id)-1 < rf.lastEntryIndex() {
 		select {
 		case <-s.stopCh:
 			return false
 		default:
 		}
-		// 缺失的日志太多时，直接发送快照
-		snapshot := rf.snapshotState.getSnapshot()
-		finishCh := make(chan finishMsg)
-		if rl.nextIndex(s.id) <= snapshot.LastIndex {
-			rf.logger.Trace(fmt.Sprintf("节点 Id=%s 缺失的日志太多，直接发送快照", s.id))
-			rf.snapshotTo(s.addr, snapshot.Data, finishCh, make(chan struct{}))
-			msg := <-finishCh
-			if msg.msgType != Success {
-				if msg.msgType == Degrade {
-					rf.logger.Trace("接收到降级通知")
-					if rf.becomeFollower(msg.term) {
-						rf.logger.Trace("降级为 Follower 成功！")
-					}
-					return false
-				}
-			}
-			rf.logger.Trace("快照发送成功！")
-			rf.leaderState.setMatchAndNextIndex(s.id, snapshot.LastIndex, snapshot.LastIndex+1)
-			if snapshot.LastIndex == rf.lastEntryIndex() {
-				rf.logger.Trace("快照后面没有新日志，日志追赶结束")
-				return true
-			}
-		}
 
-		prevIndex := rl.nextIndex(s.id) - 1
-		prevEntry, prevEntryErr := rf.logEntry(prevIndex)
-		if prevEntryErr != nil {
-			rf.logger.Error(fmt.Errorf("获取 index=%d 日志失败 %w", prevIndex, prevEntryErr).Error())
-			return false
-		}
+		nextIndex := rl.nextIndex(s.id)
+		prevIndex := nextIndex - 1
 		var entries []Entry
-		if entry, entryErr := rf.logEntry(prevIndex); entryErr != nil {
-			rf.logger.Error(fmt.Errorf("获取 index=%d 日志失败 %w", prevIndex, entryErr).Error())
+		sendEntry, sendEntryErr := rf.logEntry(nextIndex)
+		if sendEntryErr != nil {
+			rf.logger.Error(fmt.Errorf("获取 index=%d 日志失败 %w", prevIndex, sendEntryErr).Error())
 			return false
 		} else {
-			entries = []Entry{entry}
+			entries = []Entry{sendEntry}
 		}
 		args := AppendEntry{
 			Term:         rf.hardState.currentTerm(),
 			LeaderId:     rf.peerState.myId(),
 			PrevLogIndex: prevIndex,
-			PrevLogTerm:  prevEntry.Term,
+			PrevLogTerm:  sendEntry.Term,
 			LeaderCommit: rf.softState.getCommitIndex(),
 			Entries:      entries,
 		}
 		res := &AppendEntryReply{}
-		rf.logger.Trace(fmt.Sprintf("给节点 Id=%s 发送日志：%+v", s.id, args))
+		rf.logger.Trace(fmt.Sprintf("给 Id=%s 发送日志 %+v", s.id, args))
 		rpcErr := rf.transport.AppendEntries(s.addr, args, res)
 
 		if rpcErr != nil {
@@ -1780,10 +1784,11 @@ func (rf *raft) applyFsm() (err error) {
 		} else {
 			applyErr := rf.fsm.Apply(entry.Data)
 			if applyErr != nil {
-				err = fmt.Errorf("应用状态机失败：%w", err)
+				err = applyErr
+			} else {
+				lastApplied = rf.softState.lastAppliedAdd()
 			}
 		}
-		lastApplied = rf.softState.lastAppliedAdd()
 	}
 
 	return
