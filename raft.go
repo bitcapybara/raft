@@ -220,8 +220,13 @@ func (rf *raft) runLeader() {
 						break
 					}
 					if msg.msgType == Success {
-						rf.logger.Trace("成功获取到一个心跳结果")
+						nodeId := msg.id
+						rf.logger.Trace(fmt.Sprintf("获取到 id=%s 的心跳结果：Success", nodeId))
 						successCnt += 1
+						if rf.leaderState.matchIndex(nodeId) < rf.softState.getCommitIndex() {
+							rf.logger.Trace(fmt.Sprintf("节点 id=%s 日志落后，开启日志追赶", nodeId))
+							rf.leaderState.replications[nodeId].triggerCh <- struct{}{}
+						}
 					}
 					if successCnt >= rf.peerState.majority() {
 						rf.logger.Trace("心跳已成功发送给多数节点")
@@ -538,7 +543,7 @@ func (rf *raft) addReplication(id NodeId, addr NodeAddr) {
 						}()
 					}
 					rf.updateLeaderCommit()
-					rf.logger.Trace(fmt.Sprintf("将 Leader 的 commitIndex 日志更新为 %d", rf.softState.getCommitIndex()))
+					rf.logger.Trace(fmt.Sprintf("commitIndex 更新为 %d", rf.softState.getCommitIndex()))
 				}()
 			}
 		}
@@ -712,29 +717,19 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 			rf.logger.Trace("成功将新条目添加到日志中")
 		}
 
-		// 添加日志后不提交，下次心跳来了再提交
-		return
-	}
-
-	if args.EntryType == EntryHeartbeat {
-		// ========== 接收心跳 ==========
-		rf.logger.Trace("接收到心跳")
-		rf.peerState.setLeader(args.LeaderId)
-		replyRes.Term = rf.hardState.currentTerm()
-
 		// 更新提交索引
 		leaderCommit := args.LeaderCommit
 		if leaderCommit > rf.softState.getCommitIndex() {
-			var err error
-			if leaderCommit >= newEntryIndex {
-				rf.softState.setCommitIndex(newEntryIndex)
+			lastEntryIndex := rf.lastEntryIndex()
+			if leaderCommit >= rf.lastEntryIndex() {
+				rf.softState.setCommitIndex(lastEntryIndex)
 			} else {
 				rf.softState.setCommitIndex(leaderCommit)
 			}
 			rf.logger.Trace(fmt.Sprintf("成功更新提交索引，commitIndex=%d", rf.softState.getCommitIndex()))
 			applyErr := rf.applyFsm()
 			if applyErr != nil {
-				replyErr = err
+				replyErr = applyErr
 				replyRes.Success = false
 				rf.logger.Error(fmt.Errorf("日志应用到状态机失败！%w", applyErr).Error())
 			} else {
@@ -746,7 +741,36 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 		// 当日志量超过阈值时，生成快照
 		rf.logger.Trace("检查是否需要生成快照")
 		rf.checkSnapshot()
-		replyRes.Success = true
+
+		return
+	}
+
+	if args.EntryType == EntryHeartbeat {
+		// ========== 接收心跳 ==========
+		rf.logger.Trace("接收到心跳")
+		rf.peerState.setLeader(args.LeaderId)
+		replyRes.Term = rf.hardState.currentTerm()
+
+		// 更新提交索引
+		if prevIndex > rf.softState.getCommitIndex() {
+			rf.softState.setCommitIndex(prevIndex)
+			rf.logger.Trace(fmt.Sprintf("成功更新提交索引，commitIndex=%d", rf.softState.getCommitIndex()))
+			applyErr := rf.applyFsm()
+			if applyErr != nil {
+				replyErr = applyErr
+				replyRes.Success = false
+				rf.logger.Error(fmt.Errorf("日志应用到状态机失败！%w", applyErr).Error())
+			} else {
+				replyRes.Success = true
+				rf.logger.Trace("日志成功应用到状态机")
+			}
+		} else {
+			replyRes.Success = true
+		}
+
+		// 当日志量超过阈值时，生成快照
+		rf.logger.Trace("检查是否需要生成快照")
+		rf.checkSnapshot()
 		return
 	}
 
@@ -1064,7 +1088,7 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 	// 此操作会连带提交 Leader 先前未提交的日志条目并应用到状态季节
 	rf.logger.Trace("Leader 更新 commitIndex")
 	rf.updateLeaderCommit()
-	rf.logger.Trace(fmt.Sprintf("将 Leader 的 commitIndex 日志更新为 %d", rf.softState.getCommitIndex()))
+	rf.logger.Trace(fmt.Sprintf("commitIndex 日志更新为 %d", rf.softState.getCommitIndex()))
 
 	// 应用状态机
 	applyErr := rf.applyFsm()
@@ -1744,25 +1768,25 @@ func (rf *raft) addEntry(entry Entry) error {
 }
 
 // 把日志应用到状态机
-func (rf *raft) applyFsm() error {
+func (rf *raft) applyFsm() (err error) {
 	commitIndex := rf.softState.getCommitIndex()
 	lastApplied := rf.softState.getLastApplied()
 
 	for commitIndex > lastApplied {
 		if entry, entryErr := rf.logEntry(lastApplied + 1); entryErr != nil {
-			err := fmt.Errorf("获取 index=%d 日志失败 %w", lastApplied+1, entryErr)
+			err = fmt.Errorf("获取 index=%d 日志失败 %w", lastApplied+1, entryErr)
 			rf.logger.Error(err.Error())
-			return err
+			return
 		} else {
-			err := rf.fsm.Apply(entry.Data)
-			if err != nil {
-				return fmt.Errorf("应用状态机失败：%w", err)
+			applyErr := rf.fsm.Apply(entry.Data)
+			if applyErr != nil {
+				err = fmt.Errorf("应用状态机失败：%w", err)
 			}
-			lastApplied = rf.softState.lastAppliedAdd()
 		}
+		lastApplied = rf.softState.lastAppliedAdd()
 	}
 
-	return nil
+	return
 }
 
 // 更新 Leader 的提交索引
