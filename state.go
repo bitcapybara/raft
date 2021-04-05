@@ -392,7 +392,7 @@ type Replication struct {
 	mu         sync.Mutex    // 锁
 	stepDownCh chan int      // 通知主线程降级
 	stopCh     chan struct{} // 接收主线程发来的降级通知
-	triggerCh  chan trigger  // 触发复制请求
+	triggerCh  chan struct{}  // 触发复制请求
 }
 
 type transfer struct {
@@ -435,7 +435,7 @@ func newLeaderState(peers map[NodeId]NodeAddr) *LeaderState {
 			matchIndex: 0,
 			stepDownCh: stepDownCh,
 			stopCh:     make(chan struct{}),
-			triggerCh:  make(chan trigger),
+			triggerCh:  make(chan struct{}),
 		}
 	}
 	return &LeaderState{
