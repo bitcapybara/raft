@@ -1469,7 +1469,6 @@ func (rf *raft) replicationTo(id NodeId, finishCh chan finishMsg, stopCh chan st
 		case <-stopCh:
 		default:
 			msg.id = id
-			rf.logger.Trace(fmt.Sprintf("给 finishCh 通道发送 %+v", msg))
 			finishCh <- msg
 		}
 	}()
