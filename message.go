@@ -47,6 +47,7 @@ const (
 type Server struct {
 	Id   NodeId
 	Addr NodeAddr
+	Role RoleStage
 }
 
 type NodeId string
@@ -119,11 +120,12 @@ type ApplyCommandReply struct {
 // ==================== ChangeConfig ====================
 
 type ChangeConfig struct {
-	Peers map[NodeId]NodeAddr // 新配置的集群各节点
+	Peers []Server // 新配置的集群各节点
 }
 
 type ChangeConfigReply struct {
 	Status Status // 配置变更结果
+	Leader Server // 请求的不是 Leader 节点时，返回 Leader 节点信息
 }
 
 // ==================== TransferLeadership ====================
@@ -133,15 +135,5 @@ type TransferLeadership struct {
 }
 
 type TransferLeadershipReply struct {
-	Status Status
-}
-
-// ==================== AddNewNode ====================
-
-type AddNewNode struct {
-	NewNode Server
-}
-
-type AddNewNodeReply struct {
 	Status Status
 }

@@ -375,24 +375,16 @@ func (st *PeerState) addPeer(id NodeId, addr NodeAddr) {
 
 // ==================== LeaderState ====================
 
-type trigger uint8
-
-const (
-	FindNextIndex trigger = iota
-	FindMatchIndex
-)
-
 type Replication struct {
 	id         NodeId        // 节点标识
 	addr       NodeAddr      // 节点地址
-	role       RoleStage     // 复制对象的角色
 	nextIndex  int           // 下一次要发送给各节点的日志索引。由 Leader 维护，初始值为 Leader 最后一个日志的索引 + 1
 	matchIndex int           // 已经复制到各节点的最大的日志索引。由 Leader 维护，初始值为0
 	rpcBusy    bool          // 是否正在通信
 	mu         sync.Mutex    // 锁
 	stepDownCh chan int      // 通知主线程降级
 	stopCh     chan struct{} // 接收主线程发来的降级通知
-	triggerCh  chan struct{}  // 触发复制请求
+	triggerCh  chan struct{} // 触发复制请求
 }
 
 type transfer struct {
@@ -418,30 +410,19 @@ type configChange struct {
 type LeaderState struct {
 	stepDownCh   chan int                // 接收降级通知
 	done         chan NodeId             // 日志复制结束
+	followerRole map[NodeId]RoleStage    // 从节点的角色
 	replications map[NodeId]*Replication // 代表了一个复制日志的 Follower 节点
 	transfer     *transfer               // 领导权转移状态
 	configChange *configChange           // 配置变更状态
+	mu           sync.Mutex
 }
 
-func newLeaderState(peers map[NodeId]NodeAddr) *LeaderState {
-	stepDownCh := make(chan int)
-	replications := make(map[NodeId]*Replication)
-	for id, addr := range peers {
-		replications[id] = &Replication{
-			id:         id,
-			addr:       addr,
-			role:       Follower,
-			nextIndex:  1,
-			matchIndex: 0,
-			stepDownCh: stepDownCh,
-			stopCh:     make(chan struct{}),
-			triggerCh:  make(chan struct{}),
-		}
-	}
+func newLeaderState(followerRole map[NodeId]RoleStage) *LeaderState {
 	return &LeaderState{
-		stepDownCh:   stepDownCh,
+		stepDownCh:   make(chan int),
 		done:         make(chan NodeId),
-		replications: replications,
+		followerRole: followerRole,
+		replications: make(map[NodeId]*Replication),
 		transfer:     newTransfer(),
 		configChange: &configChange{},
 	}
@@ -551,10 +532,21 @@ func (st *LeaderState) newMajority() int {
 }
 
 func (st *LeaderState) roleUpgrade(id NodeId) {
-	state := st.replications[id]
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	state.role = Follower
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.followerRole[id] = Follower
+}
+
+func (st *LeaderState) getFollowerRole() map[NodeId]RoleStage {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.followerRole
+}
+
+func (st *LeaderState) setFollowerRole(id NodeId, role RoleStage) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.followerRole[id] = role
 }
 
 // ==================== timerState ====================

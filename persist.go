@@ -22,9 +22,9 @@ func (rs RaftState) toHardState(persister RaftStatePersister) HardState {
 // ========== 状态持久化器接口，由用户实现 ==========
 
 type RaftStatePersister interface {
-	// SaveRaftState 每次 raft 的状态改变，都会调用此方法
+	// 每次 raft 的状态改变，都会调用此方法
 	SaveRaftState(RaftState) error
-	// LoadRaftState 没有时返回空对象
+	// 没有时返回空对象
 	LoadRaftState() (RaftState, error)
 }
 
@@ -39,9 +39,9 @@ type Snapshot struct {
 // ========== 快照持久化器接口，由用户实现 ==========
 
 type SnapshotPersister interface {
-	// SaveSnapshot 保存快照时调用
+	// 保存快照时调用
 	SaveSnapshot(Snapshot) error
-	// LoadSnapshot 若没有需返回空对象
+	// 若没有需返回空对象
 	LoadSnapshot() (Snapshot, error)
 }
 
