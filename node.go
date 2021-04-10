@@ -13,6 +13,8 @@ const (
 	ChangeConfigRpc
 	// 来自客户端的领导权转移请求
 	TransferLeadershipRpc
+	// 来自客户端的添加 Learner 节点请求
+	AddLearnerRpc
 )
 
 type rpc struct {
@@ -105,6 +107,16 @@ func (nd *Node) TransferLeadership(args TransferLeadership, res *TransferLeaders
 		return msg.err
 	} else {
 		*res = msg.res.(TransferLeadershipReply)
+		return nil
+	}
+}
+
+// Leader 开放的 rpc 接口，由客户端调用，添加新的 Learner 节点
+func (nd *Node) AddLearner(args AddLearner, res *AddLearnerReply) error {
+	if msg := nd.sendRpc(AddLearnerRpc, args); msg.err != nil {
+		return msg.err
+	} else {
+		*res = msg.res.(AddLearnerReply)
 		return nil
 	}
 }

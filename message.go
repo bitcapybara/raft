@@ -47,7 +47,6 @@ const (
 type Server struct {
 	Id        NodeId
 	Addr      NodeAddr
-	IsLearner bool
 }
 
 type NodeId string
@@ -120,7 +119,7 @@ type ApplyCommandReply struct {
 // ==================== ChangeConfig ====================
 
 type ChangeConfig struct {
-	Peers []Server // 新配置的集群各节点
+	Peers map[NodeId]NodeAddr // 新配置的集群各节点
 }
 
 type ChangeConfigReply struct {
@@ -135,5 +134,15 @@ type TransferLeadership struct {
 }
 
 type TransferLeadershipReply struct {
+	Status Status
+}
+
+// ==================== AddLearner ====================
+
+type AddLearner struct {
+	Learners map[NodeId]NodeAddr  // 新添加的 Learner 节点
+}
+
+type AddLearnerReply struct {
 	Status Status
 }

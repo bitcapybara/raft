@@ -378,6 +378,7 @@ func (st *PeerState) addPeer(id NodeId, addr NodeAddr) {
 type Replication struct {
 	id         NodeId        // 节点标识
 	addr       NodeAddr      // 节点地址
+	role       RoleStage     // 节点角色
 	nextIndex  int           // 下一次要发送给各节点的日志索引。由 Leader 维护，初始值为 Leader 最后一个日志的索引 + 1
 	matchIndex int           // 已经复制到各节点的最大的日志索引。由 Leader 维护，初始值为0
 	rpcBusy    bool          // 是否正在通信
@@ -410,18 +411,15 @@ type configChange struct {
 type LeaderState struct {
 	stepDownCh   chan int                // 接收降级通知
 	done         chan NodeId             // 日志复制结束
-	followerRole map[NodeId]RoleStage    // 从节点的角色
 	replications map[NodeId]*Replication // 代表了一个复制日志的 Follower 节点
 	transfer     *transfer               // 领导权转移状态
 	configChange *configChange           // 配置变更状态
-	mu           sync.Mutex
 }
 
-func newLeaderState(followerRole map[NodeId]RoleStage) *LeaderState {
+func newLeaderState() *LeaderState {
 	return &LeaderState{
 		stepDownCh:   make(chan int),
 		done:         make(chan NodeId),
-		followerRole: followerRole,
 		replications: make(map[NodeId]*Replication),
 		transfer:     newTransfer(),
 		configChange: &configChange{},
@@ -531,26 +529,16 @@ func (st *LeaderState) newMajority() int {
 	return len(st.configChange.newConfig)/2 + 1
 }
 
-func (st *LeaderState) roleUpgrade(id NodeId) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.followerRole[id] = Follower
+func (st *LeaderState) getFollowerRole(id NodeId) RoleStage {
+	st.replications[id].mu.Lock()
+	defer st.replications[id].mu.Unlock()
+	return st.replications[id].role
 }
 
-func (st *LeaderState) getFollowerRole() map[NodeId]RoleStage {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	return st.followerRole
-}
-
-func (st *LeaderState) setFollowerRole(id NodeId, isLearner bool) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if isLearner {
-		st.followerRole[id] = Learner
-	} else {
-		st.followerRole[id] = Follower
-	}
+func (st *LeaderState) setReplicationRole(id NodeId, role RoleStage) {
+	st.replications[id].mu.Lock()
+	defer st.replications[id].mu.Unlock()
+	st.replications[id].role = role
 }
 
 // ==================== timerState ====================
