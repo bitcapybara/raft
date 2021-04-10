@@ -45,9 +45,9 @@ const (
 )
 
 type Server struct {
-	Id   NodeId
-	Addr NodeAddr
-	Role RoleStage
+	Id        NodeId
+	Addr      NodeAddr
+	IsLearner bool
 }
 
 type NodeId string

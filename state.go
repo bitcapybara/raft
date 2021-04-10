@@ -543,10 +543,14 @@ func (st *LeaderState) getFollowerRole() map[NodeId]RoleStage {
 	return st.followerRole
 }
 
-func (st *LeaderState) setFollowerRole(id NodeId, role RoleStage) {
+func (st *LeaderState) setFollowerRole(id NodeId, isLearner bool) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	st.followerRole[id] = role
+	if isLearner {
+		st.followerRole[id] = Learner
+	} else {
+		st.followerRole[id] = Follower
+	}
 }
 
 // ==================== timerState ====================

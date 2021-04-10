@@ -199,7 +199,7 @@ func (rf *raft) runLeader() {
 					rf.handleClientCmd(msg)
 				case ChangeConfigRpc:
 					rf.logger.Trace("接收到 ChangeConfigRpc 请求")
-					rf.handleConfiguration(msg)
+					rf.handleConfigChange(msg)
 				case TransferLeadershipRpc:
 					rf.logger.Trace("接收到 TransferLeadershipRpc 请求")
 					rf.handleTransfer(msg)
@@ -209,8 +209,8 @@ func (rf *raft) runLeader() {
 			rf.logger.Trace("心跳计时器到期，开始发送心跳")
 			stopCh := make(chan struct{})
 			finishCh := rf.heartbeat(stopCh)
-			successCnt := 1
-			count := 1
+			successCnt := 0
+			count := 0
 			end := false
 			after := time.After(rf.timerState.heartbeatDuration())
 			for !end {
@@ -392,8 +392,14 @@ func (rf *raft) heartbeat(stopCh chan struct{}) chan finishMsg {
 	finishCh := make(chan finishMsg)
 
 	for id := range rf.peerState.peers() {
-		if rf.peerState.isMe(id) || rf.leaderState.isRpcBusy(id) {
-			rf.logger.Trace(fmt.Sprintf("自身和忙节点，不发送心跳。Id=%s", id))
+		if rf.peerState.isMe(id) {
+			rf.logger.Trace(fmt.Sprintf("自身节点，不发送心跳。Id=%s", id))
+			go func() {finishCh <- finishMsg{msgType: Success}}()
+			continue
+		}
+		if rf.leaderState.isRpcBusy(id) {
+			rf.logger.Trace(fmt.Sprintf("忙节点，不发送心跳。Id=%s", id))
+			go func() {finishCh <- finishMsg{msgType: Error}}()
 			continue
 		}
 		rf.logger.Trace(fmt.Sprintf("给 Id=%s 的节点发送心跳", id))
@@ -409,8 +415,8 @@ func (rf *raft) election(stopCh chan struct{}) <-chan finishMsg {
 	preVoteFinishCh := rf.sendRequestVote(stopCh, true)
 
 	finish := false
-	count := 1
-	successCnt := 1
+	count := 0
+	successCnt := 0
 	end := false
 	after := time.After(rf.timerState.heartbeatDuration())
 	for !end {
@@ -471,6 +477,8 @@ func (rf *raft) sendRequestVote(stopCh <-chan struct{}, isPreVote bool) chan fin
 	}
 	for id, addr := range rf.peerState.peers() {
 		if rf.peerState.isMe(id) {
+			rf.logger.Trace(fmt.Sprintf("自身节点，不发送心跳。Id=%s", id))
+			go func() {finishCh <- finishMsg{msgType: Success}}()
 			continue
 		}
 
@@ -521,7 +529,7 @@ func (rf *raft) runReplication() {
 			continue
 		} else {
 			rf.logger.Trace(fmt.Sprintf("生成节点 Id=%s 的 Replication 对象", id))
-			replication = rf.newReplication(Server{Id: id, Addr: addr, Role: Follower})
+			replication = rf.newReplication(Server{Id: id, Addr: addr, IsLearner: false})
 			rf.leaderState.replications[id] = replication
 			rf.logger.Trace(fmt.Sprintf("开启复制循环：id=%s", id))
 			go rf.addReplication(replication)
@@ -1060,8 +1068,14 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 	rf.logger.Trace("给各节点发送日志条目")
 	for id := range rf.peerState.peers() {
 		// 不用给自己发，正在复制日志的不发
-		if rf.peerState.isMe(id) || rf.leaderState.isRpcBusy(id) {
+		if rf.peerState.isMe(id) {
+			rf.logger.Trace(fmt.Sprintf("自身节点，不发送心跳。Id=%s", id))
+			go func() {finishCh <- finishMsg{msgType: Success}}()
 			continue
+		}
+		if rf.leaderState.isRpcBusy(id) {
+			rf.logger.Trace(fmt.Sprintf("忙节点，不发送心跳。Id=%s", id))
+			go func() {finishCh <- finishMsg{msgType: Error}}()
 		}
 		// 发送日志
 		go rf.replicationTo(id, finishCh, stopCh, EntryReplicate)
@@ -1070,8 +1084,8 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 	// 新日志成功发送到过半 Follower 节点，提交本地的日志
 	majorityFinishCh := make(chan bool)
 	go func() {
-		count := 1
-		successCnt := 1
+		count := 0
+		successCnt := 0
 		sent := false
 		after := time.After(rf.timerState.heartbeatDuration())
 		for {
@@ -1151,7 +1165,7 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 }
 
 // 处理成员变更请求
-func (rf *raft) handleConfiguration(msg rpc) {
+func (rf *raft) handleConfigChange(msg rpc) {
 	newConfig := msg.req.(ChangeConfig)
 	replyRes := AppendEntryReply{}
 	var replyErr error
@@ -1166,7 +1180,7 @@ func (rf *raft) handleConfiguration(msg rpc) {
 	newPeers := make(map[NodeId]NodeAddr)
 	for _, s := range newConfig.Peers {
 		newPeers[s.Id] = s.Addr
-		rf.leaderState.setFollowerRole(s.Id, s.Role)
+		rf.leaderState.setFollowerRole(s.Id, s.IsLearner)
 	}
 	rf.leaderState.setNewConfig(newPeers)
 	// C(old) 配置
