@@ -1026,7 +1026,7 @@ func (rf *raft) handleSnapshot(rpcMsg rpc) {
 func (rf *raft) handleTransfer(rpcMsg rpc) {
 	// 先发送一次心跳，刷新计时器，以及
 	args := rpcMsg.req.(TransferLeadership)
-	timer := time.NewTimer(rf.timerState.minElectionTimeout())
+	timer := time.After(rf.timerState.minElectionTimeout())
 	// 设置定时器和rpc应答通道
 	rf.leaderState.setTransferBusy(args.Transferee.Id)
 	rf.leaderState.setTransferState(timer, rpcMsg.res)
@@ -1343,7 +1343,7 @@ func (rf *raft) updateSnapshot() {
 
 func (rf *raft) checkTransfer(id NodeId) {
 	select {
-	case <-rf.leaderState.transfer.timer.C:
+	case <-rf.leaderState.transfer.timer:
 		rf.logger.Trace("领导权转移超时")
 		rf.leaderState.setTransferBusy(None)
 	default:
@@ -1355,7 +1355,7 @@ func (rf *raft) checkTransfer(id NodeId) {
 		if rf.leaderState.matchIndex(id) == rf.lastEntryIndex() {
 			// 目标节点日志已是最新，发送 timeoutNow 消息
 			func() {
-				var replyRes AppendEntryReply
+				var replyRes TransferLeadershipReply
 				var replyErr error
 				defer func() {
 					rf.leaderState.transfer.reply <- rpcReply{
@@ -1364,26 +1364,20 @@ func (rf *raft) checkTransfer(id NodeId) {
 					}
 				}()
 				rf.logger.Trace(fmt.Sprintf("目标节点 Id=%s 日志已是最新，发送 timeoutNow 消息", id))
-				args := AppendEntry{EntryType: EntryTimeoutNow}
-				res := &AppendEntryReply{}
-				rpcErr := rf.transport.AppendEntries(rf.peerState.peers()[id], args, res)
-				if rpcErr != nil {
-					replyErr = fmt.Errorf("rpc 调用失败。%w", rpcErr)
-					rf.logger.Trace(replyErr.Error())
-					return
-				}
-				term := rf.hardState.currentTerm()
-				if res.Term > term {
-					term = res.Term
-					replyErr = fmt.Errorf("Term 落后，角色降级")
-					rf.logger.Trace(replyErr.Error())
+				finishCh := make(chan finishMsg)
+				stopCh := make(chan struct{})
+				defer func() {
+					close(finishCh)
+					close(stopCh)
+				}()
+				go rf.replicationTo(id, rf.peerState.peers()[id], finishCh, stopCh, EntryTimeoutNow)
+				msg := <-finishCh
+				if msg.msgType == Success {
+					rf.becomeFollower(rf.hardState.currentTerm())
+					rf.leaderState.setTransferBusy(None)
+					replyRes.Status = OK
 				} else {
-					rf.logger.Trace(fmt.Sprintf("领导权转移结果：%t", res.Success))
-					if res.Success {
-						rf.becomeFollower(term)
-						rf.leaderState.setTransferBusy(None)
-					}
-					replyRes = *res
+					replyErr = fmt.Errorf("所有权转移失败：%d", msg.msgType)
 				}
 			}()
 		} else {
@@ -1588,7 +1582,7 @@ func (rf *raft) replicationTo(id NodeId, addr NodeAddr, finishCh chan finishMsg,
 	prevIndex := rf.leaderState.nextIndex(id) - 1
 	// 获取最新的日志
 	var entries []Entry
-	if entryType != EntryHeartbeat && entryType != EntryPromote {
+	if entryType != EntryHeartbeat && entryType != EntryPromote && entryType != EntryTimeoutNow {
 		lastEntryIndex := rf.lastEntryIndex()
 		entry, err := rf.logEntry(lastEntryIndex)
 		if err != nil {

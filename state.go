@@ -384,7 +384,7 @@ type Replication struct {
 
 type transfer struct {
 	transferee NodeId          // 如果正在进行所有权转移，转移的目标id
-	timer      *time.Timer     // 领导权转移超时计时器
+	timer      <-chan time.Time     // 领导权转移超时计时器
 	reply      chan<- rpcReply // 领导权转移 rpc 答复
 	mu         sync.Mutex
 }
@@ -480,7 +480,7 @@ func (st *LeaderState) isTransferBusy() (NodeId, bool) {
 	return st.transfer.transferee, st.transfer.transferee != None
 }
 
-func (st *LeaderState) setTransferState(timer *time.Timer, reply chan<- rpcReply) {
+func (st *LeaderState) setTransferState(timer <-chan time.Time, reply chan<- rpcReply) {
 	st.transfer.mu.Lock()
 	defer st.transfer.mu.Unlock()
 	st.transfer.timer = timer
