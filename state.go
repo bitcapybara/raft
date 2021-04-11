@@ -389,15 +389,15 @@ type Replication struct {
 }
 
 type transfer struct {
-	leadTransferee NodeId          // 如果正在进行所有权转移，转移的目标id
-	timer          *time.Timer     // 领导权转移超时计时器
-	reply          chan<- rpcReply // 领导权转移 rpc 答复
-	mu             sync.Mutex
+	transferee NodeId          // 如果正在进行所有权转移，转移的目标id
+	timer      *time.Timer     // 领导权转移超时计时器
+	reply      chan<- rpcReply // 领导权转移 rpc 答复
+	mu         sync.Mutex
 }
 
 func newTransfer() *transfer {
 	return &transfer{
-		leadTransferee: None,
+		transferee: None,
 	}
 }
 
@@ -426,7 +426,7 @@ func newLeaderState() *LeaderState {
 	}
 }
 
-func (st *LeaderState) followers() map[NodeId]*Replication {
+func (st *LeaderState) getReplications() map[NodeId]*Replication {
 	return st.replications
 }
 
@@ -477,13 +477,13 @@ func (st *LeaderState) isRpcBusy(id NodeId) bool {
 func (st *LeaderState) setTransferBusy(id NodeId) {
 	st.transfer.mu.Lock()
 	defer st.transfer.mu.Unlock()
-	st.transfer.leadTransferee = id
+	st.transfer.transferee = id
 }
 
 func (st *LeaderState) isTransferBusy() (NodeId, bool) {
 	st.transfer.mu.Lock()
 	defer st.transfer.mu.Unlock()
-	return st.transfer.leadTransferee, st.transfer.leadTransferee != None
+	return st.transfer.transferee, st.transfer.transferee != None
 }
 
 func (st *LeaderState) setTransferState(timer *time.Timer, reply chan<- rpcReply) {

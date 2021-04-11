@@ -145,4 +145,5 @@ type AddLearner struct {
 
 type AddLearnerReply struct {
 	Status Status
+	Leader Server // 请求的不是 Leader 节点时，返回 Leader 节点信息
 }

@@ -162,7 +162,7 @@ func (rf *raft) runLeader() {
 
 	// 开启日志复制循环
 	rf.runReplication()
-	rf.logger.Trace("开启日志复制循环")
+	rf.logger.Trace("已开启全部节点日志复制循环")
 
 	// 节点退出 Leader 状态，收尾工作
 	defer func() {
@@ -267,7 +267,7 @@ func (rf *raft) runCandidate() {
 	rf.logger.Trace("开始选举")
 	finishCh := rf.election(stopCh)
 
-	successCnt := 1
+	successCnt := 0
 	for rf.roleState.getRoleStage() == Candidate {
 		select {
 		case <-rf.timerState.tick():
@@ -295,6 +295,13 @@ func (rf *raft) runCandidate() {
 			case ChangeConfigRpc:
 				rf.logger.Trace("当前节点不是 Leader，ChangeConfigRpc 请求驳回")
 				replyRes := ChangeConfigReply{
+					Status: NotLeader,
+					Leader: rf.peerState.getLeader(),
+				}
+				msg.res <- rpcReply{res: replyRes}
+			case AddLearnerRpc:
+				rf.logger.Trace("当前节点不是 Leader，AddLearnerRpc 请求驳回")
+				replyRes := AddLearnerReply{
 					Status: NotLeader,
 					Leader: rf.peerState.getLeader(),
 				}
@@ -360,6 +367,13 @@ func (rf *raft) runFollower() {
 					Leader: rf.peerState.getLeader(),
 				}
 				msg.res <- rpcReply{res: replyRes}
+			case AddLearnerRpc:
+				rf.logger.Trace("当前节点不是 Leader，AddLearnerRpc 请求驳回")
+				replyRes := AddLearnerReply{
+					Status: NotLeader,
+					Leader: rf.peerState.getLeader(),
+				}
+				msg.res <- rpcReply{res: replyRes}
 			}
 		}
 	}
@@ -391,7 +405,7 @@ func (rf *raft) heartbeat(stopCh chan struct{}) chan finishMsg {
 	for id := range rf.peerState.peers() {
 		if rf.peerState.isMe(id) {
 			rf.logger.Trace(fmt.Sprintf("自身节点，不发送心跳。Id=%s", id))
-			go func() { finishCh <- finishMsg{msgType: Success} }()
+			go func() { finishCh <- finishMsg{msgType: Success, id: id} }()
 			continue
 		}
 		if rf.leaderState.isRpcBusy(id) {
@@ -435,7 +449,7 @@ func (rf *raft) election(stopCh chan struct{}) <-chan finishMsg {
 				successCnt += 1
 			}
 			if successCnt >= rf.peerState.majority() {
-				rf.logger.Trace("请求已成功发送给多数节点")
+				rf.logger.Trace("投票请求已成功发送给多数节点")
 				end = true
 				finish = true
 			}
@@ -474,7 +488,7 @@ func (rf *raft) sendRequestVote(stopCh <-chan struct{}, isPreVote bool) chan fin
 	}
 	for id, addr := range rf.peerState.peers() {
 		if rf.peerState.isMe(id) {
-			rf.logger.Trace(fmt.Sprintf("自身节点，不发送心跳。Id=%s", id))
+			rf.logger.Trace(fmt.Sprintf("自身节点，不发送投票请求。Id=%s", id))
 			go func() { finishCh <- finishMsg{msgType: Success} }()
 			continue
 		}
@@ -1044,7 +1058,6 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 		rf.logger.Trace(replyErr.Error())
 		return
 	}
-	rf.leaderState.matchAndNextIndexAdd(rf.peerState.myId())
 
 	// 给各节点发送日志条目
 	finishCh := make(chan finishMsg)
@@ -1161,11 +1174,15 @@ func (rf *raft) handleLearnerAdd(msg rpc) {
 		}
 	}()
 
+	// 将新节点添加到 replication 集合
 	for id, addr := range learners {
 		if _, ok := rf.leaderState.replications[id]; !ok {
 			// 开启复制循环
 			rf.logger.Trace(fmt.Sprintf("开启复制循环。id=%s", id))
-			rf.addReplication(rf.newReplication(id, addr, Learner))
+			replication := rf.newReplication(id, addr, Learner)
+			rf.leaderState.replications[id] = replication
+			go rf.addReplication(replication)
+			go func() { replication.triggerCh <- struct{}{} }()
 		}
 	}
 }
@@ -1271,7 +1288,7 @@ func (rf *raft) handleConfigChange(msg rpc) {
 	}
 	// 查看follower有没有被移除的
 	rf.logger.Trace("删除新配置中不包含的 replication")
-	followers := rf.leaderState.followers()
+	followers := rf.leaderState.getReplications()
 	for id, f := range followers {
 		if _, ok := peers[id]; !ok {
 			f.stopCh <- struct{}{}
@@ -1640,7 +1657,7 @@ func (rf *raft) replicate(s *Replication) bool {
 
 	// 向前查找 nextIndex 值
 	rf.logger.Trace("向前查找 nextIndex 值")
-	if rf.findCorrectNextIndex(s) {
+	if !rf.findCorrectNextIndex(s) {
 		rf.logger.Trace("日志追赶失败")
 		return false
 	}
@@ -1684,7 +1701,7 @@ func (rf *raft) checkSnapshot(s *Replication) bool {
 func (rf *raft) findCorrectNextIndex(s *Replication) bool {
 	rl := rf.leaderState
 
-	for rl.nextIndex(s.id) > 1 {
+	for rl.nextIndex(s.id) > 0 {
 		select {
 		case <-s.stopCh:
 			return false
@@ -1714,7 +1731,7 @@ func (rf *raft) findCorrectNextIndex(s *Replication) bool {
 			rf.logger.Error(fmt.Errorf("调用rpc服务失败：%s%w\n", s.addr, err).Error())
 			return false
 		}
-		rf.logger.Trace(fmt.Sprintf("接收到应答%+v", res))
+		rf.logger.Trace(fmt.Sprintf("接收到节点 id=%s 的应答 %+v", s.id, res))
 		// 如果任期数小，降级为 Follower
 		if res.Term > rf.hardState.currentTerm() {
 			rf.logger.Trace("当前任期数小，降级为 Follower")
@@ -1761,10 +1778,15 @@ func (rf *raft) findCorrectMatchIndex(s *Replication) bool {
 
 		nextIndex := rl.nextIndex(s.id)
 		prevIndex := nextIndex - 1
+		prevEntry, prevErr := rf.logEntry(prevIndex)
+		if prevErr != nil {
+			rf.logger.Error(fmt.Errorf("获取 index=%d 日志失败 %w", prevIndex, prevErr).Error())
+			return false
+		}
 		var entries []Entry
 		sendEntry, sendEntryErr := rf.logEntry(nextIndex)
 		if sendEntryErr != nil {
-			rf.logger.Error(fmt.Errorf("获取 index=%d 日志失败 %w", prevIndex, sendEntryErr).Error())
+			rf.logger.Error(fmt.Errorf("获取 index=%d 日志失败 %w", nextIndex, sendEntryErr).Error())
 			return false
 		} else {
 			entries = []Entry{sendEntry}
@@ -1773,7 +1795,7 @@ func (rf *raft) findCorrectMatchIndex(s *Replication) bool {
 			Term:         rf.hardState.currentTerm(),
 			LeaderId:     rf.peerState.myId(),
 			PrevLogIndex: prevIndex,
-			PrevLogTerm:  sendEntry.Term,
+			PrevLogTerm:  prevEntry.Term,
 			LeaderCommit: rf.softState.getCommitIndex(),
 			Entries:      entries,
 		}
@@ -1924,7 +1946,11 @@ func (rf *raft) applyFsm() (err error) {
 func (rf *raft) updateLeaderCommit() {
 	commitIndexes := make([]int, 0)
 	for id := range rf.peerState.peers() {
-		commitIndexes = append(commitIndexes, rf.leaderState.matchIndex(id))
+		if rf.peerState.isMe(id) {
+			commitIndexes = append(commitIndexes, rf.softState.getCommitIndex())
+		} else {
+			commitIndexes = append(commitIndexes, rf.leaderState.matchIndex(id))
+		}
 	}
 	sort.Ints(commitIndexes)
 	rf.softState.setCommitIndex(commitIndexes[rf.peerState.majority()-1])
