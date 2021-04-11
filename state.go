@@ -367,12 +367,6 @@ func (st *PeerState) getLeader() Server {
 	}
 }
 
-func (st *PeerState) addPeer(id NodeId, addr NodeAddr) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.peersMap[id] = addr
-}
-
 // ==================== LeaderState ====================
 
 type Replication struct {
@@ -544,7 +538,7 @@ func (st *LeaderState) setReplicationRole(id NodeId, role RoleStage) {
 // ==================== timerState ====================
 
 type timerState struct {
-	timeoutTimer *time.Timer // 超时计时器
+	timeoutTimer <-chan time.Time // 超时计时器
 
 	electionMinTimeout int // 最小选举超时时间
 	electionMaxTimeout int // 最大选举超时时间
@@ -561,21 +555,11 @@ func newTimerState(config Config) *timerState {
 
 // 用于计时器已到期后重置
 func (st *timerState) setElectionTimer() {
-	if st.timeoutTimer == nil {
-		st.timeoutTimer = time.NewTimer(st.electionDuration())
-	} else {
-		st.timeoutTimer.Stop()
-		st.timeoutTimer.Reset(st.electionDuration())
-	}
+	st.timeoutTimer = time.After(st.electionDuration())
 }
 
 func (st *timerState) setHeartbeatTimer() {
-	if st.timeoutTimer == nil {
-		st.timeoutTimer = time.NewTimer(st.heartbeatDuration())
-	} else {
-		st.timeoutTimer.Stop()
-		st.timeoutTimer.Reset(st.heartbeatDuration())
-	}
+	st.timeoutTimer = time.After(st.heartbeatDuration())
 }
 
 func (st *timerState) electionDuration() time.Duration {
@@ -592,7 +576,7 @@ func (st *timerState) heartbeatDuration() time.Duration {
 }
 
 func (st *timerState) tick() <-chan time.Time {
-	return st.timeoutTimer.C
+	return st.timeoutTimer
 }
 
 // ==================== snapshotState ====================

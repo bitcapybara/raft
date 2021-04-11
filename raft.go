@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"sort"
 	"time"
 )
@@ -131,11 +132,6 @@ func (rf *raft) raftRun(rpcCh chan rpc) {
 	rf.rpcCh = rpcCh
 	go func() {
 		for {
-			select {
-			case <-rf.exitCh:
-				return
-			default:
-			}
 			switch rf.roleState.getRoleStage() {
 			case Leader:
 				rf.logger.Trace("开启runLeader()循环")
@@ -151,6 +147,12 @@ func (rf *raft) raftRun(rpcCh chan rpc) {
 				rf.runLearner()
 			}
 		}
+	}()
+
+	go func() {
+		<-rf.exitCh
+		rf.logger.Trace("接收到程序退出信号")
+		os.Exit(0)
 	}()
 }
 
@@ -272,7 +274,7 @@ func (rf *raft) runCandidate() {
 		select {
 		case <-rf.timerState.tick():
 			// 开启下一轮选举
-			rf.logger.Trace("选举计时器到期，开始下一轮选举")
+			rf.logger.Trace("选举计时器到期，开启新一轮选举")
 			return
 		case msg := <-rf.rpcCh:
 			switch msg.rpcType {
@@ -341,7 +343,6 @@ func (rf *raft) runFollower() {
 			// 成为候选者
 			rf.logger.Trace("选举计时器到期，开启新一轮选举")
 			rf.becomeCandidate()
-			return
 		case msg := <-rf.rpcCh:
 			switch msg.rpcType {
 			case ApplyCommandRpc:
@@ -402,7 +403,7 @@ func (rf *raft) heartbeat(stopCh chan struct{}) chan finishMsg {
 
 	finishCh := make(chan finishMsg)
 
-	for id := range rf.peerState.peers() {
+	for id, addr := range rf.peerState.peers() {
 		if rf.peerState.isMe(id) {
 			rf.logger.Trace(fmt.Sprintf("自身节点，不发送心跳。Id=%s", id))
 			go func() { finishCh <- finishMsg{msgType: Success, id: id} }()
@@ -414,7 +415,7 @@ func (rf *raft) heartbeat(stopCh chan struct{}) chan finishMsg {
 			continue
 		}
 		rf.logger.Trace(fmt.Sprintf("给 Id=%s 的节点发送心跳", id))
-		go rf.replicationTo(id, finishCh, stopCh, EntryHeartbeat)
+		go rf.replicationTo(id, addr, finishCh, stopCh, EntryHeartbeat)
 	}
 
 	return finishCh
@@ -808,7 +809,12 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 			replyRes.Success = false
 			rf.logger.Trace("新配置应用失败")
 		}
-		rf.logger.Trace(fmt.Sprintf("新配置应用成功，Peers=%v", rf.peerState.peers()))
+		rf.logger.Trace(fmt.Sprintf("新配置应用成功，Peers=%+v", rf.peerState.peers()))
+		if _, ok := rf.peerState.peers()[rf.peerState.myId()]; !ok {
+			rf.logger.Trace("新配置中不包含当前节点，退出程序")
+			go func() { rf.exitCh <- struct{}{} }()
+			return
+		}
 		replyRes.Success = true
 		return
 	}
@@ -821,13 +827,13 @@ func (rf *raft) handleCommand(rpcMsg rpc) {
 		} else {
 			rf.logger.Trace("角色变为候选者失败")
 		}
+		return
 	}
 
 	// 已接收到全部日志，从 Learner 角色升级为 Follower
 	if rf.roleState.getRoleStage() == Learner && args.EntryType == EntryPromote {
 		rf.logger.Trace(fmt.Sprintf("Learner 接收到升级请求，Term=%d", args.Term))
-		rf.becomeFollower(args.Term)
-		replyRes.Success = true
+		replyRes.Success = rf.becomeFollower(args.Term)
 		rf.logger.Trace("成功升级到Follower")
 	}
 }
@@ -1064,7 +1070,7 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 	rf.logger.Trace("给各节点发送日志条目")
-	for id := range rf.peerState.peers() {
+	for id, addr := range rf.peerState.peers() {
 		// 不用给自己发，正在复制日志的不发
 		if rf.peerState.isMe(id) {
 			rf.logger.Trace(fmt.Sprintf("自身节点，不发送心跳。Id=%s", id))
@@ -1076,7 +1082,7 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 			go func() { finishCh <- finishMsg{msgType: Error} }()
 		}
 		// 发送日志
-		go rf.replicationTo(id, finishCh, stopCh, EntryReplicate)
+		go rf.replicationTo(id, addr, finishCh, stopCh, EntryReplicate)
 	}
 
 	// 新日志成功发送到过半 Follower 节点，提交本地的日志
@@ -1203,7 +1209,7 @@ func (rf *raft) handleConfigChange(msg rpc) {
 	promoteCh := make(chan finishMsg)
 	promoteCnt := 0
 	for id, addr := range newConfig.Peers {
-		if rf.leaderState.getFollowerRole(id) != Learner {
+		if rf.peerState.isMe(id) || rf.leaderState.getFollowerRole(id) != Learner {
 			continue
 		}
 		promoteCnt += 1
@@ -1214,12 +1220,11 @@ func (rf *raft) handleConfigChange(msg rpc) {
 				close(stopCh)
 				close(finishCh)
 			}()
-			rf.logger.Trace("日志追赶成功，且目标节点是 Learner 角色，发送 EntryPromote 请求")
-			rf.replicationTo(id, finishCh, stopCh, EntryPromote)
+			rf.logger.Trace("目标节点是 Learner 角色，发送 EntryPromote 请求")
+			go rf.replicationTo(id, addr, finishCh, stopCh, EntryPromote)
 			finish := <-finishCh
 			if finish.msgType == Success {
 				rf.leaderState.setReplicationRole(id, Follower)
-				rf.peerState.addPeer(id, addr)
 				rf.logger.Trace("目标节点升级为 Follower 成功")
 				promoteCh <- finishMsg{msgType: Success}
 			} else {
@@ -1250,7 +1255,7 @@ func (rf *raft) handleConfigChange(msg rpc) {
 		oldPeers[id] = addr
 	}
 	rf.leaderState.setOldConfig(oldPeers)
-	rf.logger.Trace(fmt.Sprintf("旧配置：%s，新配置%s", oldPeers, newPeers))
+	rf.logger.Trace(fmt.Sprintf("旧配置：%+v，新配置%+v", oldPeers, newPeers))
 
 	// C(old,new) 配置
 	oldNewPeers := make(map[NodeId]NodeAddr)
@@ -1283,7 +1288,7 @@ func (rf *raft) handleConfigChange(msg rpc) {
 	// 如果当前节点被移除，退出程序
 	if _, ok := peers[rf.peerState.myId()]; !ok {
 		rf.logger.Trace("新配置中不包含当前节点，程序退出")
-		rf.exitCh <- struct{}{}
+		go func() { rf.exitCh <- struct{}{} }()
 		return
 	}
 	// 查看follower有没有被移除的
@@ -1422,32 +1427,35 @@ func (rf *raft) sendOldNewConfig(peers map[NodeId]NodeAddr) error {
 
 func (rf *raft) sendNewConfig(peers map[NodeId]NodeAddr) error {
 
-	oldNewPeersData, enOldNewErr := encodePeersMap(peers)
+	// C(old,new)配置
+	oldNewPeers := rf.peerState.peers()
+
+	newPeersData, enOldNewErr := encodePeersMap(peers)
 	if enOldNewErr != nil {
 		return fmt.Errorf("新配置序列化失败！%w", enOldNewErr)
 	}
 
-	// C(old,new)配置添加到状态
-	addEntryErr := rf.addEntry(Entry{Type: EntryChangeConf, Data: oldNewPeersData})
+	// C(new)配置添加到状态
+	addEntryErr := rf.addEntry(Entry{Type: EntryChangeConf, Data: newPeersData})
 	if addEntryErr != nil {
 		return fmt.Errorf("将配置添加到日志失败！%w", addEntryErr)
 	}
 	rf.peerState.replacePeers(peers)
 	rf.logger.Trace("替换掉当前节点的 Peers 配置")
 
-	// C(old,new)发送到各个节点
+	// C(new)配置发送到各个节点
 	finishCh := make(chan finishMsg)
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 	rf.logger.Trace("给各节点发送新配置")
-	for id := range rf.peerState.peers() {
+	for id, addr := range oldNewPeers {
 		// 不用给自己发
 		if rf.peerState.isMe(id) {
 			continue
 		}
 		// 发送日志
 		rf.logger.Trace(fmt.Sprintf("给 Id=%s 的节点发送配置", id))
-		go rf.replicationTo(id, finishCh, stopCh, EntryChangeConf)
+		go rf.replicationTo(id, addr, finishCh, stopCh, EntryChangeConf)
 	}
 
 	count := 1
@@ -1492,14 +1500,14 @@ func (rf *raft) waitForConfig(peers map[NodeId]NodeAddr) bool {
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 
-	for id := range peers {
+	for id, addr := range peers {
 		// 不用给自己发
 		if rf.peerState.isMe(id) {
 			continue
 		}
 		// 发送日志
 		rf.logger.Trace(fmt.Sprintf("给节点 Id=%s 发送最新条目", id))
-		go rf.replicationTo(id, finishCh, stopCh, EntryChangeConf)
+		go rf.replicationTo(id, addr, finishCh, stopCh, EntryChangeConf)
 	}
 
 	count := 1
@@ -1555,7 +1563,7 @@ func encodePeersMap(peers map[NodeId]NodeAddr) ([]byte, error) {
 }
 
 // Leader 给某个节点发送心跳/日志
-func (rf *raft) replicationTo(id NodeId, finishCh chan finishMsg, stopCh chan struct{}, entryType EntryType) {
+func (rf *raft) replicationTo(id NodeId, addr NodeAddr, finishCh chan finishMsg, stopCh chan struct{}, entryType EntryType) {
 	var msg finishMsg
 	defer func() {
 		select {
@@ -1577,7 +1585,6 @@ func (rf *raft) replicationTo(id NodeId, finishCh chan finishMsg, stopCh chan st
 	rf.logger.Trace(fmt.Sprintf("给节点 %s 发送 %s 类型的 entry", id, EntryTypeToString(entryType)))
 
 	// 发起 RPC 调用
-	addr := rf.peerState.peers()[id]
 	prevIndex := rf.leaderState.nextIndex(id) - 1
 	// 获取最新的日志
 	var entries []Entry
@@ -1629,7 +1636,7 @@ func (rf *raft) replicationTo(id NodeId, finishCh chan finishMsg, stopCh chan st
 	}
 
 	if res.Success {
-		msg = finishMsg{msgType: Success}
+		msg = finishMsg{msgType: Success, id: id}
 		if entryType == EntryReplicate {
 			rf.leaderState.matchAndNextIndexAdd(id)
 		}
@@ -1875,12 +1882,12 @@ func (rf *raft) becomeLeader() bool {
 	finishCh := make(chan finishMsg)
 	stopCh := make(chan struct{})
 	rf.logger.Trace("给各个节点发送心跳，建立权柄")
-	for id := range rf.peerState.peers() {
+	for id, addr := range rf.peerState.peers() {
 		if rf.peerState.isMe(id) {
 			continue
 		}
 		rf.logger.Trace(fmt.Sprintf("给 Id=%s 发送心跳", id))
-		go rf.replicationTo(id, finishCh, stopCh, EntryHeartbeat)
+		go rf.replicationTo(id, addr, finishCh, stopCh, EntryHeartbeat)
 	}
 	return true
 }
@@ -1893,7 +1900,6 @@ func (rf *raft) becomeCandidate() bool {
 
 // 降级为 Follower
 func (rf *raft) becomeFollower(term int) bool {
-
 	rf.logger.Trace("设置节点 Term 值")
 	err := rf.hardState.setTerm(term)
 	if err != nil {
