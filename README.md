@@ -1,4 +1,4 @@
-# go-raft
+# raft
 分布式 raft 共识算法 go 实现
 
 ### 一、需要实现的接口
@@ -31,5 +31,5 @@
 
 ### 三、示例
 
-[simplefsm](https://github.com/bitcapybara/simplefsm) 项目是此 raft 库的一个示例，实现了一个极简的状态机，但已经包含了 raft 的所有功能。
+[simplefsm](https://github.com/bitcapybara/simplefsm) 项目是此 raft 库的一个示例，实现了一个极简的状态机，但已经包含了此 raft 库的所有功能。
 
