@@ -152,6 +152,7 @@ func (rf *raft) raftRun(rpcCh chan rpc) {
 	go func() {
 		<-rf.exitCh
 		rf.logger.Trace("接收到程序退出信号")
+		rf.timerState.stopTimer()
 		os.Exit(0)
 	}()
 }

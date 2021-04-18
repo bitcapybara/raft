@@ -538,7 +538,8 @@ func (st *LeaderState) setReplicationRole(id NodeId, role RoleStage) {
 // ==================== timerState ====================
 
 type timerState struct {
-	timeoutTimer <-chan time.Time // 超时计时器
+	timeoutTimer *time.Timer // 超时计时器
+	mu sync.Mutex
 
 	electionMinTimeout int // 最小选举超时时间
 	electionMaxTimeout int // 最大选举超时时间
@@ -555,11 +556,23 @@ func newTimerState(config Config) *timerState {
 
 // 用于计时器已到期后重置
 func (st *timerState) setElectionTimer() {
-	st.timeoutTimer = time.After(st.electionDuration())
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	duration := st.electionDuration()
+	if st.timeoutTimer == nil {
+		st.timeoutTimer = time.NewTimer(duration)
+	}
+	st.timeoutTimer.Reset(duration)
 }
 
 func (st *timerState) setHeartbeatTimer() {
-	st.timeoutTimer = time.After(st.heartbeatDuration())
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	duration := st.heartbeatDuration()
+	if st.timeoutTimer == nil {
+		st.timeoutTimer = time.NewTimer(duration)
+	}
+	st.timeoutTimer.Reset(duration)
 }
 
 func (st *timerState) electionDuration() time.Duration {
@@ -575,8 +588,16 @@ func (st *timerState) heartbeatDuration() time.Duration {
 	return time.Millisecond * time.Duration(st.heartbeatTimeout)
 }
 
-func (st *timerState) tick() <-chan time.Time {
-	return st.timeoutTimer
+func (st *timerState) tick() <- chan time.Time {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.timeoutTimer.C
+}
+
+func (st *timerState) stopTimer() {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.timeoutTimer.Stop()
 }
 
 // ==================== snapshotState ====================
