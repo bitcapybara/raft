@@ -48,6 +48,11 @@ func (nd *Node) Run() {
 	nd.raft.raftRun(nd.rpcCh)
 }
 
+// 判断当前节点是否是 Leader 节点
+func (nd *Node) IsLeader() bool {
+	return nd.raft.isLeader()
+}
+
 // Follower 和 Candidate 开放的 rpc接口，由 Leader 调用
 // 客户端接收到请求后，调用此方法
 func (nd *Node) AppendEntries(args AppendEntry, res *AppendEntryReply) error {
