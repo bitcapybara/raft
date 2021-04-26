@@ -48,9 +48,14 @@ func (nd *Node) Run() {
 	nd.raft.raftRun(nd.rpcCh)
 }
 
-// 判断当前节点是否是 Leader 节点
+// 客户端查询当前节点是否是 Leader 节点
 func (nd *Node) IsLeader() bool {
 	return nd.raft.isLeader()
+}
+
+// 客户端查询集群 Leader 地址
+func (nd *Node) GetLeader() NodeAddr {
+	return nd.raft.peerState.getLeader().Addr
 }
 
 // Follower 和 Candidate 开放的 rpc接口，由 Leader 调用
