@@ -53,6 +53,11 @@ func (nd *Node) IsLeader() bool {
 	return nd.raft.isLeader()
 }
 
+// 客户端添加角色变更观察器
+func (nd *Node) AddRoleObserver(ob chan RoleStage) {
+	nd.raft.addRoleObserver(ob)
+}
+
 // 客户端查询集群 Leader 地址
 func (nd *Node) GetLeader() NodeAddr {
 	return nd.raft.peerState.getLeader().Addr

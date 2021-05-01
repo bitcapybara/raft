@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -69,6 +70,9 @@ type raft struct {
 
 	rpcCh  chan rpc      // 主线程接收 rpc 消息
 	exitCh chan struct{} // 当前节点离开节点，退出程序
+
+	roleObserver []chan RoleStage // 节点角色变更观察者
+	obMu         sync.Mutex
 }
 
 func newRaft(config Config) *raft {
@@ -1884,12 +1888,14 @@ func (rf *raft) becomeLeader() bool {
 		rf.logger.Trace(fmt.Sprintf("给 Id=%s 发送心跳", id))
 		go rf.replicationTo(id, addr, finishCh, stopCh, EntryHeartbeat)
 	}
+	rf.onRoleChange(Leader)
 	return true
 }
 
 func (rf *raft) becomeCandidate() bool {
 	// 角色置为候选者
 	rf.setRoleStage(Candidate)
+	rf.onRoleChange(Candidate)
 	return true
 }
 
@@ -1902,6 +1908,7 @@ func (rf *raft) becomeFollower(term int) bool {
 		return false
 	}
 	rf.setRoleStage(Follower)
+	rf.onRoleChange(Follower)
 	return true
 }
 
@@ -2050,4 +2057,21 @@ func (rf *raft) truncateBefore(index int) (err error) {
 		rf.hardState.truncateBefore(index)
 	}
 	return
+}
+
+func (rf *raft) addRoleObserver(ob chan RoleStage) {
+	rf.obMu.Lock()
+	rf.obMu.Unlock()
+	rf.roleObserver = append(rf.roleObserver, ob)
+}
+
+func (rf *raft) onRoleChange(role RoleStage) {
+	if len(rf.roleObserver) <= 0 {
+		return
+	}
+	for _, ob := range rf.roleObserver {
+		go func(ob chan RoleStage) {
+			ob <- role
+		}(ob)
+	}
 }
