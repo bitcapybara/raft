@@ -580,7 +580,7 @@ func (rf *raft) addReplication(r *Replication) {
 				// 设置状态
 				rf.leaderState.setRpcBusy(r.id, true)
 				defer rf.leaderState.setRpcBusy(r.id, false)
-				// 复制日志，成功后将节点角色提升为 Follower
+				// 复制日志
 				replicate := rf.replicate(r)
 				rf.logger.Trace(fmt.Sprintf("日志追赶结束，返回值=%t", replicate))
 				if replicate {
