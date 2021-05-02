@@ -1079,7 +1079,8 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 		// 不用给自己发，正在复制日志的不发
 		if rf.peerState.isMe(id) {
 			rf.logger.Trace(fmt.Sprintf("自身节点，不发送心跳。Id=%s", id))
-			go func() { finishCh <- finishMsg{msgType: Success} }()
+			rf.softState.setCommitIndex(rf.softState.getCommitIndex() + 1)
+			go func() { finishCh <- finishMsg{msgType: Success, id: id} }()
 			continue
 		}
 		if rf.leaderState.isRpcBusy(id) {
@@ -1162,7 +1163,7 @@ func (rf *raft) handleClientCmd(rpcMsg rpc) {
 	// 应用状态机
 	applyErr := rf.applyFsm()
 	if applyErr != nil {
-		replyErr = fmt.Errorf("日志应用状态机失败！%w", applyErr)
+		replyErr = applyErr
 		rf.logger.Error(replyErr.Error())
 	}
 
@@ -1940,10 +1941,13 @@ func (rf *raft) applyFsm() (err error) {
 		} else {
 			applyErr := rf.fsm.Apply(entry.Data)
 			if applyErr != nil {
-				err = applyErr
-			} else {
-				lastApplied = rf.softState.lastAppliedAdd()
+				if err == nil {
+					err = fmt.Errorf("应用状态机失败，%w", applyErr)
+				} else {
+					err = fmt.Errorf("%w", err)
+				}
 			}
+			lastApplied = rf.softState.lastAppliedAdd()
 		}
 	}
 
